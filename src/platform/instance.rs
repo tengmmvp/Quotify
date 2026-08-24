@@ -1,0 +1,73 @@
+//! 单实例：命名互斥体 + 唤醒已有实例。
+//!
+//! 二次启动时向已运行实例的托盘窗口投递「弹出面板」消息后静默退出，
+//! 用户感知是「点了一下，面板出来了」。
+
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
+use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_APP};
+
+/// 托盘隐藏窗口类名（FindWindow 唤醒用，全局唯一）。
+pub const TRAY_WND_CLASS: &str = "QuotifyTrayWnd";
+/// 「唤醒已有实例」消息。
+pub const WM_APP_WAKEUP: u32 = WM_APP + 3;
+
+enum GuardState {
+    First(HANDLE),
+    AlreadyRunning,
+}
+
+pub struct InstanceGuard(GuardState);
+
+impl Drop for InstanceGuard {
+    fn drop(&mut self) {
+        if let GuardState::First(h) = self.0 {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(h);
+            }
+        }
+    }
+}
+
+/// 尝试成为唯一实例。返回 `AlreadyRunning` 时调用方应唤醒旧实例后退出。
+pub fn acquire() -> InstanceGuard {
+    unsafe {
+        // 优先 Global 命名空间（跨会话）；无权限时回退 Local
+        for scope in ["Global", "Local"] {
+            let name: Vec<u16> = format!("{scope}\\{TRAY_WND_CLASS}.SingleInstance")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            if let Ok(h) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
+                // CreateMutex 成功时 GetLastError 可能是 ERROR_ALREADY_EXISTS
+                let already = GetLastError() == ERROR_ALREADY_EXISTS;
+                if already {
+                    return InstanceGuard(GuardState::AlreadyRunning);
+                }
+                return InstanceGuard(GuardState::First(h));
+            }
+        }
+        // 两种命名空间都创建失败：保守放行（不让应用完全无法启动）
+        InstanceGuard(GuardState::First(HANDLE::default()))
+    }
+}
+
+impl InstanceGuard {
+    pub fn is_first(&self) -> bool {
+        matches!(self.0, GuardState::First(_))
+    }
+
+    /// 找到已运行实例的托盘窗口，请它弹出面板。
+    pub fn wake_existing(&self) {
+        let class: Vec<u16> = TRAY_WND_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            match FindWindowW(PCWSTR(class.as_ptr()), None) {
+                Ok(hwnd) => {
+                    let _ = PostMessageW(Some(hwnd), WM_APP_WAKEUP, Default::default(), Default::default());
+                }
+                Err(_) => {}
+            }
+        }
+    }
+}

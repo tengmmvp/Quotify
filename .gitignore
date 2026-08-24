@@ -1,1 +1,14 @@
+# 构建产物
 /target
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# 运行时生成的便携配置（含明文 API key，严禁入库）
+config.toml
+
+# 系统杂项
+Thumbs.db
+Desktop.ini

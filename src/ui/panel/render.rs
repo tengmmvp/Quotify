@@ -26,7 +26,7 @@ use windows::Win32::Graphics::DirectWrite::{
 use windows::Win32::Foundation::HWND;
 
 use super::anim::{Tween, animations_allowed, ease_in_out_cubic, ease_out_cubic};
-use super::theme::{BAR_HEIGHT, RADIUS, Theme};
+use super::theme::{RADIUS, Theme};
 use super::{PanelView};
 use crate::app::App;
 use crate::ui::fmt;
@@ -59,7 +59,6 @@ pub enum Hit {
     ToggleAutostart,
     AddAccount,
     RemoveAccount(usize),
-    SelectAccount(usize),
     CheckUpdate,
 }
 
@@ -356,29 +355,29 @@ impl Renderer {
             }
             _ => {
                 if let Some(snap) = snap {
-                    // 套餐徽标行：V3 · Max
-                    let mut badge = String::new();
+                    // 套餐标识：纯文字（版本 mono Ember · 等级 500 墨色）
                     let v = snap.plan_version.label();
-                    if !v.is_empty() {
-                        badge.push_str(v);
-                    }
                     let t = snap.tier.label();
-                    if !t.is_empty() {
-                        if !badge.is_empty() {
-                            badge.push_str(" · ");
-                        }
-                        badge.push_str(t);
-                    } else if let Some(l) = &snap.plan_label {
-                        if !badge.is_empty() {
-                            badge.push_str(" · ");
-                        }
-                        badge.push_str(l);
+                    let fallback = snap.plan_label.clone().unwrap_or_default();
+                    let tier_text = if !t.is_empty() { t } else { &fallback };
+                    let mut bx = pad;
+                    if !v.is_empty() {
+                        self.text_rect_opts(
+                            target,
+                            v,
+                            &D2D_RECT_F { left: bx, top: y + 2.0, right: bx + 60.0, bottom: y + 18.0 },
+                            12.0,
+                            500,
+                            self.theme.accent,
+                            alpha,
+                            false,
+                            true,
+                        );
+                        bx += v.chars().count() as f32 * 7.3 + 10.0;
                     }
-                    if badge.is_empty() {
-                        badge.push_str("GLM");
-                    }
-                    self.badge(target, &badge, pad, y, alpha);
-                    y += 30.0;
+                    let shown = if tier_text.is_empty() { "GLM" } else { tier_text };
+                    self.text(target, shown, bx, y + 1.0, w - pad - bx, 18.0, 13.0, 500, self.theme.text_primary, alpha);
+                    y += 26.0;
 
                     // 5h / 周 两条进度（MCP 另行处理）
                     let rows: [(Option<&crate::api::QuotaBucket>, &str, f32); 2] = [
@@ -402,10 +401,10 @@ impl Renderer {
                     }
                     y = row_y + 4.0;
 
-                    // 迷你柱状图 + Top 模型
+                    // 迷你柱状图 + Top 模型（图表两侧仅留 10px，尽量贴满面板宽）
                     if let Some(mu) = &snap.model_usage {
                         if !mu.series.is_empty() {
-                            y = self.sparkline(target, &mu.series, pad, y, w - pad * 2.0, alpha);
+                            y = self.sparkline(target, &mu.series, 10.0, y, w - 20.0, alpha);
                         }
                         if !mu.by_model.is_empty() {
                             let mut line = String::new();
@@ -474,15 +473,11 @@ impl Renderer {
         self.text(target, label, pad, y + 2.0, w - pad * 2.0 - 150.0, 18.0, 13.0, 500, c_tertiary, alpha);
         self.text_mono_r(target, &right, w - pad - 140.0, y, 140.0, 18.0, 13.0, 500, c_primary, alpha);
 
-        // 倒计时（等宽 11，元数据质感）
-        if let Some(r) = b.resets_at {
-            let cd_text = format!("{} {}", fmt::countdown(r, lang), lang.strings().resets_in);
-            self.text_mono_r(target, &cd_text, w - pad - 140.0, y + 17.0, 140.0, 14.0, 11.0, 400, c_tertiary, alpha);
-        }
-
-        // 进度条（4px 圆角，Forest/Amber/Crimson 档位色）
+        // 进度条（加粗 10px，4px 圆角，档位色）
+        let bar_h = 10.0;
+        let bar_y = y + 24.0;
         let track = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: pad, top: y + 24.0, right: w - pad, bottom: y + 24.0 + BAR_HEIGHT },
+            rect: D2D_RECT_F { left: pad, top: bar_y, right: w - pad, bottom: bar_y + bar_h },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
@@ -492,16 +487,21 @@ impl Renderer {
         let frac = (anim_v / 100.0).clamp(0.0, 1.0);
         if frac > 0.003 {
             let fg_w = (w - pad * 2.0) * frac;
-            let color = tier_color;
             let fg = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: pad, top: y + 24.0, right: pad + fg_w, bottom: y + 24.0 + BAR_HEIGHT },
+                rect: D2D_RECT_F { left: pad, top: bar_y, right: pad + fg_w, bottom: bar_y + bar_h },
                 radiusX: RADIUS,
                 radiusY: RADIUS,
             };
-            let fill = self.brush(target, color, alpha);
+            let fill = self.brush(target, tier_color, alpha);
             target.FillRoundedRectangle(&fg, &fill);
         }
-        y + 24.0 + BAR_HEIGHT + 18.0
+
+        // 倒计时在进度条下方（右对齐，等宽 11）
+        if let Some(r) = b.resets_at {
+            let cd_text = format!("{} {}", fmt::countdown(r, lang), lang.strings().resets_in);
+            self.text_mono_r(target, &cd_text, w - pad - 160.0, bar_y + bar_h + 4.0, 160.0, 14.0, 11.0, 400, c_tertiary, alpha);
+        }
+        bar_y + bar_h + 18.0
     }}
 
     unsafe fn sparkline(
@@ -513,15 +513,15 @@ impl Renderer {
         width: f32,
         alpha: f32,
     ) -> f32 { unsafe {
-        let h = 28.0;
+        let h = 52.0; // 充分利用面板空间
         let max = series.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1) as f32;
         let n = series.len().max(1) as f32;
-        let gap = 1.5;
-        let bw = ((width - gap * (n - 1.0)) / n).clamp(1.0, 6.0);
+        let gap = 2.0;
+        let bw = ((width - gap * (n - 1.0)) / n).clamp(2.0, 12.0);
         // 模型用量柱：Forest 低调绿（Ember 留给文字强调）
         let brush = self.brush(target, self.theme.ok, alpha * 0.75);
         for (i, (_, v)) in series.iter().enumerate() {
-            let bh = (*v as f32 / max * h).max(1.5);
+            let bh = (*v as f32 / max * h).max(2.0);
             let bx = x + i as f32 * (bw + gap);
             let r = D2D1_ROUNDED_RECT {
                 rect: D2D_RECT_F { left: bx, top: y + h - bh, right: bx + bw, bottom: y + h },
@@ -594,15 +594,40 @@ impl Renderer {
             let _ = ease_in_out_cubic(0.5);
             return;
         }
-        for (i, acc) in app.config.accounts.iter().enumerate() {
-            let selected = app.config.selected.as_deref() == Some(acc.id.as_str());
-            let platform = if acc.platform == crate::api::client::Platform::Cn { s.platform_cn } else { s.platform_intl };
-            self.account_row(target, Hit::SelectAccount(i), Hit::RemoveAccount(i), &acc.name, platform, selected, pad, y, cw, alpha);
-            y += 34.0;
+        // 单账号：有则显示账号卡片（叉掉后回到添加），无则显示添加按钮
+        if let Some((idx, acc)) = app
+            .config
+            .accounts
+            .iter()
+            .enumerate()
+            .find(|(_, a)| Some(a.id.as_str()) == app.config.selected.as_deref())
+            .or_else(|| app.config.accounts.first().map(|a| (0usize, a)))
+        {
+            let platform = if acc.platform == crate::api::client::Platform::Cn {
+                s.platform_cn
+            } else {
+                s.platform_intl
+            };
+            // 版本 / 等级来自用量数据（无数据时占位）
+            let (version, tier) = match &app.data.snapshot {
+                Some(snap) => {
+                    let t = snap.tier.label();
+                    let tier = if t.is_empty() {
+                        snap.plan_label.clone().unwrap_or_else(|| "—".into())
+                    } else {
+                        t.to_string()
+                    };
+                    (snap.plan_version.label().to_string(), tier)
+                }
+                None => ("—".to_string(), "—".to_string()),
+            };
+            self.account_card(target, Hit::RemoveAccount(idx), &acc.name, platform, &version, &tier, pad, y, cw, alpha);
+            y += 48.0 + 12.0;
+        } else {
+            // 添加账号独占一行：占满内容区，视觉对称
+            self.pill_button(target, Hit::AddAccount, pad, y + 2.0, cw, 30.0, s.add_account, alpha, false);
+            y += 36.0;
         }
-        // 添加账号独占一行：占满内容区，视觉对称
-        self.pill_button(target, Hit::AddAccount, pad, y + 2.0, cw, 30.0, s.add_account, alpha, false);
-        y += 36.0;
 
         // ── 轮询间隔（分段第 5 段「自定义」，选中时下方展开输入行）──
         y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
@@ -820,52 +845,50 @@ impl Renderer {
         y + h + 10.0
     }}
 
-    /// 账号行：整行卡片（Linen 底 + 4px 圆角），名称左、平台 tag 右、删除末尾。
-    /// 选中态用 Ink 描边（与输入框聚焦同一视觉语言）。
+    /// 单账号卡片：名称 + 三段信息行（平台 / 套餐版本 / 等级），右上删除。
     #[allow(clippy::too_many_arguments)]
-    unsafe fn account_row(
+    unsafe fn account_card(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        hit: Hit,
         remove: Hit,
         name: &str,
         platform: &str,
-        selected: bool,
+        version: &str,
+        tier: &str,
         x: f32,
         y: f32,
         w: f32,
         alpha: f32,
     ) { unsafe {
-        // 行卡片
-        let row = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y + 1.0, right: x + w, bottom: y + 31.0 },
+        let card = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 48.0 },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
         let fill = self.brush(target, self.theme.track, alpha);
-        target.FillRoundedRectangle(&row, &fill);
-        if selected {
-            let edge = self.brush(target, self.theme.action, alpha);
-            target.DrawRoundedRectangle(&row, &edge, 1.2, None);
+        target.FillRoundedRectangle(&card, &fill);
+        let edge = self.brush(target, self.theme.border, alpha * 0.8);
+        target.DrawRoundedRectangle(&card, &edge, 1.0, None);
+        // 账号名
+        self.text(target, name, x + 12.0, y + 7.0, w - 56.0, 16.0, 14.0, 500, self.theme.text_primary, alpha);
+        // 三段信息行（平台 · 版本 · 等级），三等分且每格居中
+        let cell = (w - 24.0) / 3.0;
+        for (i, text) in [platform, version, tier].iter().enumerate() {
+            let cx = x + 12.0 + cell * i as f32;
+            self.text_aligned(
+                target,
+                text,
+                &D2D_RECT_F { left: cx, top: y + 27.0, right: cx + cell, bottom: y + 42.0 },
+                11.0,
+                400,
+                self.theme.text_secondary,
+                alpha,
+                1,
+                true,
+            );
         }
-        // 名称
-        self.text(target, name, x + 10.0, y + 8.0, w - 110.0, 16.0, 14.0, if selected { 500 } else { 400 }, self.theme.text_primary, alpha);
-        // 平台 tag（等宽 11，Ember 文字点缀）
-        let tag_w = platform.chars().count() as f32 * 6.6 + 4.0;
-        self.text_rect_opts(
-            target,
-            platform,
-            &D2D_RECT_F { left: x + w - 58.0 - tag_w, top: y + 9.0, right: x + w - 54.0, bottom: y + 25.0 },
-            11.0,
-            400,
-            self.theme.accent,
-            alpha,
-            true,
-            true,
-        );
-        // 删除 ×
-        self.x_button(target, remove, x + w - 26.0, y + 11.0);
-        self.hits.push((hit, D2D_RECT_F { left: x, top: y + 1.0, right: x + w - 36.0, bottom: y + 31.0 }));
+        // 删除 ×（右上）
+        self.x_button(target, remove, x + w - 26.0, y + 8.0);
     }}
 
     /// 按钮：primary = Ink 填充（画布上的深墨块）；次级 = Linen 填充。
@@ -937,26 +960,6 @@ impl Renderer {
         let rect = D2D_RECT_F { left: x, top: y + 5.0, right: x + w, bottom: y + h - 4.0 };
         self.text_aligned(target, label, &rect, 12.0, 400, fg, alpha, 1, false);
         self.hits.push((hit, D2D_RECT_F { left: x - 4.0, top: y - 4.0, right: x + w + 4.0, bottom: y + h + 4.0 }));
-    }}
-
-    /// 套餐徽标：Linen 底 + Ember 等宽文字（tag 风）。
-    unsafe fn badge(&mut self, target: &ID2D1HwndRenderTarget, label: &str, x: f32, y: f32, alpha: f32) { unsafe {
-        // 等宽 11px 的字宽近似，中文按 1.7 倍计
-        let units: f32 = label
-            .chars()
-            .map(|c| if c.is_ascii() { 1.0 } else { 1.7 })
-            .sum();
-        let w = units * 6.8 + 20.0;
-        let h = 22.0;
-        let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
-            radiusX: RADIUS,
-            radiusY: RADIUS,
-        };
-        let b = self.brush(target, self.theme.track, alpha);
-        target.FillRoundedRectangle(&r, &b);
-        let rect = D2D_RECT_F { left: x, top: y + 3.0, right: x + w, bottom: y + h - 3.0 };
-        self.text_rect_opts(target, label, &rect, 11.0, 500, self.theme.accent, alpha, false, true);
     }}
 
     unsafe fn icon_button(&mut self, target: &ID2D1HwndRenderTarget, hit: Hit, cx: f32, cy: f32, r: f32, spin: f32) { unsafe {

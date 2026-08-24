@@ -40,8 +40,6 @@ pub struct Theme {
 
 /// 面板宽度（逻辑像素）。
 pub const PANEL_WIDTH: i32 = 340;
-/// 进度条高度。
-pub const BAR_HEIGHT: f32 = 8.0;
 /// 组件统一圆角（Cursor 的锐利纸感签名）。
 pub const RADIUS: f32 = 4.0;
 

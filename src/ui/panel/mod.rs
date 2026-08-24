@@ -132,14 +132,12 @@ impl Panel {
         (logical as f32 * self.dpi).round() as i32
     }
 
-    /// 面板逻辑高度（随视图与账号数动态；自定义输入行展开时 +40）。
-    fn view_height(&self, accounts: usize) -> i32 {
+    /// 面板逻辑高度（含单账号卡片 60；自定义输入行展开时 +40）。
+    fn view_height(&self, _accounts: usize) -> i32 {
         match self.view {
             PanelView::Main => 380,
             PanelView::Settings if self.adding_account => 258,
-            PanelView::Settings => {
-                552 + 34 * accounts as i32 + if self.customizing_interval { 40 } else { 0 }
-            }
+            PanelView::Settings => 576 + if self.customizing_interval { 40 } else { 0 },
         }
     }
 

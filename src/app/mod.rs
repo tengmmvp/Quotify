@@ -420,7 +420,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 eprintln!("{e}");
             }
         }
-        Hit::SelectAccount(i) => select_account(app, panel_hwnd, i),
         Hit::RemoveAccount(i) => {
             if i < app.config.accounts.len() {
                 let removed_id = app.config.accounts[i].id.clone();

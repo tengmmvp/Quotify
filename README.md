@@ -33,4 +33,4 @@ cargo build --release
 
 ## License
 
-MIT
+[GPL-3.0](LICENSE)

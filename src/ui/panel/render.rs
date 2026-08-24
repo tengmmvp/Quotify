@@ -40,6 +40,14 @@ pub enum Hit {
     Retry,
     Back,
     IntervalPreset(u64),
+    /// 轮询间隔：进入自定义输入
+    CustomizeInterval,
+    /// 轮询间隔：应用自定义值
+    ApplyInterval,
+    /// 自绘输入框聚焦
+    InputName,
+    InputKey,
+    InputInterval,
     Language(&'static str),
     /// 添加账号时的平台选择（"cn" / "intl"）
     Platform(&'static str),
@@ -568,15 +576,15 @@ impl Renderer {
                 alpha,
             );
             y += 8.0;
-            // 名称（视觉输入框 + EDIT 子窗口内缩 2px）
+            // 名称 / API key 自绘输入框
+            let input = &app.panel.input;
             self.text(target, s.account_name, pad, y, cw, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
             y += 18.0;
-            self.input_field(target, pad, y, cw);
+            self.input_field(target, Hit::InputName, pad, y, cw, &input.name, input.field == Some(super::InputField::Name), alpha);
             y += 26.0 + 6.0;
-            // API key
             self.text(target, s.api_key_label, pad, y, cw, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
             y += 18.0;
-            self.input_field(target, pad, y, cw);
+            self.input_field(target, Hit::InputKey, pad, y, cw, &input.key, input.field == Some(super::InputField::Key), alpha);
             y += 26.0 + 12.0;
             // 保存/取消成组水平居中
             let pair_w = 88.0 * 2.0 + 12.0;
@@ -588,29 +596,48 @@ impl Renderer {
         }
         for (i, acc) in app.config.accounts.iter().enumerate() {
             let selected = app.config.selected.as_deref() == Some(acc.id.as_str());
-            let label = format!(
-                "{} · {}",
-                acc.name,
-                if acc.platform == crate::api::client::Platform::Cn { s.platform_cn } else { s.platform_intl }
-            );
-            self.account_row(target, Hit::SelectAccount(i), Hit::RemoveAccount(i), &label, selected, pad, y, w, alpha);
+            let platform = if acc.platform == crate::api::client::Platform::Cn { s.platform_cn } else { s.platform_intl };
+            self.account_row(target, Hit::SelectAccount(i), Hit::RemoveAccount(i), &acc.name, platform, selected, pad, y, cw, alpha);
             y += 34.0;
         }
         // 添加账号独占一行：占满内容区，视觉对称
         self.pill_button(target, Hit::AddAccount, pad, y + 2.0, cw, 30.0, s.add_account, alpha, false);
         y += 36.0;
 
-        // ── 轮询间隔 ──
+        // ── 轮询间隔（分段第 5 段「自定义」，选中时下方展开输入行）──
         y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
-        let presets: [(Hit, &str); 4] = [
+        let presets: [(Hit, &str); 5] = [
             (Hit::IntervalPreset(60), s.interval_1m),
             (Hit::IntervalPreset(300), s.interval_5m),
             (Hit::IntervalPreset(900), s.interval_15m),
             (Hit::IntervalPreset(1800), s.interval_30m),
+            (Hit::CustomizeInterval, s.interval_custom),
         ];
         let cur = app.config.general.poll_interval_secs;
-        y = self.segmented_raw(target, &presets, |h| matches!(h, Hit::IntervalPreset(v) if *v == cur), pad, y, cw, alpha);
-        y += 10.0;
+        let is_preset = [60u64, 300, 900, 1800].contains(&cur);
+        y = self.segmented_raw(
+            target,
+            &presets,
+            |h| match h {
+                Hit::IntervalPreset(v) => *v == cur,
+                Hit::CustomizeInterval => !is_preset,
+                _ => false,
+            },
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        if app.panel.customizing_interval {
+            // 输入行：宽输入框左起 + 单位紧随，确定按钮右对齐
+            let input = &app.panel.input;
+            self.input_field(target, Hit::InputInterval, pad, y + 2.0, 96.0, &input.interval, input.field == Some(super::InputField::Interval), alpha);
+            self.text(target, s.interval_custom_unit, pad + 104.0, y + 8.0, 40.0, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
+            self.outline_button(target, Hit::ApplyInterval, w - pad - 56.0, y + 1.0, 56.0, 28.0, s.apply, alpha);
+            y += 40.0;
+        } else {
+            y += 10.0;
+        }
 
         // ── 语言 ──
         y = self.section_label(target, s.language, pad, y, w, alpha, true);
@@ -668,13 +695,30 @@ impl Renderer {
         ny + 20.0
     }}
 
-    /// 输入框视觉：Linen 底 + hairline 描边（EDIT 子窗口在其内 2px）。
-    unsafe fn input_field(&mut self, target: &ID2D1HwndRenderTarget, x: f32, y: f32, w: f32) { unsafe {
+    /// 自绘输入框：Linen 底 + hairline 描边（聚焦时 Ember 描边）+ 等宽文本。
+    /// 光标由系统 caret 呈现（CreateCaret，IME 候选窗跟随其定位）。
+    unsafe fn input_field(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        hit: Hit,
+        x: f32,
+        y: f32,
+        w: f32,
+        content: &str,
+        active: bool,
+        alpha: f32,
+    ) { unsafe {
         let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 26.0 };
-        let fill = self.brush(target, self.theme.track, 1.0);
+        let fill = self.brush(target, self.theme.track, alpha);
         target.FillRectangle(&rect, &fill);
-        let edge = self.brush(target, self.theme.border, 1.0);
-        target.DrawRectangle(&rect, &edge, 1.0, None);
+        let edge_color = if active { self.theme.action } else { self.theme.border };
+        let edge = self.brush(target, edge_color, alpha);
+        target.DrawRectangle(&rect, &edge, 1.2, None);
+        // 只显示末尾可视部分（等宽 7.3px/字符）
+        let max_chars = (((w - 12.0) / 7.3).floor() as usize).max(1);
+        let vis: String = content.chars().rev().take(max_chars).collect::<Vec<_>>().into_iter().rev().collect();
+        self.text_rect_opts(target, &vis, &D2D_RECT_F { left: x + 6.0, top: y + 6.0, right: x + w - 4.0, bottom: y + 22.0 }, 12.0, 400, self.theme.text_primary, alpha, false, true);
+        self.hits.push((hit, D2D_RECT_F { left: x - 4.0, top: y - 4.0, right: x + w + 4.0, bottom: y + 30.0 }));
     }}
 
     /// hairline 分隔线（Stone，暖色 1px）。
@@ -776,34 +820,52 @@ impl Renderer {
         y + h + 10.0
     }}
 
+    /// 账号行：整行卡片（Linen 底 + 4px 圆角），名称左、平台 tag 右、删除末尾。
+    /// 选中态用 Ink 描边（与输入框聚焦同一视觉语言）。
+    #[allow(clippy::too_many_arguments)]
     unsafe fn account_row(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         hit: Hit,
         remove: Hit,
-        label: &str,
+        name: &str,
+        platform: &str,
         selected: bool,
         x: f32,
         y: f32,
         w: f32,
         alpha: f32,
     ) { unsafe {
-        // 选中态：Linen 底 + Forest 左侧 2px 标记（selected navigation 手势）
+        // 行卡片
+        let row = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F { left: x, top: y + 1.0, right: x + w, bottom: y + 31.0 },
+            radiusX: RADIUS,
+            radiusY: RADIUS,
+        };
+        let fill = self.brush(target, self.theme.track, alpha);
+        target.FillRoundedRectangle(&row, &fill);
         if selected {
-            let r = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: x - 6.0, top: y - 2.0, right: w - 8.0, bottom: y + 26.0 },
-                radiusX: RADIUS,
-                radiusY: RADIUS,
-            };
-            let b = self.brush(target, self.theme.track, alpha);
-            target.FillRoundedRectangle(&r, &b);
-            let mark = self.brush(target, self.theme.ok, alpha);
-            self.line(target, x - 2.0, y + 3.0, x - 2.0, y + 21.0, &mark, 2.0);
+            let edge = self.brush(target, self.theme.action, alpha);
+            target.DrawRoundedRectangle(&row, &edge, 1.2, None);
         }
-        self.text(target, label, x, y + 5.0, w - 60.0, 20.0, 14.0, if selected { 500 } else { 400 }, self.theme.text_primary, alpha);
+        // 名称
+        self.text(target, name, x + 10.0, y + 8.0, w - 110.0, 16.0, 14.0, if selected { 500 } else { 400 }, self.theme.text_primary, alpha);
+        // 平台 tag（等宽 11，Ember 文字点缀）
+        let tag_w = platform.chars().count() as f32 * 6.6 + 4.0;
+        self.text_rect_opts(
+            target,
+            platform,
+            &D2D_RECT_F { left: x + w - 58.0 - tag_w, top: y + 9.0, right: x + w - 54.0, bottom: y + 25.0 },
+            11.0,
+            400,
+            self.theme.accent,
+            alpha,
+            true,
+            true,
+        );
         // 删除 ×
-        self.x_button(target, remove, w - x - 24.0, y + 8.0);
-        self.hits.push((hit, D2D_RECT_F { left: x - 6.0, top: y - 2.0, right: w - 34.0, bottom: y + 28.0 }));
+        self.x_button(target, remove, x + w - 26.0, y + 11.0);
+        self.hits.push((hit, D2D_RECT_F { left: x, top: y + 1.0, right: x + w - 36.0, bottom: y + 31.0 }));
     }}
 
     /// 按钮：primary = Ink 填充（画布上的深墨块）；次级 = Linen 填充。

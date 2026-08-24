@@ -317,8 +317,8 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                             let n = app.config.accounts.len();
                             app.panel.show_preview(hwnd, rect, n);
                             app.panel.view = crate::ui::panel::PanelView::Settings;
-                            // 视图切换后重定尺寸（设置页比主界面高）
                             if let Some(p) = app.panel.hwnd {
+                                sync_customizing(app);
                                 relayout_panel(app, p);
                             }
                         }
@@ -362,12 +362,14 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             // 进入设置是明确的交互意图：锁定面板，不再因鼠标离开收起
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.view = crate::ui::panel::PanelView::Settings;
+            sync_customizing(app);
             relayout_panel(app, panel_hwnd);
         }
         Hit::Back => {
             let was_adding = app.panel.adding_account;
             app.panel.adding_account = false;
-            app.panel.destroy_edit_controls_pub();
+            app.panel.customizing_interval = false;
+            app.panel.clear_input_pub(panel_hwnd);
             // 添加账号页的「取消」回设置页；设置页的「返回」才回主界面
             if !was_adding {
                 app.panel.view = crate::ui::panel::PanelView::Main;
@@ -381,6 +383,10 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             if let Some(p) = &app.poller {
                 p.reschedule();
             }
+            // 预设生效：收起自定义输入行
+            app.panel.customizing_interval = false;
+            app.panel.clear_input_pub(panel_hwnd);
+            relayout_panel(app, panel_hwnd);
         }
         Hit::Language(tag) => {
             app.config.general.language = if tag.is_empty() { None } else { Some(tag.to_string()) };
@@ -435,17 +441,30 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.adding_account = true;
             app.panel.pending_platform = crate::api::client::Platform::Cn;
+            app.panel.input.name.clear();
+            app.panel.input.key.clear();
             relayout_panel(app, panel_hwnd);
-            // EDIT 延迟到队列空闲时创建（见 WM_APP_SPAWN_EDIT 注释）
-            unsafe {
-                let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                    Some(panel_hwnd),
-                    crate::ui::panel::WM_APP_SPAWN_EDIT,
-                    Default::default(),
-                    Default::default(),
-                );
-            }
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
+        Hit::InputName => {
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
+        }
+        Hit::InputKey => {
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
+        }
+        Hit::InputInterval => {
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+        }
+        Hit::CustomizeInterval => {
+            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
+            app.panel.customizing_interval = true;
+            if app.panel.input.interval.trim().is_empty() {
+                prefill_interval(app);
+            }
+            relayout_panel(app, panel_hwnd);
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+        }
+        Hit::ApplyInterval => apply_interval(app, panel_hwnd),
         Hit::AccountSwitch => {
             let n = app.config.accounts.len();
             if n > 1 {
@@ -505,16 +524,18 @@ fn select_account(app: &mut App, panel_hwnd: HWND, i: usize) {
     let _ = panel_hwnd;
 }
 
-/// 保存添加账号表单（读取 EDIT 内容）。
+/// 保存添加账号表单（读取自绘输入缓冲）。
 fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
-    let name = read_edit_text(app.panel.edit_name).filter(|s| !s.trim().is_empty());
-    let key = read_edit_text(app.panel.edit_key).filter(|s| !s.trim().is_empty());
-    let (Some(name), Some(key)) = (name, key) else { return };
+    let name = app.panel.input.name.trim().to_string();
+    let key = app.panel.input.key.trim().to_string();
+    if name.is_empty() || key.is_empty() {
+        return;
+    }
 
     let acc = crate::app::config::Account {
         id: app.config.new_account_id(),
-        name: name.trim().to_string(),
-        api_key: key.trim().to_string(),
+        name,
+        api_key: key,
         platform: app.panel.pending_platform,
     };
     let is_first = app.config.accounts.is_empty();
@@ -524,7 +545,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     }
     crate::app::config::save(&app.config);
     app.panel.adding_account = false;
-    app.panel.destroy_edit_controls_pub();
+    app.panel.clear_input_pub(panel_hwnd);
     app.data = AccountData { snapshot: None, last_error: None };
     app.sync_poll_context();
     app.update_tray_icon();
@@ -534,19 +555,60 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 读取 EDIT 控件文本。
-fn read_edit_text(edit: Option<HWND>) -> Option<String> {
-    let h = edit?;
-    unsafe {
-        let len = windows::Win32::UI::WindowsAndMessaging::GetWindowTextLengthW(h);
-        let mut buf = vec![0u16; len as usize + 1];
-        let n = windows::Win32::UI::WindowsAndMessaging::GetWindowTextW(h, &mut buf);
-        Some(String::from_utf16_lossy(&buf[..n as usize]))
+/// 应用自定义轮询间隔（分钟）。结果仍为非预设值时保持输入行展开
+/// （预填新值，当前值始终可见）；恰好落在预设上则收起。
+fn apply_interval(app: &mut App, panel_hwnd: HWND) {
+    if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0) {
+        app.config.general.poll_interval_secs = (mins * 60).max(10);
+        crate::app::config::save(&app.config);
+        app.sync_poll_context();
+        if let Some(p) = &app.poller {
+            p.reschedule();
+        }
+    }
+    sync_customizing(app);
+    app.panel.clear_input_pub(panel_hwnd);
+    relayout_panel(app, panel_hwnd);
+}
+
+/// 当前间隔非预设值时展开自定义输入行并预填；预设则收起。
+fn sync_customizing(app: &mut App) {
+    let cur = app.config.general.poll_interval_secs;
+    let is_preset = [60u64, 300, 900, 1800].contains(&cur);
+    app.panel.customizing_interval = !is_preset;
+    if !is_preset {
+        prefill_interval(app);
+    }
+}
+
+/// 用当前配置预填自定义间隔（分钟，向上取整）。
+fn prefill_interval(app: &mut App) {
+    let cur = app.config.general.poll_interval_secs;
+    let mins = (cur + 59) / 60;
+    app.panel.input.interval = mins.to_string();
+}
+
+/// 面板内按 Enter 的确认行为：名称 → 切到 key；key → 保存；间隔 → 应用。
+pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
+    use crate::ui::panel::InputField;
+    match app.panel.input.field {
+        Some(InputField::Name) => {
+            if !app.panel.input.name.trim().is_empty() {
+                app.panel.focus_input(panel_hwnd, InputField::Key);
+            }
+        }
+        Some(InputField::Key) => {
+            if !app.panel.input.name.trim().is_empty() && !app.panel.input.key.trim().is_empty() {
+                save_pending_account(app, panel_hwnd);
+            }
+        }
+        Some(InputField::Interval) => apply_interval(app, panel_hwnd),
+        None => {}
     }
 }
 
 /// 视图切换后面板重定位重设尺寸。
-fn relayout_panel(app: &App, panel_hwnd: HWND) {
+fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
     let Some(anchor) = app.panel.anchor else { return };
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::*;
@@ -571,77 +633,15 @@ fn relayout_panel(app: &App, panel_hwnd: HWND) {
             y = mi.rcWork.top + 8;
         }
         let _ = SetWindowPos(panel_hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOCOPYBITS);
+        // 同步展开动画的布局基准
+        app.panel.anim_x = x;
+        app.panel.anim_w = w;
+        app.panel.anim_full_h = h;
+        app.panel.anim_bottom = y + h;
         let _ = InvalidateRect(Some(panel_hwnd), None, true);
     }
 }
 
-/// 添加账号时创建 name / key 输入框（EDIT 子控件）。
-/// 由 WM_APP_SPAWN_EDIT 延迟调用（队列空闲时）。
-pub(crate) fn spawn_edit_controls(app: &mut App, panel_hwnd: HWND) {
-    unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::*;
-        let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)
-            .unwrap_or_default();
-        let class = wide("EDIT");
-        // 逻辑布局与 draw_settings 的 input_field 视觉框对齐：
-        // 框 (pad, 126/176, 300×26)，EDIT 内缩 2px
-        let dpi = app.panel.dpi_pub();
-        let lx = |v: i32| (v as f32 * dpi).round() as i32;
-        let x = lx(22);
-        let input_w = lx(296);
-        let h = lx(22);
-        // 15pt Segoe UI（与面板正文字号一致）；HFONT 存 Panel 复用，
-        // 避免多次添加账号累积 GDI 句柄
-        if app.panel.edit_font.is_none() {
-            let face = wide("Segoe UI");
-            app.panel.edit_font = Some(windows::Win32::Graphics::Gdi::CreateFontW(
-                -lx(20),
-                0,
-                0,
-                0,
-                windows::Win32::Graphics::Gdi::FW_NORMAL.0 as i32,
-                0,
-                0,
-                0,
-                windows::Win32::Graphics::Gdi::DEFAULT_CHARSET,
-                windows::Win32::Graphics::Gdi::OUT_DEFAULT_PRECIS,
-                windows::Win32::Graphics::Gdi::CLIP_DEFAULT_PRECIS,
-                windows::Win32::Graphics::Gdi::CLEARTYPE_QUALITY,
-                0,
-                PCWSTR(face.as_ptr()),
-            ));
-        }
-        let font = app.panel.edit_font;
-        for (ey, is_key) in [(lx(128), false), (lx(178), true)] {
-            // 平面无边框：深色底由 WM_CTLCOLOREDIT 上色，与面板风格一体
-            let edit = CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                PCWSTR(class.as_ptr()),
-                None,
-                WS_CHILD | WS_VISIBLE | WINDOW_STYLE(ES_AUTOHSCROLL as u32),
-                x, ey, input_w, h,
-                Some(panel_hwnd),
-                None,
-                Some(hinst.into()),
-                None,
-            );
-            if let Ok(e) = edit {
-                if let Some(f) = font {
-                    let _ = SendMessageW(e, WM_SETFONT, Some(WPARAM(f.0 as usize)), Some(LPARAM(1)));
-                }
-                // 解除 IME 关联：第三方输入法的全局钩子会拖慢发往本窗口
-                // 的每次输入消息（打字/点击都卡数秒的根源）。名称/key 以
-                // ASCII 为主；需要中文时可在别处粘贴。
-                let _ = windows::Win32::UI::Input::Ime::ImmAssociateContext(e, Default::default());
-                if is_key {
-                    app.panel.set_edit_key(e);
-                } else {
-                    app.panel.set_edit_name(e);
-                }
-            }
-        }
-    }
-}
 
 /// 应用入口：初始化、装配、消息循环。
 pub fn run() -> i32 {
@@ -718,13 +718,8 @@ pub fn run() -> i32 {
                 app.panel.adding_account = true;
                 app.panel.pending_platform = crate::api::client::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {
-                    relayout_panel(&app, p);
-                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                        Some(p),
-                        crate::ui::panel::WM_APP_SPAWN_EDIT,
-                        Default::default(),
-                        Default::default(),
-                    );
+                    relayout_panel(&mut app, p);
+                    app.panel.focus_input(p, crate::ui::panel::InputField::Name);
                 }
             }
         }

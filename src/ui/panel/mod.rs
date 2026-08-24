@@ -30,9 +30,6 @@ const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE_DEBOUNCE: usize = 2;
 const TIMER_OUTSIDE_CHECK: usize = 3;
 
-/// 延迟创建输入框（队列空闲时处理，避免在输入消息内同步创建 EDIT 死锁）。
-pub const WM_APP_SPAWN_EDIT: u32 = 0x8000 + 5;
-
 /// 面板的展示模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelMode {
@@ -50,6 +47,34 @@ pub enum PanelView {
     Settings,
 }
 
+/// 自绘输入的目标字段。不使用系统 EDIT：其在本环境与输入法钩子、
+/// 前台锁定、ghost 的兼容问题无解；键盘消息直达面板窗口过程自管理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputField {
+    Name,
+    Key,
+    Interval,
+}
+
+/// 自绘输入状态（缓冲；光标由系统 caret 呈现）。
+pub struct PanelInput {
+    pub field: Option<InputField>,
+    pub name: String,
+    pub key: String,
+    pub interval: String,
+}
+
+impl Default for PanelInput {
+    fn default() -> Self {
+        Self {
+            field: None,
+            name: String::new(),
+            key: String::new(),
+            interval: String::new(),
+        }
+    }
+}
+
 pub struct Panel {
     pub hwnd: Option<HWND>,
     pub mode: PanelMode,
@@ -61,12 +86,15 @@ pub struct Panel {
     /// 设置视图：添加账号子状态（显示输入行）
     pub adding_account: bool,
     pub pending_platform: crate::api::client::Platform,
-    pub edit_name: Option<HWND>,
-    pub edit_key: Option<HWND>,
-    /// 输入框复用字体（15pt Segoe UI）
-    pub(crate) edit_font: Option<windows::Win32::Graphics::Gdi::HFONT>,
-    /// 输入框背景画刷缓存（颜色 → 刷，主题切换时重建）
-    edit_brush: Option<(u32, HBRUSH)>,
+    /// 自绘输入状态
+    pub input: PanelInput,
+    /// 轮询间隔自定义模式（显示输入行）
+    pub customizing_interval: bool,
+    /// 展开动画的当前布局（物理像素；锚定底边做高度生长）
+    pub(crate) anim_x: i32,
+    pub(crate) anim_w: i32,
+    pub(crate) anim_full_h: i32,
+    pub(crate) anim_bottom: i32,
     class_registered: bool,
     hide_anim: bool,
     /// Pinned 模式下鼠标离开面板/托盘区的起始时刻（持续在外 2s 才收起）
@@ -86,10 +114,12 @@ impl Panel {
             renderer: None,
             adding_account: false,
             pending_platform: crate::api::client::Platform::Cn,
-            edit_name: None,
-            edit_key: None,
-            edit_font: None,
-            edit_brush: None,
+            input: PanelInput::default(),
+            customizing_interval: false,
+            anim_x: 0,
+            anim_w: 0,
+            anim_full_h: 0,
+            anim_bottom: 0,
             class_registered: false,
             hide_anim: false,
             outside_since: None,
@@ -102,12 +132,14 @@ impl Panel {
         (logical as f32 * self.dpi).round() as i32
     }
 
-    /// 面板逻辑高度（随视图与账号数动态）。
+    /// 面板逻辑高度（随视图与账号数动态；自定义输入行展开时 +40）。
     fn view_height(&self, accounts: usize) -> i32 {
         match self.view {
             PanelView::Main => 380,
             PanelView::Settings if self.adding_account => 258,
-            PanelView::Settings => 552 + 34 * accounts as i32,
+            PanelView::Settings => {
+                552 + 34 * accounts as i32 + if self.customizing_interval { 40 } else { 0 }
+            }
         }
     }
 
@@ -203,6 +235,11 @@ impl Panel {
                 x, y, w, h,
                 SWP_SHOWWINDOW | SWP_NOCOPYBITS,
             );
+            // 记录布局供展开动画使用（锚定底边）
+            self.anim_x = x;
+            self.anim_w = w;
+            self.anim_full_h = h;
+            self.anim_bottom = y + h;
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // 注意：不再使用 WS_EX_LAYERED 整窗 alpha——layered 与交换链
             // 呈现（HwndRenderTarget）不兼容，且其子控件更新代价高昂。
@@ -233,12 +270,16 @@ impl Panel {
         self.mode = PanelMode::Hidden;
         self.hovered = false;
         self.adding_account = false;
-        self.destroy_edit_controls();
+        self.clear_input(hwnd);
         self.hide_anim = true;
-        if let Some(r) = self.renderer.as_mut() {
-            r.anim.appear = Some(anim::Tween::now(140));
+        // 直接隐藏（收起不做自绘动画——收缩/淡出都会与系统 DWM 过渡
+        // 叠加产生闪烁；消失的顺滑交给系统）
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+            let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
+            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            crate::platform::trim_working_set();
         }
-        unsafe { start_anim(hwnd) };
     }
 
     /// 左键：预览 ⇄ 锁定；已锁定 → 收起。
@@ -252,6 +293,14 @@ impl Panel {
             _ => {
                 self.mode = PanelMode::Pinned;
                 self.show_at(parent, anchor, accounts);
+                // 社区标准（PowerToys/launcher 同类）：点击瞬间进程持有
+                // 前台权，显示后立即激活面板——后台窗口的 EDIT 拿不到
+                // 焦点、IME 行为异常，这是输入卡顿的根源
+                if let Some(h) = self.hwnd {
+                    unsafe {
+                        let _ = SetForegroundWindow(h);
+                    }
+                }
             }
         }
     }
@@ -260,23 +309,102 @@ impl Panel {
         self.mode = PanelMode::Preview;
         self.view = PanelView::Main;
         self.adding_account = false;
-        self.destroy_edit_controls();
+        if let Some(h) = self.hwnd {
+            self.clear_input(h);
+        } else {
+            self.input.field = None;
+        }
         self.show_at(parent, anchor, accounts);
     }
 
-    fn destroy_edit_controls(&mut self) {
-        for e in [self.edit_name.take(), self.edit_key.take()].into_iter().flatten() {
-            unsafe {
-                let _ = DestroyWindow(e);
+    /// 结束输入状态（销毁光标与 IME 上下文）。
+    fn clear_input(&mut self, hwnd: HWND) {
+        self.input.field = None;
+        unsafe {
+            let _ = DestroyCaret();
+            // 摘除 IME 上下文（裸窗口挂上后要收回，避免游离）
+            use windows::Win32::UI::Input::Ime::{
+                ImmAssociateContext, ImmDestroyContext, ImmGetContext, HIMC,
+            };
+            let ctx = ImmGetContext(hwnd);
+            if !ctx.is_invalid() {
+                let _ = ImmAssociateContext(hwnd, HIMC(std::ptr::null_mut()));
+                let _ = ImmDestroyContext(ctx);
             }
         }
     }
 
-    // ── 供 app 层使用的访问器 ──
-
-    pub fn destroy_edit_controls_pub(&mut self) {
-        self.destroy_edit_controls();
+    pub fn clear_input_pub(&mut self, hwnd: HWND) {
+        self.clear_input(hwnd);
     }
+
+    /// 聚焦某个输入字段：系统 caret + IME 上下文（组合窗跟随光标，
+    /// 拼音在 IME 内组合而不是字母透传进缓冲）。
+    pub fn focus_input(&mut self, hwnd: HWND, field: InputField) {
+        self.input.field = Some(field);
+        self.mode = PanelMode::Pinned;
+        unsafe {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
+            let caret_h = self.px(16);
+            let _ = CreateCaret(hwnd, None, 1, caret_h);
+            let _ = ShowCaret(Some(hwnd));
+            self.update_caret(hwnd);
+            self.attach_ime(hwnd);
+        }
+    }
+
+    /// 挂 IME 上下文并把组合窗定位到光标处。
+    unsafe fn attach_ime(&mut self, hwnd: HWND) { unsafe {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::UI::Input::Ime::{
+            ImmAssociateContext, ImmCreateContext, ImmGetContext, ImmReleaseContext,
+            ImmSetCompositionWindow, COMPOSITIONFORM, CFS_POINT,
+        };
+        let _ = ImmAssociateContext(hwnd, ImmCreateContext());
+        let Some(field) = self.input.field else { return };
+        let (buf, bx, by) = match field {
+            InputField::Name => (&self.input.name, 20.0f32, 126.0f32),
+            InputField::Key => (&self.input.key, 20.0, 176.0),
+            InputField::Interval => (&self.input.interval, 20.0, 168.0),
+        };
+        let x = bx + 6.0 + text_width(buf);
+        let pt = POINT {
+            x: (x * self.dpi).round() as i32,
+            y: ((by + 20.0) * self.dpi).round() as i32,
+        };
+        let ctx = ImmGetContext(hwnd);
+        if !ctx.is_invalid() {
+            let mut cf = COMPOSITIONFORM {
+                dwStyle: CFS_POINT,
+                ptCurrentPos: pt,
+                rcArea: windows::Win32::Foundation::RECT::default(),
+            };
+            let _ = ImmSetCompositionWindow(ctx, &mut cf);
+            let _ = ImmReleaseContext(hwnd, ctx);
+        }
+    }}
+
+    /// 按当前字段内容计算光标位置（按字符实际宽度：ASCII 7.3 / 全角 12.5）。
+    /// 坐标与 draw_settings 的 input_field 布局对齐。
+    pub fn update_caret(&self, _hwnd: HWND) {
+        let Some(field) = self.input.field else { return };
+        // (框 x, 框 y)；间隔框左起 96 宽（与 draw_settings 对齐）
+        let (buf, bx, by) = match field {
+            InputField::Name => (&self.input.name, 20.0f32, 126.0f32),
+            InputField::Key => (&self.input.key, 20.0, 176.0),
+            InputField::Interval => (&self.input.interval, 20.0, 168.0),
+        };
+        let x = bx + 6.0 + text_width(buf);
+        let y = by + 5.0;
+        unsafe {
+            let _ = SetCaretPos(
+                (x * self.dpi).round() as i32,
+                (y * self.dpi).round() as i32,
+            );
+        }
+    }
+
+    // ── 供 app 层使用的访问器 ──
 
     pub fn px_of(&self, logical: i32) -> i32 {
         self.px(logical)
@@ -286,16 +414,9 @@ impl Panel {
         self.view_height(accounts)
     }
 
+    #[allow(dead_code)]
     pub fn dpi_pub(&self) -> f32 {
         self.dpi
-    }
-
-    pub fn set_edit_name(&mut self, h: HWND) {
-        self.edit_name = Some(h);
-    }
-
-    pub fn set_edit_key(&mut self, h: HWND) {
-        self.edit_key = Some(h);
     }
 }
 
@@ -379,20 +500,19 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
-                                // 子控件（EDIT）同样算在面板内
+                                // 子控件同样算在面板内
                                 let in_panel = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
-                                // 焦点在面板/其子控件上（正在输入）时绝不收起
-                                let focus = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus();
-                                let focus_in_panel = !focus.is_invalid()
-                                    && (focus == hwnd || GetAncestor(focus, GA_ROOT) == hwnd);
+                                // 输入状态中（正在打字）绝不收起
+                                let focus_in_panel = app.panel.input.field.is_some()
+                                    || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
                                 if in_panel || focus_in_panel {
                                     app.panel.outside_since = None;
                                 } else {
                                     let now = windows::Win32::System::SystemInformation::GetTickCount64();
                                     let since = *app.panel.outside_since.get_or_insert(now);
-                                    // Preview 600ms（悬停移开即收）/ Pinned 2s
+                                    // Preview 300ms（悬停移开即收）/ Pinned 2s
                                     // （给「托盘 → 面板」的移动留时间）
-                                    let timeout: u64 = if preview { 600 } else { 2000 };
+                                    let timeout: u64 = if preview { 300 } else { 2000 };
                                     if now - since > timeout {
                                         app.panel.outside_since = None;
                                         app.panel.begin_hide(hwnd);
@@ -485,81 +605,58 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 }
                 LRESULT(0)
             }
-            WM_APP_SPAWN_EDIT => {
-                // 延迟创建输入框：不在鼠标消息处理内同步创建 EDIT——
-                // 那会与窗口激活/IME 上下文初始化互相等待，导致线程
-                // 死锁（窗口被系统替换成白色 ghost）。队列空闲时创建则安全。
+            WM_CHAR => {
+                // 自绘输入：键盘直达面板（无 EDIT 子窗口，绕开输入法
+                // 钩子与前台锁定的全部兼容问题）
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
-                    crate::app::spawn_edit_controls(app, hwnd);
-                    // PowerToys Run 同款前台授权：后台进程的窗口受前台
-                    // 锁定限制，EDIT 拿不到真焦点，IME 反复等待造成卡顿。
-                    // 挂到当前前台线程的输入队列后再激活+设焦点。
-                    {
-                        let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
-                        let fg_tid =
-                            windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None);
-                        let our_tid = windows::Win32::System::Threading::GetCurrentThreadId();
-                        let attached = fg_tid != 0
-                            && windows::Win32::System::Threading::AttachThreadInput(
-                                our_tid,
-                                fg_tid,
-                                true,
-                            )
-                            .as_bool();
-                        let _ = windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(hwnd);
-                        if let Some(e) = app.panel.edit_name {
-                            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(e));
+                    if app.panel.input.field.is_some() {
+                        let ch = (wparam.0 & 0xFFFF) as u16;
+                        let mut confirm = false;
+                        {
+                            let input = &mut app.panel.input;
+                            let field = input.field;
+                            let buf = match field {
+                                Some(InputField::Name) => &mut input.name,
+                                Some(InputField::Key) => &mut input.key,
+                                _ => &mut input.interval,
+                            };
+                            match char::from_u32(ch as u32) {
+                                Some('\r') | Some('\n') => confirm = true,
+                                Some('\u{8}') => {
+                                    buf.pop();
+                                }
+                                Some('\u{16}') => {
+                                    // Ctrl+V：粘贴剪贴板文本（中文输入的补充路径）
+                                    if let Some(text) = read_clipboard_text() {
+                                        for c in text.chars() {
+                                            if !c.is_control() && buf.len() < 128 {
+                                                buf.push(c);
+                                            }
+                                        }
+                                    }
+                                }
+                                Some(c) if !c.is_control() && (c as u32) != 127 => {
+                                    // Unicode 直收：IME 上屏的中文经 WM_CHAR 到达
+                                    if buf.len() < 128 {
+                                        buf.push(c);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
-                        if attached {
-                            let _ = windows::Win32::System::Threading::AttachThreadInput(
-                                our_tid,
-                                fg_tid,
-                                false,
-                            );
+                        if confirm {
+                            crate::app::confirm_panel_input(app, hwnd);
                         }
+                        app.panel.update_caret(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
             }
-            WM_CTLCOLOREDIT => {
-                // 输入框按主题着色（深色主题下深底浅字，而非系统白底）
-                let app = app_from_tray(hwnd);
-                if let Some(app) = app {
-                    let (bg, fg) = app
-                        .panel
-                        .renderer
-                        .as_ref()
-                        .map(|r| (rgb_of(r.theme.track), rgb_of(r.theme.text_primary)))
-                        .unwrap_or((0x002E_33_34, 0x00E4_EA_EC));
-                    if app.panel.edit_brush.map(|(c, _)| c) != Some(bg) {
-                        if let Some((_, old)) = app.panel.edit_brush.take() {
-                            let _ = windows::Win32::Graphics::Gdi::DeleteObject(old.into());
-                        }
-                        let b = windows::Win32::Graphics::Gdi::CreateSolidBrush(
-                            windows::Win32::Foundation::COLORREF(bg),
-                        );
-                        app.panel.edit_brush = Some((bg, b));
-                    }
-                    let hdc = windows::Win32::Graphics::Gdi::HDC(wparam.0 as *mut _);
-                    let _ = windows::Win32::Graphics::Gdi::SetBkColor(
-                        hdc,
-                        windows::Win32::Foundation::COLORREF(bg),
-                    );
-                    let _ = windows::Win32::Graphics::Gdi::SetTextColor(
-                        hdc,
-                        windows::Win32::Foundation::COLORREF(fg),
-                    );
-                    if let Some((_, b)) = app.panel.edit_brush {
-                        return LRESULT(b.0 as isize);
-                    }
-                }
-                DefWindowProcW(hwnd, msg, wparam, lparam)
-            }
             WM_ERASEBKGND => LRESULT(1), // 全量交给 D2D
             WM_SETCURSOR => {
-                // 只处理面板本体的命中：可点击元素手型，其余箭头。
-                // 子控件（EDIT）冒泡上来的走默认——保留其 I-beam 光标。
+                // 只处理面板本体的命中：可点击元素手型，其余箭头
                 let hit_hwnd = HWND(wparam.0 as *mut _);
                 if hit_hwnd == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
                     let app = app_from_tray(hwnd);
@@ -609,6 +706,29 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT { unsafe {
     if let Some(r) = app.panel.renderer.as_ref() {
         let _ = r;
     }
+    // 展开动画：高度自 88% 生长到 100%（锚定底边，Win11 flyout 风格）；
+    // 收起反向收缩。不依赖 layered，与硬件呈现兼容。
+    if let Some(t) = app
+        .panel
+        .renderer
+        .as_ref()
+        .and_then(|r| r.anim.appear.as_ref())
+    {
+        let p = anim::ease_out_cubic(t.progress());
+        let k = if hiding { 1.0 - p } else { p };
+        let scale = 0.88 + 0.12 * k;
+        let (x, w, full_h, bottom) = (
+            app.panel.anim_x,
+            app.panel.anim_w,
+            app.panel.anim_full_h,
+            app.panel.anim_bottom,
+        );
+        if w > 0 && full_h > 0 {
+            let h = (full_h as f32 * scale).round() as i32;
+            let y = bottom - h;
+            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOCOPYBITS);
+        }
+    }
     let _ = InvalidateRect(Some(hwnd), None, false);
 
     if done {
@@ -639,11 +759,47 @@ fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
 }
 
 /// 线性 [0..1] 颜色 → COLORREF（0x00BBGGRR）。
+#[allow(dead_code)]
 fn rgb_of(c: [f32; 4]) -> u32 {
     let r = (c[0].clamp(0.0, 1.0) * 255.0).round() as u32;
     let g = (c[1].clamp(0.0, 1.0) * 255.0).round() as u32;
     let b = (c[2].clamp(0.0, 1.0) * 255.0).round() as u32;
     r | (g << 8) | (b << 16)
+}
+
+/// 等宽 12px 字号下的文本像素宽（ASCII 7.3 / 全角 CJK 12.5）。
+fn text_width(s: &str) -> f32 {
+    s.chars().map(|c| if c.is_ascii() { 7.3 } else { 12.5 }).sum()
+}
+
+/// 读剪贴板 Unicode 文本（Ctrl+V 粘贴）。
+fn read_clipboard_text() -> Option<String> {
+    unsafe {
+        use windows::Win32::System::DataExchange::{
+            CloseClipboard, GetClipboardData, OpenClipboard,
+        };
+        use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        use windows::Win32::Foundation::HGLOBAL;
+
+        const CF_UNICODETEXT: u32 = 13;
+        OpenClipboard(None).ok()?;
+        let result = GetClipboardData(CF_UNICODETEXT).ok().and_then(|h| {
+            let hg = HGLOBAL(h.0);
+            let ptr = GlobalLock(hg) as *const u16;
+            if ptr.is_null() {
+                return None;
+            }
+            let mut len = 0usize;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
+            let _ = GlobalUnlock(hg);
+            Some(s)
+        });
+        let _ = CloseClipboard();
+        result
+    }
 }
 
 /// lParam 的有符号低位（GET_X_LPARAM 等价，windows-rs 未导出该宏）。

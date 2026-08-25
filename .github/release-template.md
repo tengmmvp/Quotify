@@ -1,10 +1,10 @@
 <div align="center">
 
-# Quotify {tag}
+# Quotify
 
 **GLM Coding Plan 用量小组件**
 
-![platform](https://img.shields.io/badge/Platform-Windows%2010%2B-0078D4?style=flat-square) ![exe](https://img.shields.io/badge/Size-{size}-2ea043?style=flat-square)
+![version](https://img.shields.io/badge/Version-{tag}-6e56cf?style=for-the-badge) ![platform](https://img.shields.io/badge/Platform-Windows%2010%2B-0078D4?style=for-the-badge) ![exe](https://img.shields.io/badge/Size-{size}-2ea043?style=for-the-badge)
 
 </div>
 

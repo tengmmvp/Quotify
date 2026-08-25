@@ -50,11 +50,16 @@ pub enum Hit {
     InputName,
     InputKey,
     InputInterval,
+    /// 团队版：组织 / 项目 ID 输入
+    InputOrg,
+    InputProject,
     Language(&'static str),
     /// 外观模式选择（"" = 跟随系统 / "light" / "dark"）
     Appearance(&'static str),
     /// 添加账号时的平台选择（"cn" / "intl"）
     Platform(&'static str),
+    /// 添加账号时的类型选择（"personal" / "team"；团队仅国内站）
+    AccountType(&'static str),
     /// 添加账号：保存
     SaveAccount,
     ToggleThreshold,
@@ -601,7 +606,9 @@ impl Renderer {
         let section = if app.panel.adding_account { s.platform_section } else { s.accounts_section };
         y = self.section_label(target, section, pad, y, w, alpha, false);
         if app.panel.adding_account {
-            // 添加流程：先选平台（账号类型），再逐行输入名称与 key
+            // 添加流程：平台 → 类型（个人/团队）→ 名称 / key；
+            // 团队版追加组织 / 项目 ID 输入。标签统一 13·400 控件字阶。
+            y = self.sub_label(target, s.account_platform, pad, y, cw, alpha);
             let plats: [(Hit, &str); 2] = [
                 (Hit::Platform("cn"), s.platform_cn),
                 (Hit::Platform("intl"), s.platform_intl),
@@ -616,17 +623,40 @@ impl Renderer {
                 cw,
                 alpha,
             );
-            y += 8.0;
+            y = self.sub_label(target, s.account_type_label, pad, y, cw, alpha);
+            let team = app.panel.pending_team;
+            let types: [(Hit, &str); 2] = [
+                (Hit::AccountType("personal"), s.type_personal),
+                (Hit::AccountType("team"), s.type_team),
+            ];
+            y = self.segmented_raw(
+                target,
+                &types,
+                |h| matches!(h, Hit::AccountType(v) if team == (*v == "team")),
+                pad,
+                y,
+                cw,
+                alpha,
+            );
             // 名称 / API key 自绘输入框
             let input = &app.panel.input;
-            self.text(target, s.account_name, pad, y, cw, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
-            y += 18.0;
+            y = self.sub_label(target, s.account_name, pad, y, cw, alpha);
             self.input_field(target, Hit::InputName, pad, y, cw, &input.name, input.field == Some(super::InputField::Name), alpha);
             y += 26.0 + 6.0;
-            self.text(target, s.api_key_label, pad, y, cw, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
-            y += 18.0;
+            y = self.sub_label(target, s.api_key_label, pad, y, cw, alpha);
             self.input_field(target, Hit::InputKey, pad, y, cw, &input.key, input.field == Some(super::InputField::Key), alpha);
-            y += 26.0 + 12.0;
+            y += 26.0 + 6.0;
+            if team {
+                // 团队版：组织 / 项目 ID（请求头 Bigmodel-Organization / Bigmodel-Project）
+                y = self.sub_label(target, s.org_id_label, pad, y, cw, alpha);
+                self.input_field(target, Hit::InputOrg, pad, y, cw, &input.org, input.field == Some(super::InputField::Org), alpha);
+                y += 26.0 + 6.0;
+                y = self.sub_label(target, s.project_id_label, pad, y, cw, alpha);
+                self.input_field(target, Hit::InputProject, pad, y, cw, &input.project, input.field == Some(super::InputField::Project), alpha);
+                y += 26.0 + 12.0;
+            } else {
+                y += 6.0;
+            }
             // 保存/取消成组水平居中
             let pair_w = 88.0 * 2.0 + 12.0;
             let bx = pad + (cw - pair_w) / 2.0;
@@ -648,6 +678,15 @@ impl Renderer {
                 s.platform_cn
             } else {
                 s.platform_intl
+            };
+            // 团队版账号在平台名牌上并列标注（账号卡无编辑入口，保存后
+            // 仍可辨识账号类型）
+            let platform_owned;
+            let platform = if acc.team {
+                platform_owned = format!("{platform} | {}", s.team_badge);
+                &platform_owned
+            } else {
+                platform
             };
             // 版本 / 等级来自用量数据（无数据时占位）
             let (version, tier) = match &app.data.snapshot {

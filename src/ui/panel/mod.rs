@@ -54,6 +54,10 @@ pub enum InputField {
     Name,
     Key,
     Interval,
+    /// 团队版：组织 ID
+    Org,
+    /// 团队版：项目 ID
+    Project,
 }
 
 /// 自绘输入状态（缓冲；光标由系统 caret 呈现）。
@@ -62,6 +66,8 @@ pub struct PanelInput {
     pub name: String,
     pub key: String,
     pub interval: String,
+    pub org: String,
+    pub project: String,
 }
 
 impl Default for PanelInput {
@@ -71,6 +77,8 @@ impl Default for PanelInput {
             name: String::new(),
             key: String::new(),
             interval: String::new(),
+            org: String::new(),
+            project: String::new(),
         }
     }
 }
@@ -86,6 +94,8 @@ pub struct Panel {
     /// 设置视图：添加账号子状态（显示输入行）
     pub adding_account: bool,
     pub pending_platform: crate::api::client::Platform,
+    /// 添加账号：团队版（展开组织/项目输入行；仅国内站）
+    pub pending_team: bool,
     /// 自绘输入状态
     pub input: PanelInput,
     /// 轮询间隔自定义模式（显示输入行）
@@ -119,6 +129,7 @@ impl Panel {
             renderer: None,
             adding_account: false,
             pending_platform: crate::api::client::Platform::Cn,
+            pending_team: false,
             input: PanelInput::default(),
             customizing_interval: false,
             anim_x: 0,
@@ -144,7 +155,9 @@ impl Panel {
         match self.view {
             // 动态：随指标行数 / 余额 / 副标题伸缩（sync_main_height 维护）
             PanelView::Main => self.main_h,
-            PanelView::Settings if self.adding_account => 258,
+            // 添加页：账号类型双分段（平台/个人团队）+ 名称/key；
+            // 团队版追加组织/项目两行输入（106px）
+            PanelView::Settings if self.adding_account => 338 + if self.pending_team { 106 } else { 0 },
             // 设置页随内容伸缩：账号卡(48) vs 添加按钮(38)、自定义间隔行(+30)、
             // key 失效提示行(+18)；底部留 30px 余量（按钮边框需完整呈现）
             PanelView::Settings => {
@@ -392,9 +405,11 @@ impl Panel {
         let _ = ImmAssociateContext(hwnd, ImmCreateContext());
         let Some(field) = self.input.field else { return };
         let (buf, bx, by) = match field {
-            InputField::Name => (&self.input.name, 20.0f32, 126.0f32),
-            InputField::Key => (&self.input.key, 20.0, 176.0),
+            InputField::Name => (&self.input.name, 20.0f32, 203.0f32),
+            InputField::Key => (&self.input.key, 20.0, 256.0),
             InputField::Interval => (&self.input.interval, 20.0, 168.0),
+            InputField::Org => (&self.input.org, 20.0, 309.0),
+            InputField::Project => (&self.input.project, 20.0, 362.0),
         };
         let x = bx + 6.0 + text_width(buf);
         let pt = POINT {
@@ -419,9 +434,11 @@ impl Panel {
         let Some(field) = self.input.field else { return };
         // (框 x, 框 y)；间隔框左起 96 宽（与 draw_settings 对齐）
         let (buf, bx, by) = match field {
-            InputField::Name => (&self.input.name, 20.0f32, 126.0f32),
-            InputField::Key => (&self.input.key, 20.0, 176.0),
+            InputField::Name => (&self.input.name, 20.0f32, 203.0f32),
+            InputField::Key => (&self.input.key, 20.0, 256.0),
             InputField::Interval => (&self.input.interval, 20.0, 168.0),
+            InputField::Org => (&self.input.org, 20.0, 309.0),
+            InputField::Project => (&self.input.project, 20.0, 362.0),
         };
         let x = bx + 6.0 + text_width(buf);
         let y = by + 5.0;
@@ -656,6 +673,8 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                             let buf = match field {
                                 Some(InputField::Name) => &mut input.name,
                                 Some(InputField::Key) => &mut input.key,
+                                Some(InputField::Org) => &mut input.org,
+                                Some(InputField::Project) => &mut input.project,
                                 _ => &mut input.interval,
                             };
                             match char::from_u32(ch as u32) {

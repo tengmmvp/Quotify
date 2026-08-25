@@ -11,7 +11,7 @@ use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
-use crate::api::client::Platform;
+use crate::api::client::AccountSpec;
 
 /// 一次轮询的结果（跨线程传递给主线程）。
 pub enum PollOutcome {
@@ -20,7 +20,7 @@ pub enum PollOutcome {
 }
 
 /// poller 眼中的「当前要查什么」。主线程在配置/选中账号变更时更新。
-pub type PollTarget = Arc<Mutex<Option<(Platform, String)>>>;
+pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
 /// 当前轮询间隔（秒）。主线程在设置变更时更新。
 pub type PollInterval = Arc<Mutex<u64>>;
 
@@ -120,7 +120,7 @@ fn poll_loop(
             continue;
         }
 
-        let (platform, key) = {
+        let spec = {
             let guard = target.lock().unwrap();
             match guard.clone() {
                 Some(v) => v,
@@ -136,7 +136,7 @@ fn poll_loop(
         };
         had_target = true;
 
-        let outcome = match crate::api::client::fetch_usage(platform, &key) {
+        let outcome = match crate::api::client::fetch_usage(&spec) {
             Ok(s) => PollOutcome::Success(Box::new(s)),
             Err(e) => PollOutcome::Failure(Box::new(e)),
         };

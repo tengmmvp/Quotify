@@ -91,7 +91,12 @@ impl App {
             .config
             .selected_account()
             .filter(|a| !a.api_key.trim().is_empty())
-            .map(|a| (a.platform, a.api_key.clone()));
+            .map(|a| crate::api::client::AccountSpec {
+                platform: a.platform,
+                api_key: a.api_key.clone(),
+                org_id: a.org_id.clone(),
+                project_id: a.project_id.clone(),
+            });
         *self.poll_target.lock().unwrap() = target;
         *self.poll_interval.lock().unwrap() = self.config.general.poll_interval_secs.max(10);
     }
@@ -419,10 +424,25 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::Platform(tag) => {
             app.panel.pending_platform = if tag == "intl" {
+                // 团队版仅国内站：切到国际版时类型同步回个人版
+                app.panel.pending_team = false;
                 crate::api::client::Platform::Intl
             } else {
                 crate::api::client::Platform::Cn
             };
+            collapse_team_focus(app, panel_hwnd);
+            relayout_panel(app, panel_hwnd);
+        }
+        Hit::AccountType(tag) => {
+            app.panel.pending_team = tag == "team";
+            if app.panel.pending_team {
+                // 团队版仅国内站：类型切团队时平台同步回国内
+                app.panel.pending_platform = crate::api::client::Platform::Cn;
+            }
+            // 团队输入行收起时清掉残留的输入焦点
+            collapse_team_focus(app, panel_hwnd);
+            // 团队输入行的显隐影响添加页高度
+            relayout_panel(app, panel_hwnd);
         }
         Hit::SaveAccount => save_pending_account(app, panel_hwnd),
         Hit::ToggleThreshold => {
@@ -466,8 +486,11 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.adding_account = true;
             app.panel.pending_platform = crate::api::client::Platform::Cn;
+            app.panel.pending_team = false;
             app.panel.input.name.clear();
             app.panel.input.key.clear();
+            app.panel.input.org.clear();
+            app.panel.input.project.clear();
             relayout_panel(app, panel_hwnd);
             app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
@@ -476,6 +499,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::InputKey => {
             app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
+        }
+        Hit::InputOrg => {
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Org);
+        }
+        Hit::InputProject => {
+            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Project);
         }
         Hit::InputInterval => {
             app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
@@ -549,6 +578,17 @@ fn select_account(app: &mut App, panel_hwnd: HWND, i: usize) {
     let _ = panel_hwnd;
 }
 
+/// 团队输入行收起（切回个人版）时，若焦点还在组织/项目框里则清除，
+/// 避免光标残留在已消失的控件位置、键盘输入写入隐藏缓冲。
+fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
+    use crate::ui::panel::InputField;
+    if !app.panel.pending_team
+        && matches!(app.panel.input.field, Some(InputField::Org) | Some(InputField::Project))
+    {
+        app.panel.clear_input_pub(panel_hwnd);
+    }
+}
+
 /// 保存添加账号表单（读取自绘输入缓冲）。
 fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     let name = app.panel.input.name.trim().to_string();
@@ -564,6 +604,10 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         name,
         api_key: key,
         platform: app.panel.pending_platform,
+        // 团队版标记与选择头；两 ID 留空时查询自动按个人版降级
+        team: app.panel.pending_team,
+        org_id: app.panel.input.org.trim().to_string(),
+        project_id: app.panel.input.project.trim().to_string(),
     };
     let is_first = app.config.accounts.is_empty();
     app.config.accounts.push(acc.clone());
@@ -626,6 +670,20 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
         }
         Some(InputField::Key) => {
             // 名称可留空（保存时默认 Default），key 必填
+            if !app.panel.input.key.trim().is_empty() {
+                if app.panel.pending_team {
+                    app.panel.focus_input(panel_hwnd, InputField::Org);
+                } else {
+                    save_pending_account(app, panel_hwnd);
+                }
+            }
+        }
+        Some(InputField::Org) => {
+            if !app.panel.input.org.trim().is_empty() {
+                app.panel.focus_input(panel_hwnd, InputField::Project);
+            }
+        }
+        Some(InputField::Project) => {
             if !app.panel.input.key.trim().is_empty() {
                 save_pending_account(app, panel_hwnd);
             }

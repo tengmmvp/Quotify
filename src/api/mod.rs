@@ -7,9 +7,11 @@
 //! 关键结构（`GET {base}/api/monitor/usage/quota/limit` 响应 `data`）：
 //! - `level`：套餐等级（"lite" / "pro" / "max"）
 //! - `limits[]`：
-//!   - `TOKENS_LIMIT` / `CREDIT_LIMIT`：额度桶。`unit:3` = 5 小时滚动窗，
-//!     `unit:6` = 周窗；`percentage` 为已用百分比，`nextResetTime` 为
-//!     毫秒时间戳（5h 桶在 0% 等状态可能缺失）
+//!   - `TOKENS_LIMIT` / `CREDIT_LIMIT`：额度桶。窗口由 `unit`（时间单位
+//!     代码）× `number`（数量）的时长决定：最短桶 = 5 小时滚动窗
+//!     （`unit:3 number:5`）、最长桶 = 周窗（`unit:6 number:1`），30 天
+//!     滚动窗（`unit:1 number:30`）实测也存在；`percentage` 为已用百分比，
+//!     `nextResetTime` 为毫秒时间戳（5h 桶在 0% 等状态可能缺失）
 //!   - `TIME_LIMIT`：MCP 工具用量（月度）。`percentage` 已用百分比、
 //!     `currentValue` 当前值、`usage` 总量、`usageDetails` 明细
 //! - 老套餐（V1，2026-02-12 前订阅）只回一条额度桶，无周窗
@@ -168,18 +170,23 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-/// 额度桶分类（智谱 `unit` 字段的显式窗口分类，参考 cc-switch 实测）。
-enum WindowKind {
-    FiveHour,
-    Weekly,
+/// `unit`（时间单位代码）→ 分钟乘数：1=天、3=小时、4=天、5=分钟、6=周。
+/// 乘数表来自 CodexBar（`{1:1440, 3:60, 5:1, 6:10080}`），unit:4 由
+/// glm-usage-monitor 实测枚举补充。窗口时长 = `number × unit` 分钟，
+/// 如 `3×60=300`（5 小时）、`1×10080`（周）、`30×1440`（30 天滚动窗）。
+fn window_minutes(item: &Value) -> Option<i64> {
+    const MULTIPLIERS: &[(i64, i64)] = &[(1, 1440), (3, 60), (4, 1440), (5, 1), (6, 10080)];
+    let unit = item.get("unit").and_then(Value::as_i64)?;
+    let number = item.get("number").and_then(Value::as_i64).filter(|&n| n > 0)?;
+    MULTIPLIERS.iter().find(|(u, _)| *u == unit).map(|(_, m)| number * m)
 }
 
-fn classify_window(item: &Value) -> Option<WindowKind> {
-    match item.get("unit").and_then(Value::as_i64) {
-        Some(3) => Some(WindowKind::FiveHour),
-        Some(6) => Some(WindowKind::Weekly),
-        _ => None,
-    }
+/// 取 `limits` 数组。兼容三种位置：`data.limits`、`data` 本身即数组、
+/// 响应顶层即数组（V3 实测形态，无 `{data:{limits}}` 信封）。
+fn limits_of(data: &Value) -> Option<&Vec<Value>> {
+    data.get("limits")
+        .and_then(Value::as_array)
+        .or_else(|| data.as_array())
 }
 
 /// 单个 `limits[]` 条目是否为额度桶（积分制 V3 回 `CREDIT_LIMIT`，
@@ -272,20 +279,20 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
     let mut mcp: Option<McpUsage> = None;
     let mut has_credit = false;
     let mut quota_count = 0usize;
-    // unit 缺失/不认识时的兜底桶，按重置时间升序回填空缺槽位
+    // 能算出窗口时长的桶 / 不能的兜底桶，分开处理
+    let mut timed: Vec<(QuotaBucket, i64)> = Vec::new();
     let mut unclassified: Vec<QuotaBucket> = Vec::new();
 
-    if let Some(limits) = data.get("limits").and_then(Value::as_array) {
+    if let Some(limits) = limits_of(data) {
         for item in limits {
             let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
             if is_quota_entry(item) {
                 quota_count += 1;
                 has_credit |= is_credit_entry(item);
                 let bucket = parse_bucket(item);
-                match classify_window(item) {
-                    Some(WindowKind::FiveHour) if five_hour.is_none() => five_hour = Some(bucket),
-                    Some(WindowKind::Weekly) if weekly.is_none() => weekly = Some(bucket),
-                    _ => unclassified.push(bucket),
+                match window_minutes(item) {
+                    Some(minutes) => timed.push((bucket, minutes)),
+                    None => unclassified.push(bucket),
                 }
             } else if kind.eq_ignore_ascii_case("TIME_LIMIT") {
                 // MCP 工具用量（月度）
@@ -298,6 +305,25 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                     details: parse_mcp_details(item),
                 });
             }
+        }
+    }
+
+    // 时长分类（CodexBar 共识）：额度桶按窗口时长归类，最短 = 5 小时
+    // 滚动窗、最长 = 周窗，中间桶丢弃；30 天滚动窗由此正确落入最长桶，
+    // 而按 unit 数值身份（3/6）严格匹配会把 30 天窗漏掉。
+    if !timed.is_empty() {
+        timed.sort_by_key(|&(_, minutes)| minutes);
+        if timed.len() == 1 {
+            let (bucket, minutes) = timed.remove(0);
+            // 单桶：5 小时窗归主槽，其余（如仅周窗的账号）归周槽，避免错标
+            if minutes == 300 {
+                five_hour = Some(bucket);
+            } else {
+                weekly = Some(bucket);
+            }
+        } else {
+            weekly = Some(timed.pop().map(|(b, _)| b).unwrap());
+            five_hour = Some(timed.remove(0).0);
         }
     }
 
@@ -352,26 +378,39 @@ fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
 }
 
 /// 解析完整响应体（`{success, msg?, data}` 信封）。
+/// V3 实测形态下顶层可能直接是 `limits` 数组而无信封，一并兼容。
 pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| FetchError::Api(format!("响应解析失败: {e}")))?;
 
-    if v.get("success").and_then(Value::as_bool) == Some(false) {
-        let msg = v.get("msg").and_then(Value::as_str).unwrap_or("未知错误");
-        let code = v.get("code").and_then(Value::as_i64);
-        return Err(inband_error(code, msg));
-    }
-    // 信封里的 `code` 与 `success` 并存（CodexBar 实测），非 200 视为业务错误
-    if let Some(code) = v.get("code").and_then(Value::as_i64) {
-        if code != 200 {
-            let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
-            return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
+    let data = if v.is_array() {
+        &v
+    } else {
+        if v.get("success").and_then(Value::as_bool) == Some(false) {
+            let msg = v.get("msg").and_then(Value::as_str).unwrap_or("未知错误");
+            let code = v.get("code").and_then(Value::as_i64);
+            return Err(inband_error(code, msg));
         }
+        // 信封里的 `code` 与 `success` 并存（CodexBar 实测），非 200 视为业务错误
+        if let Some(code) = v.get("code").and_then(Value::as_i64) {
+            if code != 200 {
+                let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
+                return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
+            }
+        }
+        v.get("data")
+            .ok_or_else(|| FetchError::Api("响应缺少 data 字段".into()))?
+    };
+
+    // 空额度检测：团队版缺组织/项目选择头时接口仍返回 success，但 limits
+    // 为空（cc-switch #4222/#6402 根因）；个人版 key 无 Coding Plan 权限时
+    // 同形态。给出可行动的错误而不是静默空面板。
+    if limits_of(&data).is_none_or(|limits| limits.is_empty()) {
+        return Err(FetchError::Api(
+            "未返回额度数据：请确认 API key 属于编码套餐（团队版需填写组织/项目 ID）".into(),
+        ));
     }
-    let data = v
-        .get("data")
-        .ok_or_else(|| FetchError::Api("响应缺少 data 字段".into()))?;
-    Ok(parse_usage(data))
+    Ok(parse_usage(&data))
 }
 
 #[cfg(test)]
@@ -526,5 +565,130 @@ mod tests {
         assert_eq!(snap.plan_version, PlanVersion::V2);
         assert_eq!(snap.five_hour.unwrap().used_percent, 0.0);
         assert_eq!(snap.weekly.unwrap().used_percent, 0.0);
+    }
+
+    #[test]
+    fn thirty_day_rolling_window_classifies_by_duration() {
+        // 30 天滚动窗（unit:1 number:30）实测存在，按时长归最长桶（周槽），
+        // 按 unit 数值身份（3/6）匹配会把它整个漏掉
+        let body = r#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "TOKENS_LIMIT", "unit": 1, "number": 30, "percentage": 50.0, "nextResetTime": 1787112000000 },
+                    { "type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 10.0, "nextResetTime": 1778806800000 }
+                ]
+            }
+        }"#;
+        let snap = parse_response(body).unwrap();
+        assert!((snap.five_hour.unwrap().used_percent - 10.0).abs() < 1e-9);
+        assert!((snap.weekly.unwrap().used_percent - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unit4_day_window_supported() {
+        // unit:4=天（glm-usage-monitor 实测枚举），7 天 = 10080 分钟与周窗同级
+        let body = r#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "TOKENS_LIMIT", "unit": 4, "number": 7, "percentage": 40.0 },
+                    { "type": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 5.0 }
+                ]
+            }
+        }"#;
+        let snap = parse_response(body).unwrap();
+        assert!((snap.five_hour.unwrap().used_percent - 5.0).abs() < 1e-9);
+        assert!((snap.weekly.unwrap().used_percent - 40.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn single_weekly_only_bucket_goes_to_weekly_slot() {
+        // 仅周窗的账号（Codex 场景回退）：单桶非 5h 时长归周槽，不错标成 5 小时窗
+        let body = r#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "TOKENS_LIMIT", "unit": 6, "number": 1, "percentage": 33.0, "nextResetTime": 2000000000000 }
+                ]
+            }
+        }"#;
+        let snap = parse_response(body).unwrap();
+        assert!(snap.five_hour.is_none());
+        assert!((snap.weekly.unwrap().used_percent - 33.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn top_level_array_response_parses() {
+        // V3 实测形态：顶层直接是额度数组，无 {data:{limits}} 信封
+        // （样本来自社区 dump，绝对值重算百分比）
+        let body = r#"[
+            { "type": "CREDIT_LIMIT", "unit": 3, "number": 5, "usage": 28000, "currentValue": 2585, "remaining": 25414, "percentage": 9, "nextResetTime": 1786592963348 },
+            { "type": "CREDIT_LIMIT", "unit": 6, "number": 1, "usage": 140000, "currentValue": 58386, "remaining": 81613, "percentage": 41, "nextResetTime": 1786692650981 }
+        ]"#;
+        let snap = parse_response(body).unwrap();
+        assert_eq!(snap.plan_version, PlanVersion::V3);
+        // used = max(usage - remaining, currentValue)
+        let fh = snap.five_hour.unwrap();
+        assert!((fh.used_percent - 2586.0 / 28000.0 * 100.0).abs() < 1e-9);
+        let wk = snap.weekly.unwrap();
+        assert!((wk.used_percent - 58387.0 / 140000.0 * 100.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn empty_limits_returns_actionable_error() {
+        // 团队版缺组织/项目选择头 / key 无 Coding Plan 权限：
+        // success + 空 limits，不能静默成空面板
+        for body in [
+            r#"{ "success": true, "code": 200, "msg": "操作成功", "data": { "limits": [] } }"#,
+            r#"{ "success": true, "data": {} }"#,
+        ] {
+            let err = parse_response(body).unwrap_err();
+            assert!(matches!(err, FetchError::Api(_)), "{body} → {err:?}");
+            assert!(err.to_string().contains("编码套餐"), "{body} → {err}");
+        }
+    }
+
+    /// 2026-08-25 控制台实测样本（bigmodel.cn）：单 5h 桶 + MCP 明细，
+    /// level 小写 "max"，MCP 三明细之和恰等于 currentValue
+    #[test]
+    fn real_console_sample_single_bucket_with_mcp_details() {
+        let body = r#"{
+            "code": 200,
+            "msg": "操作成功",
+            "data": {
+                "limits": [
+                    {
+                        "type": "TIME_LIMIT", "unit": 5, "number": 1,
+                        "usage": 4000, "currentValue": 85, "remaining": 3915,
+                        "percentage": 2, "nextResetTime": 1789707570998,
+                        "usageDetails": [
+                            { "modelCode": "search-prime", "usage": 56 },
+                            { "modelCode": "web-reader", "usage": 29 },
+                            { "modelCode": "zread", "usage": 0 }
+                        ]
+                    },
+                    {
+                        "type": "TOKENS_LIMIT", "unit": 3, "number": 5,
+                        "percentage": 11, "nextResetTime": 1787633490996
+                    }
+                ],
+                "level": "max"
+            },
+            "success": true
+        }"#;
+        let snap = parse_response(body).unwrap();
+        assert_eq!(snap.plan_version, PlanVersion::V1);
+        assert_eq!(snap.tier, PlanTier::Max);
+        assert!(snap.weekly.is_none());
+        let fh = snap.five_hour.unwrap();
+        assert!((fh.used_percent - 11.0).abs() < 1e-9);
+        assert!(fh.resets_at.is_some());
+        let mcp = snap.mcp.unwrap();
+        assert_eq!(mcp.total, 4000.0);
+        assert_eq!(mcp.current_value, 85.0);
+        assert_eq!(mcp.details.len(), 3);
+        assert_eq!(mcp.details[0].model_code, "search-prime");
+        assert!(mcp.resets_at.is_some());
     }
 }

@@ -50,6 +50,15 @@ pub struct Account {
     /// API key（本地明文，与 cc-switch 等同类工具惯例一致）
     pub api_key: String,
     pub platform: Platform,
+    /// 团队版标记（仅国内站；请求走 `?type=2` + 组织/项目选择头）
+    #[serde(default)]
+    pub team: bool,
+    /// 团队版：`Bigmodel-Organization` 头的值
+    #[serde(default)]
+    pub org_id: String,
+    /// 团队版：`Bigmodel-Project` 头的值
+    #[serde(default)]
+    pub project_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -112,6 +121,9 @@ notify_reset_weekly_enabled = false
 # name = "我的 GLM"
 # api_key = "你的 API key"
 # platform = "cn"          # cn = 国内版 open.bigmodel.cn；intl = 国际版 api.z.ai
+# team = false             # 团队版（仅国内站）：true 时下面两项必填
+# org_id = ""              # 团队版：组织 ID（bigmodel-organization 请求头）
+# project_id = ""          # 团队版：项目 ID（bigmodel-project 请求头）
 
 # 当前选中的账号 id
 selected = ""

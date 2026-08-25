@@ -144,7 +144,10 @@ mod tests {
         let t = now + chrono::Duration::days(3);
         assert_eq!(countdown_from(t, now, zh), "3 天");
         // 已过期 → 0 秒，不出现负数
-        assert_eq!(countdown_from(now - chrono::Duration::minutes(5), now, zh), "0 秒");
+        assert_eq!(
+            countdown_from(now - chrono::Duration::minutes(5), now, zh),
+            "0 秒"
+        );
     }
 
     #[test]

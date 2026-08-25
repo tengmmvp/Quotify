@@ -4,27 +4,26 @@
 
 use std::collections::HashMap;
 
-use windows::core::PCWSTR;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_IGNORE, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
-    D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_BEZIER_SEGMENT, D2D1_COLOR_F,
+    D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT,
 };
-use windows_numerics::{Matrix3x2, Vector2};
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, D2D1_DRAW_TEXT_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_CAP_STYLE_FLAT,
-    D2D1_DASH_STYLE_DASH, D2D1_STROKE_STYLE_PROPERTIES,
-    ID2D1HwndRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
+    ID2D1HwndRenderTarget, ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
-    DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_TEXT_ALIGNMENT_LEADING,
-    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-    IDWriteFactory, IDWriteTextFormat,
+    DWRITE_FACTORY_TYPE_SHARED, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+    DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
 };
-use windows::Win32::Foundation::HWND;
+use windows::core::PCWSTR;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use super::anim::{Tween, animations_allowed, ease_out_cubic};
 use super::layout;
@@ -104,7 +103,10 @@ pub struct AnimState {
 
 impl AnimState {
     pub fn new() -> Self {
-        Self { appear: None, spin: 0.0 }
+        Self {
+            appear: None,
+            spin: 0.0,
+        }
     }
 }
 
@@ -154,12 +156,9 @@ pub struct Renderer {
 impl Renderer {
     pub fn new() -> Option<Self> {
         unsafe {
-            let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)
-            .ok()?;
-            let dwrite: IDWriteFactory = DWriteCreateFactory(
-                DWRITE_FACTORY_TYPE_SHARED,
-            )
-            .ok()?;
+            let factory: ID2D1Factory =
+                D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
+            let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
             Some(Self {
                 factory,
                 dwrite,
@@ -225,7 +224,11 @@ impl Renderer {
         dpi: f32,
     ) {
         unsafe {
-            let dpi = if dpi.is_finite() && dpi >= 1.0 { dpi } else { 1.0 };
+            let dpi = if dpi.is_finite() && dpi >= 1.0 {
+                dpi
+            } else {
+                1.0
+            };
             let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
             let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
             // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准
@@ -240,10 +243,13 @@ impl Renderer {
                 // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫
                 let size_only = self.target.is_some() && self.target_dpi == dpi;
                 let resized = size_only
-                    && self
-                        .target
-                        .as_ref()
-                        .is_some_and(|t| t.Resize(&D2D_SIZE_U { width: w_px, height: h_px }).is_ok());
+                    && self.target.as_ref().is_some_and(|t| {
+                        t.Resize(&D2D_SIZE_U {
+                            width: w_px,
+                            height: h_px,
+                        })
+                        .is_ok()
+                    });
                 if !resized {
                     self.target = None;
                     let pf = D2D1_PIXEL_FORMAT {
@@ -260,14 +266,22 @@ impl Renderer {
                     };
                     let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
                         hwnd,
-                        pixelSize: D2D_SIZE_U { width: w_px, height: h_px },
+                        pixelSize: D2D_SIZE_U {
+                            width: w_px,
+                            height: h_px,
+                        },
                         presentOptions: D2D1_PRESENT_OPTIONS_NONE,
                     };
                     match self.factory.CreateHwndRenderTarget(&props, &hwnd_props) {
                         Ok(target) => {
                             let black = target
                                 .CreateSolidColorBrush(
-                                    &D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 1.0 },
+                                    &D2D1_COLOR_F {
+                                        r: 0.0,
+                                        g: 0.0,
+                                        b: 0.0,
+                                        a: 1.0,
+                                    },
                                     None,
                                 )
                                 .ok();
@@ -276,13 +290,17 @@ impl Renderer {
                             self.target_dpi = dpi;
                         }
                         Err(e) => {
-                            crate::platform::log(&format!("[Quotify] CreateHwndRenderTarget 失败: {e}"));
+                            crate::platform::log(&format!(
+                                "[Quotify] CreateHwndRenderTarget 失败: {e}"
+                            ));
                             return;
                         }
                     }
                 }
             }
-            let Some(target) = self.target.clone() else { return };
+            let Some(target) = self.target.clone() else {
+                return;
+            };
             let rect_logical = RECT {
                 left: 0,
                 top: 0,
@@ -328,7 +346,12 @@ impl Renderer {
 
         let bg = self.theme.bg;
         let bg_brush = self.brush(target, bg, 1.0);
-        let bg_rect = D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h };
+        let bg_rect = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: w,
+            bottom: h,
+        };
         target.FillRectangle(&bg_rect, &bg_brush);
 
         match view {
@@ -359,7 +382,11 @@ impl Renderer {
             let v = s.plan_version.label();
             let tier = {
                 let t = s.tier.label();
-                if t.is_empty() { s.plan_label.clone().unwrap_or_default() } else { t.to_string() }
+                if t.is_empty() {
+                    s.plan_label.clone().unwrap_or_default()
+                } else {
+                    t.to_string()
+                }
             };
             match (v.is_empty(), tier.is_empty()) {
                 (false, false) => Some(format!("{v} · {tier}")),
@@ -368,29 +395,71 @@ impl Renderer {
                 (true, true) => None,
             }
         });
-        let (logo_size, logo_y) = if meta.is_some() { (32.0, y + 5.0) } else { (22.0, y + 1.0) };
+        let (logo_size, logo_y) = if meta.is_some() {
+            (32.0, y + 5.0)
+        } else {
+            (22.0, y + 1.0)
+        };
         self.logo(target, pad, logo_y, logo_size, alpha);
         let tx = pad + logo_size + 10.0;
         let tw = w - tx - 88.0;
         let title_disp = ellipsize_px(title, 16.0, tw);
-        self.text(target, &title_disp, tx, y + 2.0, tw, 22.0, 16.0, 500, self.theme.text_primary, alpha);
+        self.text(
+            target,
+            &title_disp,
+            tx,
+            y + 2.0,
+            tw,
+            22.0,
+            16.0,
+            500,
+            self.theme.text_primary,
+            alpha,
+        );
         if let Some(m) = &meta {
-            self.text(target, m, tx + 1.0, y + 24.0, tw, 17.0, 12.0, 400, self.theme.text_secondary, alpha);
+            self.text(
+                target,
+                m,
+                tx + 1.0,
+                y + 24.0,
+                tw,
+                17.0,
+                12.0,
+                400,
+                self.theme.text_secondary,
+                alpha,
+            );
         }
         let btn_r = 16.0;
         let refresh_cx = w - pad - btn_r - 30.0;
         let settings_cx = w - pad - btn_r;
         let btn_cy = if snap.is_some() { y + 19.0 } else { y + 12.0 };
-        self.icon_button(target, Hit::Refresh, refresh_cx, btn_cy, btn_r, self.anim.spin);
+        self.icon_button(
+            target,
+            Hit::Refresh,
+            refresh_cx,
+            btn_cy,
+            btn_r,
+            self.anim.spin,
+        );
         self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
         if model.accounts_count > 1 {
             self.hits.push((
                 Hit::AccountSwitch,
-                D2D_RECT_F { left: pad, top: y, right: w - 110.0, bottom: y + if snap.is_some() { 42.0 } else { 26.0 } },
+                D2D_RECT_F {
+                    left: pad,
+                    top: y,
+                    right: w - 110.0,
+                    bottom: y + if snap.is_some() { 42.0 } else { 26.0 },
+                },
             ));
         }
         // 与 sync_main_height 同用 has_meta 谓词，否则内容会与 footer 重叠
-        y += if snap.is_some_and(|s| s.has_meta()) { 52.0 } else { 38.0 };
+        y += if snap.is_some_and(|s| s.has_meta()) {
+            52.0
+        } else {
+            38.0
+        };
 
         // ── 数据态 ──
         match (snap, model.error) {
@@ -410,11 +479,41 @@ impl Renderer {
                 let block_h = 48.0 + 18.0 + 28.0 + if has_sub { 44.0 } else { 0.0 };
                 let top = center_y - block_h / 2.0;
                 self.logo(target, cx - 24.0, top, 48.0, alpha);
-                let title_rect = D2D_RECT_F { left: pad, top: top + 66.0, right: w - pad, bottom: top + 66.0 + 28.0 };
-                self.text_aligned(target, t1, &title_rect, 21.0, 400, self.theme.text_primary, alpha, Align::Center, false);
+                let title_rect = D2D_RECT_F {
+                    left: pad,
+                    top: top + 66.0,
+                    right: w - pad,
+                    bottom: top + 66.0 + 28.0,
+                };
+                self.text_aligned(
+                    target,
+                    t1,
+                    &title_rect,
+                    21.0,
+                    400,
+                    self.theme.text_primary,
+                    alpha,
+                    Align::Center,
+                    false,
+                );
                 if has_sub {
-                    let sub_rect = D2D_RECT_F { left: pad + 12.0, top: top + 96.0, right: w - pad - 12.0, bottom: top + 96.0 + 40.0 };
-                    self.text_aligned(target, t2, &sub_rect, 14.0, 400, self.theme.text_secondary, alpha, Align::Center, false);
+                    let sub_rect = D2D_RECT_F {
+                        left: pad + 12.0,
+                        top: top + 96.0,
+                        right: w - pad - 12.0,
+                        bottom: top + 96.0 + 40.0,
+                    };
+                    self.text_aligned(
+                        target,
+                        t2,
+                        &sub_rect,
+                        14.0,
+                        400,
+                        self.theme.text_secondary,
+                        alpha,
+                        Align::Center,
+                        false,
+                    );
                 }
             }
             (None, Some(e)) => {
@@ -426,25 +525,64 @@ impl Renderer {
                 let card_h = 96.0;
                 let card_top = body_top + (body_h - card_h) / 2.0;
                 let card = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F { left: pad, top: card_top, right: w - pad, bottom: card_top + card_h },
+                    rect: D2D_RECT_F {
+                        left: pad,
+                        top: card_top,
+                        right: w - pad,
+                        bottom: card_top + card_h,
+                    },
                     radiusX: RADIUS,
                     radiusY: RADIUS,
                 };
                 let fill = self.brush(
                     target,
-                    [self.theme.danger[0], self.theme.danger[1], self.theme.danger[2], 0.06],
+                    [
+                        self.theme.danger[0],
+                        self.theme.danger[1],
+                        self.theme.danger[2],
+                        0.06,
+                    ],
                     alpha,
                 );
                 target.FillRoundedRectangle(&card, &fill);
                 let edge = self.brush(
                     target,
-                    [self.theme.danger[0], self.theme.danger[1], self.theme.danger[2], 0.35],
+                    [
+                        self.theme.danger[0],
+                        self.theme.danger[1],
+                        self.theme.danger[2],
+                        0.35,
+                    ],
                     alpha,
                 );
                 target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-                let title_rect = D2D_RECT_F { left: pad + 12.0, top: card_top + 18.0, right: w - pad - 12.0, bottom: card_top + 40.0 };
-                self.text_aligned(target, &msg, &title_rect, 13.0, 500, self.theme.danger, alpha, Align::Center, false);
-                self.outline_button(target, Hit::Retry, cx - 44.0, card_top + 50.0, 88.0, 28.0, s.retry, alpha);
+                let title_rect = D2D_RECT_F {
+                    left: pad + 12.0,
+                    top: card_top + 18.0,
+                    right: w - pad - 12.0,
+                    bottom: card_top + 40.0,
+                };
+                self.text_aligned(
+                    target,
+                    &msg,
+                    &title_rect,
+                    13.0,
+                    500,
+                    self.theme.danger,
+                    alpha,
+                    Align::Center,
+                    false,
+                );
+                self.outline_button(
+                    target,
+                    Hit::Retry,
+                    cx - 44.0,
+                    card_top + 50.0,
+                    88.0,
+                    28.0,
+                    s.retry,
+                    alpha,
+                );
             }
             _ => {
                 if let Some(snap) = snap {
@@ -453,10 +591,26 @@ impl Renderer {
                     y += 14.0;
                     let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
                     target.FillRectangle(
-                        &D2D_RECT_F { left: pad, top: y + 1.0, right: pad + 3.0, bottom: y + 13.0 },
+                        &D2D_RECT_F {
+                            left: pad,
+                            top: y + 1.0,
+                            right: pad + 3.0,
+                            bottom: y + 13.0,
+                        },
                         &bar,
                     );
-                    self.text(target, s.usage_section, pad + 7.0, y, w - pad * 2.0 - 7.0, 17.0, 12.0, 600, self.theme.text_tertiary, alpha);
+                    self.text(
+                        target,
+                        s.usage_section,
+                        pad + 7.0,
+                        y,
+                        w - pad * 2.0 - 7.0,
+                        17.0,
+                        12.0,
+                        600,
+                        self.theme.text_tertiary,
+                        alpha,
+                    );
                     y += 26.0;
 
                     let detail_of = |cur: Option<f64>, tot: Option<f64>| -> Option<String> {
@@ -470,20 +624,52 @@ impl Renderer {
                         }
                     };
                     if let Some(b) = snap.five_hour.as_ref() {
-                        y = self.metric_row(target, s.five_hour, b.used_percent, detail_of(b.current, b.total), b.resets_at, y, w, alpha, model.lang);
+                        y = self.metric_row(
+                            target,
+                            s.five_hour,
+                            b.used_percent,
+                            detail_of(b.current, b.total),
+                            b.resets_at,
+                            y,
+                            w,
+                            alpha,
+                            model.lang,
+                        );
                     }
                     if let Some(b) = snap.weekly.as_ref() {
-                        y = self.metric_row(target, s.weekly, b.used_percent, detail_of(b.current, b.total), b.resets_at, y, w, alpha, model.lang);
+                        y = self.metric_row(
+                            target,
+                            s.weekly,
+                            b.used_percent,
+                            detail_of(b.current, b.total),
+                            b.resets_at,
+                            y,
+                            w,
+                            alpha,
+                            model.lang,
+                        );
                     }
                     if let Some(m) = snap.mcp.as_ref() {
                         let detail = if m.total > 0.0 {
-                            Some(s.used_of
-                                .replace("{cur}", &fmt::compact_number(m.current_value))
-                                .replace("{tot}", &fmt::compact_number(m.total)))
+                            Some(
+                                s.used_of
+                                    .replace("{cur}", &fmt::compact_number(m.current_value))
+                                    .replace("{tot}", &fmt::compact_number(m.total)),
+                            )
                         } else {
                             None
                         };
-                        y = self.metric_row(target, s.mcp_tools, m.used_percent, detail, m.resets_at, y, w, alpha, model.lang);
+                        y = self.metric_row(
+                            target,
+                            s.mcp_tools,
+                            m.used_percent,
+                            detail,
+                            m.resets_at,
+                            y,
+                            w,
+                            alpha,
+                            model.lang,
+                        );
                     }
 
                     // 余额为国内版功能：撕线之下的「总额」行——刊头带强调块，右侧等宽数值
@@ -493,12 +679,39 @@ impl Renderer {
                         y += 14.0;
                         let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
                         target.FillRectangle(
-                            &D2D_RECT_F { left: pad, top: y + 1.0, right: pad + 3.0, bottom: y + 13.0 },
+                            &D2D_RECT_F {
+                                left: pad,
+                                top: y + 1.0,
+                                right: pad + 3.0,
+                                bottom: y + 13.0,
+                            },
                             &bar,
                         );
-                        self.text(target, s.balance_label, pad + 7.0, y, 140.0, 17.0, 12.0, 600, self.theme.text_tertiary, alpha);
+                        self.text(
+                            target,
+                            s.balance_label,
+                            pad + 7.0,
+                            y,
+                            140.0,
+                            17.0,
+                            12.0,
+                            600,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
                         let line = format!("¥{:.2}", b.available);
-                        self.text_mono_r(target, &line, w - pad - 140.0, y, 140.0, 18.0, 12.0, 500, self.theme.text_primary, alpha);
+                        self.text_mono_r(
+                            target,
+                            &line,
+                            w - pad - 140.0,
+                            y,
+                            140.0,
+                            18.0,
+                            12.0,
+                            500,
+                            self.theme.text_primary,
+                            alpha,
+                        );
                     }
                 }
                 let footer_y = dy + h - 36.0;
@@ -507,24 +720,51 @@ impl Renderer {
                     let line = match model.snapshot {
                         Some(snap) => format!(
                             "{} · {} {msg}",
-                            s.data_as_of.replace("{t}", &fmt::as_of_time(snap.queried_at)),
+                            s.data_as_of
+                                .replace("{t}", &fmt::as_of_time(snap.queried_at)),
                             s.fetch_failed,
                         ),
                         None => msg,
                     };
-                    self.text(target, &line, pad, footer_y + 6.0, w - pad * 2.0 - 74.0, 30.0, 12.0, 400, self.theme.text_secondary, alpha);
-                    self.outline_button(target, Hit::Retry, w - pad - 62.0, footer_y + 4.0, 62.0, 26.0, s.retry, alpha);
+                    self.text(
+                        target,
+                        &line,
+                        pad,
+                        footer_y + 6.0,
+                        w - pad * 2.0 - 74.0,
+                        30.0,
+                        12.0,
+                        400,
+                        self.theme.text_secondary,
+                        alpha,
+                    );
+                    self.outline_button(
+                        target,
+                        Hit::Retry,
+                        w - pad - 62.0,
+                        footer_y + 4.0,
+                        62.0,
+                        26.0,
+                        s.retry,
+                        alpha,
+                    );
                 } else if let Some(snap) = model.snapshot {
                     let fresh = (chrono::Local::now() - snap.queried_at).num_seconds() < 60;
                     let text = if fresh {
                         s.updated_just_now.to_string()
                     } else {
-                        s.updated_ago.replace("{t}", &fmt::ago(snap.queried_at, model.lang))
+                        s.updated_ago
+                            .replace("{t}", &fmt::ago(snap.queried_at, model.lang))
                     };
                     self.text_aligned(
                         target,
                         &text,
-                        &D2D_RECT_F { left: pad, top: footer_y + 8.0, right: w - pad, bottom: footer_y + 25.0 },
+                        &D2D_RECT_F {
+                            left: pad,
+                            top: footer_y + 8.0,
+                            right: w - pad,
+                            bottom: footer_y + 25.0,
+                        },
                         12.0,
                         400,
                         self.theme.text_tertiary,
@@ -556,39 +796,91 @@ impl Renderer {
         // 先拷贝所需颜色：后续 text/brush 调用要 &mut self，不能持有 theme 引用
         let (c_label, c_value, c_caption, c_track) = (
             self.theme.text_primary,
-            if critical { self.theme.danger } else { self.theme.text_primary },
+            if critical {
+                self.theme.danger
+            } else {
+                self.theme.text_primary
+            },
             self.theme.text_tertiary,
             self.theme.track,
         );
 
-        self.text(target, label, pad, y + 2.0, w - pad * 2.0 - 110.0, 19.0, 14.0, 400, c_label, alpha);
+        self.text(
+            target,
+            label,
+            pad,
+            y + 2.0,
+            w - pad * 2.0 - 110.0,
+            19.0,
+            14.0,
+            400,
+            c_label,
+            alpha,
+        );
         let pct = fmt::percent(used_percent);
-        self.text_mono_r(target, &pct, w - pad - 100.0, y + 1.0, 100.0, 19.0, 14.0, 600, c_value, alpha);
+        self.text_mono_r(
+            target,
+            &pct,
+            w - pad - 100.0,
+            y + 1.0,
+            100.0,
+            19.0,
+            14.0,
+            600,
+            c_value,
+            alpha,
+        );
 
         // 5px 直角细条，与面板锐利纸感一致；critical 转警示色
         let bar_h = 5.0;
         let bar_y = y + 22.0;
-        let track = D2D_RECT_F { left: pad, top: bar_y, right: w - pad, bottom: bar_y + bar_h };
+        let track = D2D_RECT_F {
+            left: pad,
+            top: bar_y,
+            right: w - pad,
+            bottom: bar_y + bar_h,
+        };
         let track_brush = self.brush(target, c_track, alpha);
         target.FillRectangle(&track, &track_brush);
         let frac = (used_percent / 100.0).clamp(0.0, 1.0) as f32;
         if frac > 0.004 {
             // 最小可见长度 2px，避免 0.x% 时出现针尖
             let fg_w = ((w - pad * 2.0) * frac).max(2.0);
-            let fg = D2D_RECT_F { left: pad, top: bar_y, right: pad + fg_w, bottom: bar_y + bar_h };
+            let fg = D2D_RECT_F {
+                left: pad,
+                top: bar_y,
+                right: pad + fg_w,
+                bottom: bar_y + bar_h,
+            };
             let fill = self.brush(target, c_value, alpha);
             target.FillRectangle(&fg, &fill);
         }
 
         if let Some(r) = resets_at {
             let line = strings.resets_line.replace("{t}", &fmt::countdown(r, lang));
-            self.text(target, &line, pad, bar_y + bar_h + 5.0, (w - pad * 2.0) * 0.55, 16.0, 11.0, 400, c_caption, alpha);
+            self.text(
+                target,
+                &line,
+                pad,
+                bar_y + bar_h + 5.0,
+                (w - pad * 2.0) * 0.55,
+                16.0,
+                11.0,
+                400,
+                c_caption,
+                alpha,
+            );
         }
         if let Some(d) = detail {
             self.text_rect_opts(
                 target,
                 &d,
-                &D2D_RECT_F { left: pad + (w - pad * 2.0) * 0.55, top: bar_y + bar_h + 5.0, right: w - pad, bottom: bar_y + bar_h + 21.0 },
+                &D2D_RECT_F {
+                    left: pad + (w - pad * 2.0) * 0.55,
+                    top: bar_y + bar_h + 5.0,
+                    right: w - pad,
+                    bottom: bar_y + bar_h + 21.0,
+                },
                 11.0,
                 400,
                 c_caption,
@@ -619,13 +911,36 @@ impl Renderer {
         if !panel.adding_account {
             self.back_arrow(target, Hit::Back, pad, y + 6.0);
         }
-        let nav_title = if panel.adding_account { s.add_account } else { s.settings };
-        let title_rect = D2D_RECT_F { left: pad, top: y, right: w - pad, bottom: y + 26.0 };
-        self.text_aligned(target, nav_title, &title_rect, 16.0, 400, self.theme.text_primary, alpha, Align::Center, false);
+        let nav_title = if panel.adding_account {
+            s.add_account
+        } else {
+            s.settings
+        };
+        let title_rect = D2D_RECT_F {
+            left: pad,
+            top: y,
+            right: w - pad,
+            bottom: y + 26.0,
+        };
+        self.text_aligned(
+            target,
+            nav_title,
+            &title_rect,
+            16.0,
+            400,
+            self.theme.text_primary,
+            alpha,
+            Align::Center,
+            false,
+        );
         y += 30.0;
 
         // ── 账号：设置页首项即数据来源；添加页此处标题用「版本」──
-        let section = if panel.adding_account { s.platform_section } else { s.accounts_section };
+        let section = if panel.adding_account {
+            s.platform_section
+        } else {
+            s.accounts_section
+        };
         y = self.section_label(target, section, pad, y, w, alpha, false);
         if panel.adding_account {
             // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID
@@ -663,29 +978,85 @@ impl Renderer {
             let input = &panel.input;
             self.sub_label(target, s.account_name, pad, y, cw, alpha);
             let name_y = dy + layout::ADD_NAME_Y;
-            self.input_field(target, Hit::InputName, layout::INPUT_X, name_y, cw, &input.name, input.field == Some(super::InputField::Name), alpha);
+            self.input_field(
+                target,
+                Hit::InputName,
+                layout::INPUT_X,
+                name_y,
+                cw,
+                &input.name,
+                input.field == Some(super::InputField::Name),
+                alpha,
+            );
             y = name_y + layout::INPUT_H + layout::INPUT_GAP;
             self.sub_label(target, s.api_key_label, pad, y, cw, alpha);
             let key_y = dy + layout::ADD_KEY_Y;
-            self.input_field(target, Hit::InputKey, layout::INPUT_X, key_y, cw, &input.key, input.field == Some(super::InputField::Key), alpha);
+            self.input_field(
+                target,
+                Hit::InputKey,
+                layout::INPUT_X,
+                key_y,
+                cw,
+                &input.key,
+                input.field == Some(super::InputField::Key),
+                alpha,
+            );
             y = key_y + layout::INPUT_H + layout::INPUT_GAP;
             if team {
                 // 团队版：组织 / 项目 ID（请求头 Bigmodel-Organization / Bigmodel-Project）
                 self.sub_label(target, s.org_id_label, pad, y, cw, alpha);
                 let org_y = dy + layout::ADD_ORG_Y;
-                self.input_field(target, Hit::InputOrg, layout::INPUT_X, org_y, cw, &input.org, input.field == Some(super::InputField::Org), alpha);
+                self.input_field(
+                    target,
+                    Hit::InputOrg,
+                    layout::INPUT_X,
+                    org_y,
+                    cw,
+                    &input.org,
+                    input.field == Some(super::InputField::Org),
+                    alpha,
+                );
                 y = org_y + layout::INPUT_H + layout::INPUT_GAP;
                 self.sub_label(target, s.project_id_label, pad, y, cw, alpha);
                 let project_y = dy + layout::ADD_PROJECT_Y;
-                self.input_field(target, Hit::InputProject, layout::INPUT_X, project_y, cw, &input.project, input.field == Some(super::InputField::Project), alpha);
+                self.input_field(
+                    target,
+                    Hit::InputProject,
+                    layout::INPUT_X,
+                    project_y,
+                    cw,
+                    &input.project,
+                    input.field == Some(super::InputField::Project),
+                    alpha,
+                );
                 y = project_y + layout::INPUT_H + 12.0;
             } else {
                 y += 6.0;
             }
             let pair_w = 88.0 * 2.0 + 12.0;
             let bx = pad + (cw - pair_w) / 2.0;
-            self.pill_button(target, Hit::SaveAccount, bx, y, 88.0, 30.0, s.save, alpha, true);
-            self.pill_button(target, Hit::Back, bx + 100.0, y, 88.0, 30.0, s.cancel, alpha, false);
+            self.pill_button(
+                target,
+                Hit::SaveAccount,
+                bx,
+                y,
+                88.0,
+                30.0,
+                s.save,
+                alpha,
+                true,
+            );
+            self.pill_button(
+                target,
+                Hit::Back,
+                bx + 100.0,
+                y,
+                88.0,
+                30.0,
+                s.cancel,
+                alpha,
+                false,
+            );
             return;
         }
         // 单账号：有则显示账号卡片，叉掉后回到添加；无则显示添加按钮
@@ -716,25 +1087,69 @@ impl Renderer {
                 }
                 None => ("—".to_string(), "—".to_string()),
             };
-            self.account_card(target, Hit::RemoveAccount(acc.index), acc.name, platform, &version, &tier, pad, y, cw, alpha);
+            self.account_card(
+                target,
+                Hit::RemoveAccount(acc.index),
+                acc.name,
+                platform,
+                &version,
+                &tier,
+                pad,
+                y,
+                cw,
+                alpha,
+            );
             y += 40.0 + 8.0;
             if matches!(model.error, Some(crate::api::FetchError::Auth)) {
-                self.text(target, s.key_invalid, pad + 2.0, y - 4.0, cw, 16.0, 12.0, 400, self.theme.danger, alpha);
+                self.text(
+                    target,
+                    s.key_invalid,
+                    pad + 2.0,
+                    y - 4.0,
+                    cw,
+                    16.0,
+                    12.0,
+                    400,
+                    self.theme.danger,
+                    alpha,
+                );
                 y += 18.0;
             }
         } else {
             // 添加账号独占一行：占满内容区，视觉对称
-            self.pill_button(target, Hit::AddAccount, pad, y + 2.0, cw, 30.0, s.add_account, alpha, false);
+            self.pill_button(
+                target,
+                Hit::AddAccount,
+                pad,
+                y + 2.0,
+                cw,
+                30.0,
+                s.add_account,
+                alpha,
+                false,
+            );
             y += 36.0;
         }
 
         // ── 轮询间隔：分段第 5 段「自定义」，选中时下方展开输入行 ──
         y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
         let presets: [(Hit, &str); 5] = [
-            (Hit::IntervalPreset(layout::INTERVAL_PRESETS[0]), s.interval_1m),
-            (Hit::IntervalPreset(layout::INTERVAL_PRESETS[1]), s.interval_5m),
-            (Hit::IntervalPreset(layout::INTERVAL_PRESETS[2]), s.interval_15m),
-            (Hit::IntervalPreset(layout::INTERVAL_PRESETS[3]), s.interval_30m),
+            (
+                Hit::IntervalPreset(layout::INTERVAL_PRESETS[0]),
+                s.interval_1m,
+            ),
+            (
+                Hit::IntervalPreset(layout::INTERVAL_PRESETS[1]),
+                s.interval_5m,
+            ),
+            (
+                Hit::IntervalPreset(layout::INTERVAL_PRESETS[2]),
+                s.interval_15m,
+            ),
+            (
+                Hit::IntervalPreset(layout::INTERVAL_PRESETS[3]),
+                s.interval_30m,
+            ),
             (Hit::CustomizeInterval, s.interval_custom),
         ];
         let cur = model.poll_interval_secs;
@@ -756,9 +1171,38 @@ impl Renderer {
             // y 钉在 layout::interval_input_y，与光标、高度公式同源
             let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
             let input = &panel.input;
-            self.input_field(target, Hit::InputInterval, layout::INPUT_X, iy, 96.0, &input.interval, input.field == Some(super::InputField::Interval), alpha);
-            self.text(target, s.interval_custom_unit, pad + 104.0, iy + 6.0, 40.0, 16.0, 12.0, 400, self.theme.text_secondary, alpha);
-            self.outline_button(target, Hit::ApplyInterval, w - pad - 56.0, iy - 1.0, 56.0, 28.0, s.apply, alpha);
+            self.input_field(
+                target,
+                Hit::InputInterval,
+                layout::INPUT_X,
+                iy,
+                96.0,
+                &input.interval,
+                input.field == Some(super::InputField::Interval),
+                alpha,
+            );
+            self.text(
+                target,
+                s.interval_custom_unit,
+                pad + 104.0,
+                iy + 6.0,
+                40.0,
+                16.0,
+                12.0,
+                400,
+                self.theme.text_secondary,
+                alpha,
+            );
+            self.outline_button(
+                target,
+                Hit::ApplyInterval,
+                w - pad - 56.0,
+                iy - 1.0,
+                56.0,
+                28.0,
+                s.apply,
+                alpha,
+            );
             y = iy + 38.0;
         } else {
             y += 10.0;
@@ -778,7 +1222,15 @@ impl Renderer {
             Some("en") => LanguageChoice::En,
             _ => LanguageChoice::System,
         };
-        y = self.segmented_raw(target, &langs, |h| matches!(h, Hit::Language(v) if *v == cur_lang), pad, y, cw, alpha);
+        y = self.segmented_raw(
+            target,
+            &langs,
+            |h| matches!(h, Hit::Language(v) if *v == cur_lang),
+            pad,
+            y,
+            cw,
+            alpha,
+        );
         y += 2.0;
         y = self.sub_label(target, s.appearance_section, pad, y, cw, alpha);
         let themes: [(Hit, &str); 3] = [
@@ -791,19 +1243,69 @@ impl Renderer {
             Some("dark") => AppearanceChoice::Dark,
             _ => AppearanceChoice::System,
         };
-        y = self.segmented_raw(target, &themes, |h| matches!(h, Hit::Appearance(v) if *v == cur_theme), pad, y, cw, alpha);
+        y = self.segmented_raw(
+            target,
+            &themes,
+            |h| matches!(h, Hit::Appearance(v) if *v == cur_theme),
+            pad,
+            y,
+            cw,
+            alpha,
+        );
         y += 2.0;
-        y = self.toggle_row(target, Hit::ToggleAutostart, s.autostart, "", model.autostart, pad, y, cw, alpha);
+        y = self.toggle_row(
+            target,
+            Hit::ToggleAutostart,
+            s.autostart,
+            "",
+            model.autostart,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
 
         // ── 通知 ──
         y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
-        y = self.toggle_row(target, Hit::ToggleThreshold, s.notify_threshold, s.notify_threshold_desc, model.threshold_enabled, pad, y, cw, alpha);
-        y = self.toggle_row(target, Hit::ToggleReset5h, s.notify_reset_5h_opt, s.notify_reset_5h_desc, model.reset_5h_enabled, pad, y, cw, alpha);
-        y = self.toggle_row(target, Hit::ToggleResetWeekly, s.notify_reset_weekly_opt, s.notify_reset_weekly_desc, model.reset_weekly_enabled, pad, y, cw, alpha);
+        y = self.toggle_row(
+            target,
+            Hit::ToggleThreshold,
+            s.notify_threshold,
+            s.notify_threshold_desc,
+            model.threshold_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        y = self.toggle_row(
+            target,
+            Hit::ToggleReset5h,
+            s.notify_reset_5h_opt,
+            s.notify_reset_5h_desc,
+            model.reset_5h_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        y = self.toggle_row(
+            target,
+            Hit::ToggleResetWeekly,
+            s.notify_reset_weekly_opt,
+            s.notify_reset_weekly_desc,
+            model.reset_weekly_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
 
         // ── 关于：检查更新 + 版本，位于底部 ──
         let update_label = match model.update {
-            Some(Ok(info)) if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")) => {
+            Some(Ok(info))
+                if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")) =>
+            {
                 format!("{} · {}", s.check_update, info.tag)
             }
             Some(Ok(_)) => s.up_to_date.into(),
@@ -813,15 +1315,44 @@ impl Renderer {
         y = self.section_label(target, "", pad, y, w, alpha, true);
         // 左「当前版本」12px，右描边小按钮——字号一致、视觉平衡
         let ver_line = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
-        self.text(target, &ver_line, pad, y + 7.0, w - pad * 2.0 - 124.0, 16.0, 12.0, 400, self.theme.text_tertiary, alpha);
-        self.outline_button(target, Hit::CheckUpdate, w - pad - 104.0, y + 1.0, 104.0, 28.0, &update_label, alpha);
+        self.text(
+            target,
+            &ver_line,
+            pad,
+            y + 7.0,
+            w - pad * 2.0 - 124.0,
+            16.0,
+            12.0,
+            400,
+            self.theme.text_tertiary,
+            alpha,
+        );
+        self.outline_button(
+            target,
+            Hit::CheckUpdate,
+            w - pad - 104.0,
+            y + 1.0,
+            104.0,
+            28.0,
+            &update_label,
+            alpha,
+        );
     }
 
     // ── 绘制小部件 ──
 
     /// 区块主标题：墨色强调块 + 标题；子标签不带块以区分层级
     #[allow(clippy::too_many_arguments)]
-    unsafe fn section_label(&mut self, target: &ID2D1HwndRenderTarget, label: &str, x: f32, y: f32, _w: f32, alpha: f32, rule: bool) -> f32 {
+    unsafe fn section_label(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &str,
+        x: f32,
+        y: f32,
+        _w: f32,
+        alpha: f32,
+        rule: bool,
+    ) -> f32 {
         let mut ny = y;
         if rule {
             self.divider(target, x, ny + 2.0, _w - x * 2.0, alpha);
@@ -830,10 +1361,26 @@ impl Renderer {
         if !label.is_empty() {
             let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
             target.FillRectangle(
-                &D2D_RECT_F { left: x, top: ny + 1.0, right: x + 3.0, bottom: ny + 14.0 },
+                &D2D_RECT_F {
+                    left: x,
+                    top: ny + 1.0,
+                    right: x + 3.0,
+                    bottom: ny + 14.0,
+                },
                 &bar,
             );
-            self.text(target, label, x + 7.0, ny, _w - 7.0, 17.0, 13.0, 600, self.theme.text_tertiary, alpha);
+            self.text(
+                target,
+                label,
+                x + 7.0,
+                ny,
+                _w - 7.0,
+                17.0,
+                13.0,
+                600,
+                self.theme.text_tertiary,
+                alpha,
+            );
             ny + 21.0
         } else {
             // 纯分隔无标题，只留少量空隙给紧随内容
@@ -843,8 +1390,27 @@ impl Renderer {
 
     /// 区块内子项标签：13/400 次级色、无强调块
     /// 字阶：16 导航 / 13·500 主标题 / 13·400 控件标签 / 12·400 描述
-    unsafe fn sub_label(&mut self, target: &ID2D1HwndRenderTarget, label: &str, x: f32, y: f32, w: f32, alpha: f32) -> f32 {
-        self.text(target, label, x, y + 1.0, w, 17.0, 13.0, 400, self.theme.text_secondary, alpha);
+    unsafe fn sub_label(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        alpha: f32,
+    ) -> f32 {
+        self.text(
+            target,
+            label,
+            x,
+            y + 1.0,
+            w,
+            17.0,
+            13.0,
+            400,
+            self.theme.text_secondary,
+            alpha,
+        );
         y + 21.0
     }
 
@@ -861,37 +1427,93 @@ impl Renderer {
         active: bool,
         alpha: f32,
     ) {
-        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + layout::INPUT_H };
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + layout::INPUT_H,
+        };
         let fill = self.brush(target, self.theme.track, alpha);
         target.FillRectangle(&rect, &fill);
-        let edge_color = if active { self.theme.action } else { self.theme.border };
+        let edge_color = if active {
+            self.theme.action
+        } else {
+            self.theme.border
+        };
         let edge = self.brush(target, edge_color, alpha);
         target.DrawRectangle(&rect, &edge, 1.2, None);
         // 只显示末尾可视部分（等宽 7.3px/字符）
         let max_chars = (((w - 12.0) / 7.3).floor() as usize).max(1);
-        let vis: String = content.chars().rev().take(max_chars).collect::<Vec<_>>().into_iter().rev().collect();
-        self.text_rect_opts(target, &vis, &D2D_RECT_F { left: x + 6.0, top: y + 6.0, right: x + w - 4.0, bottom: y + 22.0 }, 12.0, 400, self.theme.text_primary, alpha, Align::Left, true);
-        self.hits.push((hit, D2D_RECT_F { left: x - 4.0, top: y - 4.0, right: x + w + 4.0, bottom: y + 30.0 }));
+        let vis: String = content
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        self.text_rect_opts(
+            target,
+            &vis,
+            &D2D_RECT_F {
+                left: x + 6.0,
+                top: y + 6.0,
+                right: x + w - 4.0,
+                bottom: y + 22.0,
+            },
+            12.0,
+            400,
+            self.theme.text_primary,
+            alpha,
+            Align::Left,
+            true,
+        );
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 4.0,
+                top: y - 4.0,
+                right: x + w + 4.0,
+                bottom: y + 30.0,
+            },
+        ));
     }
 
-    unsafe fn divider(&mut self, target: &ID2D1HwndRenderTarget, x: f32, y: f32, width: f32, alpha: f32) {
+    unsafe fn divider(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        x: f32,
+        y: f32,
+        width: f32,
+        alpha: f32,
+    ) {
         let b = self.brush(target, self.theme.border, alpha * 0.7);
         self.line(target, x, y, x + width, y, &b, 1.0);
     }
 
     /// 小票撕线：指标区与余额行之间的虚线分隔
-    unsafe fn dashed_divider(&mut self, target: &ID2D1HwndRenderTarget, x: f32, y: f32, width: f32, alpha: f32) {
+    unsafe fn dashed_divider(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        x: f32,
+        y: f32,
+        width: f32,
+        alpha: f32,
+    ) {
         if self.dash_style.is_none() {
-            self.dash_style = self.factory.CreateStrokeStyle(
-                &D2D1_STROKE_STYLE_PROPERTIES {
-                    startCap: D2D1_CAP_STYLE_FLAT,
-                    endCap: D2D1_CAP_STYLE_FLAT,
-                    dashCap: D2D1_CAP_STYLE_FLAT,
-                    dashStyle: D2D1_DASH_STYLE_DASH,
-                    ..Default::default()
-                },
-                None,
-            ).ok();
+            self.dash_style = self
+                .factory
+                .CreateStrokeStyle(
+                    &D2D1_STROKE_STYLE_PROPERTIES {
+                        startCap: D2D1_CAP_STYLE_FLAT,
+                        endCap: D2D1_CAP_STYLE_FLAT,
+                        dashCap: D2D1_CAP_STYLE_FLAT,
+                        dashStyle: D2D1_DASH_STYLE_DASH,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .ok();
         }
         let b = self.brush(target, self.theme.border, alpha * 0.8);
         match self.dash_style.clone() {
@@ -919,17 +1541,44 @@ impl Renderer {
         w: f32,
         alpha: f32,
     ) -> f32 {
-        self.text(target, title, x, y + 1.0, w - 56.0, 18.0, 13.0, 400, self.theme.text_primary, alpha);
+        self.text(
+            target,
+            title,
+            x,
+            y + 1.0,
+            w - 56.0,
+            18.0,
+            13.0,
+            400,
+            self.theme.text_primary,
+            alpha,
+        );
         let mut ty = y + 19.0;
         if !desc.is_empty() {
-            self.text(target, desc, x, ty, w - 56.0, 14.0, 12.0, 400, self.theme.text_tertiary, alpha);
+            self.text(
+                target,
+                desc,
+                x,
+                ty,
+                w - 56.0,
+                14.0,
+                12.0,
+                400,
+                self.theme.text_tertiary,
+                alpha,
+            );
             ty += 14.0;
         }
         let (tw, th) = (38.0, 22.0);
         let tx = x + w - tw;
         let cy = (y + (ty - y - th) / 2.0).max(y);
         let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: tx, top: cy, right: tx + tw, bottom: cy + th },
+            rect: D2D_RECT_F {
+                left: tx,
+                top: cy,
+                right: tx + tw,
+                bottom: cy + th,
+            },
             radiusX: th / 2.0,
             radiusY: th / 2.0,
         };
@@ -940,13 +1589,24 @@ impl Renderer {
         let kx = if on { tx + tw - knob - 2.0 } else { tx + 2.0 };
         let kb = self.brush(target, [1.0, 1.0, 1.0, 1.0], alpha);
         let ellipse = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-            point: Vector2 { X: kx + knob / 2.0, Y: cy + th / 2.0 },
+            point: Vector2 {
+                X: kx + knob / 2.0,
+                Y: cy + th / 2.0,
+            },
             radiusX: knob / 2.0,
             radiusY: knob / 2.0,
         };
         target.FillEllipse(&ellipse, &kb);
         // 命中区只覆盖开关本体并含 8px 容差——点击行文字/空白不翻转
-        self.hits.push((hit, D2D_RECT_F { left: tx - 8.0, top: cy - 6.0, right: tx + tw + 8.0, bottom: cy + th + 6.0 }));
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: tx - 8.0,
+                top: cy - 6.0,
+                right: tx + tw + 8.0,
+                bottom: cy + th + 6.0,
+            },
+        ));
         ty + 9.0
     }
 
@@ -965,7 +1625,12 @@ impl Renderer {
         let n = items.len().max(1) as f32;
         let seg_w = w / n;
         let track = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
@@ -987,11 +1652,38 @@ impl Renderer {
                 let sb = self.brush(target, self.theme.action, alpha);
                 target.FillRoundedRectangle(&seg, &sb);
             }
-            let color = if sel { self.theme.action_text } else { self.theme.text_secondary };
+            let color = if sel {
+                self.theme.action_text
+            } else {
+                self.theme.text_secondary
+            };
             let tx = x + i as f32 * seg_w;
-            let rect = D2D_RECT_F { left: tx, top: y, right: tx + seg_w, bottom: y + h };
-            self.text_aligned_vc(target, label, &rect, 13.0, 400, color, alpha, Align::Center, false);
-            self.hits.push((*hit, D2D_RECT_F { left: tx, top: y, right: tx + seg_w, bottom: y + h }));
+            let rect = D2D_RECT_F {
+                left: tx,
+                top: y,
+                right: tx + seg_w,
+                bottom: y + h,
+            };
+            self.text_aligned_vc(
+                target,
+                label,
+                &rect,
+                13.0,
+                400,
+                color,
+                alpha,
+                Align::Center,
+                false,
+            );
+            self.hits.push((
+                *hit,
+                D2D_RECT_F {
+                    left: tx,
+                    top: y,
+                    right: tx + seg_w,
+                    bottom: y + h,
+                },
+            ));
         }
         y + h + 10.0
     }
@@ -1013,7 +1705,12 @@ impl Renderer {
     ) {
         let h = 40.0;
         let card = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
@@ -1026,7 +1723,12 @@ impl Renderer {
         self.text_aligned_vc(
             target,
             &name_disp,
-            &D2D_RECT_F { left: x + 12.0, top: y, right: x + w - 60.0, bottom: y + h },
+            &D2D_RECT_F {
+                left: x + 12.0,
+                top: y,
+                right: x + w - 60.0,
+                bottom: y + h,
+            },
             15.0,
             500,
             self.theme.text_primary,
@@ -1041,12 +1743,32 @@ impl Renderer {
         let max_bx = x + w - 56.0; // 给右侧 × 留位
         let pw = est_width(platform, 10.5) + 14.0;
         if bx + pw <= max_bx {
-            self.badge(target, platform, bx, by, pw, self.theme.border, self.theme.text_secondary, alpha, false);
+            self.badge(
+                target,
+                platform,
+                bx,
+                by,
+                pw,
+                self.theme.border,
+                self.theme.text_secondary,
+                alpha,
+                false,
+            );
             bx += pw + 6.0;
         }
         let vw = est_width(version, 10.5) + 14.0;
         if bx + vw <= max_bx && version != "—" {
-            self.badge(target, version, bx, by, vw, self.theme.border, self.theme.text_secondary, alpha, true);
+            self.badge(
+                target,
+                version,
+                bx,
+                by,
+                vw,
+                self.theme.border,
+                self.theme.text_secondary,
+                alpha,
+                true,
+            );
             bx += vw + 6.0;
         }
         if bx + 40.0 <= max_bx && tier != "—" {
@@ -1084,14 +1806,34 @@ impl Renderer {
         mono: bool,
     ) {
         let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 17.0 },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + 17.0,
+            },
             radiusX: 2.5,
             radiusY: 2.5,
         };
         let edge = self.brush(target, edge_color, alpha * 0.9);
         target.DrawRoundedRectangle(&r, &edge, 1.0, None);
-        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 17.0 };
-        self.text_aligned_vc(target, label, &rect, 10.5, 400, fg, alpha, Align::Center, mono);
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + 17.0,
+        };
+        self.text_aligned_vc(
+            target,
+            label,
+            &rect,
+            10.5,
+            400,
+            fg,
+            alpha,
+            Align::Center,
+            mono,
+        );
     }
 
     /// 按钮：primary 为 Ink 填充，次级 Linen
@@ -1110,26 +1852,62 @@ impl Renderer {
     ) {
         let hovered = self.hover == Some(hit);
         let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
         let (base, fill_alpha, fg) = if primary {
             // 主按钮 hover 轻微透纸——alpha 呼吸，不变色
-            (self.theme.action, if hovered { alpha * 0.86 } else { alpha }, self.theme.action_text)
+            (
+                self.theme.action,
+                if hovered { alpha * 0.86 } else { alpha },
+                self.theme.action_text,
+            )
         } else {
             // 次级：Linen，hover 沉一档到 Stone
             (
-                if hovered { self.theme.border } else { self.theme.track },
+                if hovered {
+                    self.theme.border
+                } else {
+                    self.theme.track
+                },
                 alpha,
                 self.theme.text_primary,
             )
         };
         let b = self.brush(target, base, fill_alpha);
         target.FillRoundedRectangle(&r, &b);
-        let rect = D2D_RECT_F { left: x, top: y + 5.0, right: x + w, bottom: y + h - 4.0 };
-        self.text_aligned(target, label, &rect, 13.0, 400, fg, alpha, Align::Center, false);
-        self.hits.push((hit, D2D_RECT_F { left: x - 4.0, top: y - 4.0, right: x + w + 4.0, bottom: y + h + 4.0 }));
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y + 5.0,
+            right: x + w,
+            bottom: y + h - 4.0,
+        };
+        self.text_aligned(
+            target,
+            label,
+            &rect,
+            13.0,
+            400,
+            fg,
+            alpha,
+            Align::Center,
+            false,
+        );
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 4.0,
+                top: y - 4.0,
+                right: x + w + 4.0,
+                bottom: y + h + 4.0,
+            },
+        ));
     }
 
     /// 描边小按钮：透明底 + hairline 边框，与版本号等同行文字视觉平衡。
@@ -1147,7 +1925,12 @@ impl Renderer {
     ) {
         let hovered = self.hover == Some(hit);
         let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
@@ -1157,20 +1940,59 @@ impl Renderer {
         }
         let edge = self.brush(target, self.theme.border, alpha * 0.9);
         target.DrawRoundedRectangle(&r, &edge, 1.0, None);
-        let fg = if hovered { self.theme.accent } else { self.theme.text_secondary };
-        let rect = D2D_RECT_F { left: x, top: y + 5.0, right: x + w, bottom: y + h - 4.0 };
-        self.text_aligned(target, label, &rect, 12.0, 400, fg, alpha, Align::Center, false);
-        self.hits.push((hit, D2D_RECT_F { left: x - 4.0, top: y - 4.0, right: x + w + 4.0, bottom: y + h + 4.0 }));
+        let fg = if hovered {
+            self.theme.accent
+        } else {
+            self.theme.text_secondary
+        };
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y + 5.0,
+            right: x + w,
+            bottom: y + h - 4.0,
+        };
+        self.text_aligned(
+            target,
+            label,
+            &rect,
+            12.0,
+            400,
+            fg,
+            alpha,
+            Align::Center,
+            false,
+        );
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 4.0,
+                top: y - 4.0,
+                right: x + w + 4.0,
+                bottom: y + h + 4.0,
+            },
+        ));
     }
 
-    unsafe fn icon_button(&mut self, target: &ID2D1HwndRenderTarget, hit: Hit, cx: f32, cy: f32, r: f32, spin: f32) {
+    unsafe fn icon_button(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        hit: Hit,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        spin: f32,
+    ) {
         let hovered = self.hover == Some(hit);
         let ellipse = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
             point: Vector2 { X: cx, Y: cy },
             radiusX: r,
             radiusY: r,
         };
-        let base = if hovered { self.theme.track } else { [0.0, 0.0, 0.0, 0.0] };
+        let base = if hovered {
+            self.theme.track
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
         if base[3] > 0.0 {
             let b = self.brush(target, base, 1.0);
             target.FillEllipse(&ellipse, &b);
@@ -1197,21 +2019,50 @@ impl Renderer {
             let (px, py) = (rr * r1.cos(), rr * r1.sin());
             let al = 4.0;
             let (fs, fc) = 150f32.to_radians().sin_cos();
-            segs.push((px, py, px + (fx * fc - fy * fs) * al, py + (fx * fs + fy * fc) * al));
-            segs.push((px, py, px + (fx * fc + fy * fs) * al, py + (-fx * fs + fy * fc) * al));
+            segs.push((
+                px,
+                py,
+                px + (fx * fc - fy * fs) * al,
+                py + (fx * fs + fy * fc) * al,
+            ));
+            segs.push((
+                px,
+                py,
+                px + (fx * fc + fy * fs) * al,
+                py + (-fx * fs + fy * fc) * al,
+            ));
         }
         for (x0, y0, x1, y1) in segs {
             let (ax, ay) = rot(x0, y0);
             let (bx, by) = rot(x1, y1);
             self.line(target, ax, ay, bx, by, &stroke, 1.6);
         }
-        self.hits.push((hit, D2D_RECT_F { left: cx - r - 4.0, top: cy - r - 4.0, right: cx + r + 4.0, bottom: cy + r + 4.0 }));
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: cx - r - 4.0,
+                top: cy - r - 4.0,
+                right: cx + r + 4.0,
+                bottom: cy + r + 4.0,
+            },
+        ));
     }
 
     /// 设置入口滑杆图标；细线在 16px 下清晰，齿轮会糊
-    unsafe fn sliders(&mut self, target: &ID2D1HwndRenderTarget, hit: Hit, cx: f32, cy: f32, r: f32) {
+    unsafe fn sliders(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        hit: Hit,
+        cx: f32,
+        cy: f32,
+        r: f32,
+    ) {
         let hovered = self.hover == Some(hit);
-        let base = if hovered { self.theme.track } else { [0.0, 0.0, 0.0, 0.0] };
+        let base = if hovered {
+            self.theme.track
+        } else {
+            [0.0, 0.0, 0.0, 0.0]
+        };
         if base[3] > 0.0 {
             let ellipse = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
                 point: Vector2 { X: cx, Y: cy },
@@ -1246,7 +2097,15 @@ impl Renderer {
             target.FillEllipse(&he, &hole);
             target.DrawEllipse(&he, &stroke, 1.5, None);
         }
-        self.hits.push((hit, D2D_RECT_F { left: cx - r - 4.0, top: cy - r - 4.0, right: cx + r + 4.0, bottom: cy + r + 4.0 }));
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: cx - r - 4.0,
+                top: cy - r - 4.0,
+                right: cx + r + 4.0,
+                bottom: cy + r + 4.0,
+            },
+        ));
     }
 
     unsafe fn back_arrow(&mut self, target: &ID2D1HwndRenderTarget, hit: Hit, x: f32, y: f32) {
@@ -1255,14 +2114,30 @@ impl Renderer {
         let (cx, cy) = (x + 8.0, y + 6.0);
         self.line(target, cx + 5.0, cy - 6.0, cx - 4.0, cy, &stroke, 1.8);
         self.line(target, cx - 4.0, cy, cx + 5.0, cy + 6.0, &stroke, 1.8);
-        self.hits.push((hit, D2D_RECT_F { left: x - 6.0, top: y - 6.0, right: x + 24.0, bottom: y + 20.0 }));
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 6.0,
+                top: y - 6.0,
+                right: x + 24.0,
+                bottom: y + 20.0,
+            },
+        ));
     }
 
     unsafe fn x_button(&mut self, target: &ID2D1HwndRenderTarget, hit: Hit, x: f32, y: f32) {
         let stroke = self.brush(target, self.theme.text_tertiary, 1.0);
         self.line(target, x, y, x + 10.0, y + 10.0, &stroke, 1.4);
         self.line(target, x + 10.0, y, x, y + 10.0, &stroke, 1.4);
-        self.hits.push((hit, D2D_RECT_F { left: x - 6.0, top: y - 6.0, right: x + 16.0, bottom: y + 16.0 }));
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 6.0,
+                top: y - 6.0,
+                right: x + 16.0,
+                bottom: y + 16.0,
+            },
+        ));
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1286,9 +2161,17 @@ impl Renderer {
     }
 
     /// 纯色刷子：逐次创建，失败退回兜底黑刷；alpha 乘进颜色分量
-    unsafe fn brush(&mut self, target: &ID2D1HwndRenderTarget, c: [f32; 4], alpha: f32) -> ID2D1SolidColorBrush {
+    unsafe fn brush(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        c: [f32; 4],
+        alpha: f32,
+    ) -> ID2D1SolidColorBrush {
         let color = D2D1_COLOR_F {
-            r: c[0], g: c[1], b: c[2], a: (c[3] * alpha).clamp(0.0, 1.0),
+            r: c[0],
+            g: c[1],
+            b: c[2],
+            a: (c[3] * alpha).clamp(0.0, 1.0),
         };
         // 逐次创建：存在多刷并行交替，单刷 SetColor 会被覆盖——滑杆曾整支隐形
         target
@@ -1310,7 +2193,12 @@ impl Renderer {
         color: [f32; 4],
         alpha: f32,
     ) {
-        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        };
         self.text_rect(target, s, &rect, size, weight, color, alpha);
     }
 
@@ -1328,8 +2216,23 @@ impl Renderer {
         color: [f32; 4],
         alpha: f32,
     ) {
-        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h };
-        self.text_rect_opts(target, s, &rect, size, weight, color, alpha, Align::Right, true);
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y,
+            right: x + w,
+            bottom: y + h,
+        };
+        self.text_rect_opts(
+            target,
+            s,
+            &rect,
+            size,
+            weight,
+            color,
+            alpha,
+            Align::Right,
+            true,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1343,7 +2246,17 @@ impl Renderer {
         color: [f32; 4],
         alpha: f32,
     ) {
-        self.text_rect_opts(target, s, rect, size, weight, color, alpha, Align::Left, false);
+        self.text_rect_opts(
+            target,
+            s,
+            rect,
+            size,
+            weight,
+            color,
+            alpha,
+            Align::Left,
+            false,
+        );
     }
 
     /// 文本绘制的完整选项版：对齐 + 字体族
@@ -1377,7 +2290,9 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        let Some(fmt) = self.format(size, weight, mono) else { return };
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return;
+        };
         let align_set = match align {
             Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
             Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -1414,7 +2329,9 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        let Some(fmt) = self.format(size, weight, mono) else { return };
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return;
+        };
         let align_set = match align {
             Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
             Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
@@ -1451,7 +2368,12 @@ impl Renderer {
     ) {
         // 磁贴底，圆角比例约 4/30
         let tile = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + size, bottom: y + size },
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + size,
+                bottom: y + size,
+            },
             radiusX: size * (4.0 / 30.0),
             radiusY: size * (4.0 / 30.0),
         };
@@ -1461,12 +2383,17 @@ impl Renderer {
         if self.logo_geo.is_none() {
             self.logo_geo = self.build_logo_glyph();
         }
-        let Some(geo) = self.logo_geo.clone() else { return };
+        let Some(geo) = self.logo_geo.clone() else {
+            return;
+        };
         let zb = self.brush(target, [1.0, 1.0, 1.0, 1.0], alpha);
         let m = Matrix3x2 {
-            M11: size / 30.0, M12: 0.0,
-            M21: 0.0, M22: size / 30.0,
-            M31: x, M32: y,
+            M11: size / 30.0,
+            M12: 0.0,
+            M21: 0.0,
+            M22: size / 30.0,
+            M31: x,
+            M32: y,
         };
         target.SetTransform(&m);
         target.FillGeometry(&geo, &zb, None);

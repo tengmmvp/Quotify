@@ -49,7 +49,11 @@ impl TrayIcon {
             }
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool() {
-                Some(Self { hwnd, id: 1, registered: true })
+                Some(Self {
+                    hwnd,
+                    id: 1,
+                    registered: true,
+                })
             } else {
                 log("[Quotify] 托盘 SETVERSION 失败");
                 None

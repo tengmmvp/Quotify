@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, ICONINFO, CreateIconIndirect, HICON};
+use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
 
 /// 图标最小边长（px）
 const MIN_PX: i32 = 16;
@@ -53,9 +53,21 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
     let bias = 0.01 * s;
     let m = |v: f32| v * scale + bias;
     let polys: [Vec<(f32, f32)>; 3] = [
-        vec![(15.47, 7.1), (14.17, 8.95), (13.27, 9.42), (6.17, 9.42), (6.17, 7.09)],
+        vec![
+            (15.47, 7.1),
+            (14.17, 8.95),
+            (13.27, 9.42),
+            (6.17, 9.42),
+            (6.17, 7.09),
+        ],
         vec![(24.3, 7.1), (13.14, 22.91), (5.7, 22.91), (16.86, 7.1)],
-        vec![(14.53, 22.91), (15.84, 21.05), (16.74, 20.58), (23.83, 20.58), (23.83, 22.91)],
+        vec![
+            (14.53, 22.91),
+            (15.84, 21.05),
+            (16.74, 20.58),
+            (23.83, 20.58),
+            (23.83, 22.91),
+        ],
     ];
     let polys: Vec<Vec<(f32, f32)>> = polys
         .into_iter()
@@ -132,7 +144,12 @@ fn in_rounded_rect(x: f32, y: f32, rx: f32, ry: f32, side: f32, r: f32) -> bool 
     if x < rx || x > right || y < ry || y > bottom {
         return false;
     }
-    let corners = [(rx + r, ry + r), (right - r, ry + r), (rx + r, bottom - r), (right - r, bottom - r)];
+    let corners = [
+        (rx + r, ry + r),
+        (right - r, ry + r),
+        (rx + r, bottom - r),
+        (right - r, bottom - r),
+    ];
     for &(ccx, ccy) in &corners {
         let (dx, dy) = (x - ccx, y - ccy);
         let in_corner_zone = match (ccx, ccy) {
@@ -178,7 +195,10 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         let mut bits: *mut c_void = std::ptr::null_mut();
         let color = windows::Win32::Graphics::Gdi::CreateDIBSection(
             None,
-            &BITMAPINFO { bmiHeader: hdr(32), ..Default::default() },
+            &BITMAPINFO {
+                bmiHeader: hdr(32),
+                ..Default::default()
+            },
             DIB_RGB_COLORS,
             (&mut bits) as *mut *mut c_void,
             None,
@@ -190,7 +210,10 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         let mut mask_bits: *mut c_void = std::ptr::null_mut();
         let mask = windows::Win32::Graphics::Gdi::CreateDIBSection(
             None,
-            &BITMAPINFO { bmiHeader: hdr(1), ..Default::default() },
+            &BITMAPINFO {
+                bmiHeader: hdr(1),
+                ..Default::default()
+            },
             DIB_RGB_COLORS,
             (&mut mask_bits) as *mut *mut c_void,
             None,
@@ -198,7 +221,11 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         )
         .ok()?;
         if !mask_bits.is_null() {
-            std::ptr::write_bytes(mask_bits as *mut u8, 0, (px as usize * px as usize).div_ceil(8));
+            std::ptr::write_bytes(
+                mask_bits as *mut u8,
+                0,
+                (px as usize * px as usize).div_ceil(8),
+            );
         }
 
         let info = ICONINFO {

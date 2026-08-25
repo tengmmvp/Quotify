@@ -4,9 +4,9 @@ pub mod autostart;
 pub mod instance;
 pub mod notify;
 
-use windows::core::PCWSTR;
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+use windows::core::PCWSTR;
 
 /// str → UTF-16
 pub fn wide(s: &str) -> Vec<u16> {

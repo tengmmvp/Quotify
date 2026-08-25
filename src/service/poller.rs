@@ -31,7 +31,11 @@ pub struct Poller {
 
 impl Poller {
     /// 启动轮询线程
-    pub fn spawn(hwnd: windows::Win32::Foundation::HWND, target: PollTarget, interval: PollInterval) -> Option<Self> {
+    pub fn spawn(
+        hwnd: windows::Win32::Foundation::HWND,
+        target: PollTarget,
+        interval: PollInterval,
+    ) -> Option<Self> {
         unsafe {
             let wake = CreateEventW(None, false, false, None).ok()?;
             let stop = CreateEventW(None, true, false, None).ok()?;
@@ -51,25 +55,36 @@ impl Poller {
                     poll_loop(h.0, target, interval, w.0, s.0, flag)
                 })
                 .ok()?;
-            Some(Self { wake, stop, refresh_requested, thread: Some(thread) })
+            Some(Self {
+                wake,
+                stop,
+                refresh_requested,
+                thread: Some(thread),
+            })
         }
     }
 
     /// 手动刷新：立即拉取一次。
     pub fn refresh_now(&self) {
         self.refresh_requested.store(true, Ordering::Release);
-        unsafe { let _ = SetEvent(self.wake); };
+        unsafe {
+            let _ = SetEvent(self.wake);
+        };
     }
 
     /// 间隔或账号变更：不立即拉取，仅按当前间隔重排计时。
     pub fn reschedule(&self) {
-        unsafe { let _ = SetEvent(self.wake); };
+        unsafe {
+            let _ = SetEvent(self.wake);
+        };
     }
 }
 
 impl Drop for Poller {
     fn drop(&mut self) {
-        unsafe { let _ = SetEvent(self.stop); };
+        unsafe {
+            let _ = SetEvent(self.stop);
+        };
         if let Some(t) = self.thread.take() {
             let _ = t.join();
         }

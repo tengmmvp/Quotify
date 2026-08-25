@@ -6,18 +6,18 @@ pub mod model;
 pub mod render;
 pub mod theme;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, InvalidateRect, MonitorFromWindow, HBRUSH, HMONITOR,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, ValidateRect,
+    GetMonitorInfoW, HBRUSH, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+    MonitorFromWindow, ValidateRect,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForMonitor;
 use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::PCWSTR;
 
 use crate::platform::wide;
 use crate::ui::panel::model::PanelModel;
@@ -132,7 +132,9 @@ impl Panel {
         match self.view {
             // 动态：随指标行数 / 余额 / 副标题伸缩，由 sync_main_height 维护
             PanelView::Main => self.main_h,
-            PanelView::Settings if self.adding_account => layout::add_page_height(self.pending_team),
+            PanelView::Settings if self.adding_account => {
+                layout::add_page_height(self.pending_team)
+            }
             // 逐段对照 draw_settings 的 y 累加链（dy=0）；间隔行展开 +40、收起 +10：
             PanelView::Settings => {
                 // 有账号：卡片 40 + 卡后间距 8；无账号：添加按钮行 36 含 2 余量
@@ -186,7 +188,10 @@ impl Panel {
                 PCWSTR(name.as_ptr()),
                 PCWSTR(name.as_ptr()),
                 WS_POPUP,
-                0, 0, 0, 0,
+                0,
+                0,
+                0,
+                0,
                 Some(parent),
                 None,
                 Some(hinst.into()),
@@ -203,7 +208,8 @@ impl Panel {
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &pref as *const _ as *const core::ffi::c_void,
-                std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+                std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>()
+                    as u32,
             );
             self.hwnd = Some(hwnd);
             Some(hwnd)
@@ -242,7 +248,11 @@ impl Panel {
                 }
                 None => (0, 0),
             };
-            let flags = if show { SWP_SHOWWINDOW | SWP_NOCOPYBITS } else { SWP_NOCOPYBITS };
+            let flags = if show {
+                SWP_SHOWWINDOW | SWP_NOCOPYBITS
+            } else {
+                SWP_NOCOPYBITS
+            };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
             self.anim_x = x;
             self.anim_w = w;
@@ -253,7 +263,9 @@ impl Panel {
 
     /// 定位并显示，淡入由 TIMER_ANIM 推进。
     pub fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
-        let Some(hwnd) = self.ensure_window(parent) else { return };
+        let Some(hwnd) = self.ensure_window(parent) else {
+            return;
+        };
         self.anchor = Some(anchor);
         let logical_h = self.view_height(accounts);
         self.place(hwnd, logical_h, true);
@@ -289,8 +301,10 @@ impl Panel {
         };
         self.anchor
             .map(|a| {
-                pt.x >= a.left - 24 && pt.x <= a.right + 24
-                    && pt.y >= a.top - 24 && pt.y <= a.bottom + 24
+                pt.x >= a.left - 24
+                    && pt.x <= a.right + 24
+                    && pt.y >= a.top - 24
+                    && pt.y <= a.bottom + 24
             })
             .unwrap_or(false)
     }
@@ -349,7 +363,7 @@ impl Panel {
             let _ = DestroyCaret();
             // 摘除 IME 上下文：裸窗口挂上后要收回，避免游离
             use windows::Win32::UI::Input::Ime::{
-                ImmAssociateContext, ImmDestroyContext, ImmGetContext, HIMC,
+                HIMC, ImmAssociateContext, ImmDestroyContext, ImmGetContext,
             };
             let ctx = ImmGetContext(hwnd);
             if !ctx.is_invalid() {
@@ -374,32 +388,36 @@ impl Panel {
     }
 
     /// 挂 IME 上下文并把组合窗定位到光标处。
-    unsafe fn attach_ime(&mut self, hwnd: HWND) { unsafe {
-        use windows::Win32::Foundation::POINT;
-        use windows::Win32::UI::Input::Ime::{
-            ImmAssociateContext, ImmCreateContext, ImmGetContext, ImmReleaseContext,
-            ImmSetCompositionWindow, COMPOSITIONFORM, CFS_POINT,
-        };
-        let _ = ImmAssociateContext(hwnd, ImmCreateContext());
-        let Some(field) = self.input.field else { return };
-        let (buf, by) = self.caret_anchor(field);
-        let x = layout::INPUT_X + 6.0 + text_width(buf);
-        // 组合窗锚在框底附近，框顶 +17
-        let pt = POINT {
-            x: (x * self.dpi).round() as i32,
-            y: ((by + 12.0) * self.dpi).round() as i32,
-        };
-        let ctx = ImmGetContext(hwnd);
-        if !ctx.is_invalid() {
-            let cf = COMPOSITIONFORM {
-                dwStyle: CFS_POINT,
-                ptCurrentPos: pt,
-                rcArea: windows::Win32::Foundation::RECT::default(),
+    unsafe fn attach_ime(&mut self, hwnd: HWND) {
+        unsafe {
+            use windows::Win32::Foundation::POINT;
+            use windows::Win32::UI::Input::Ime::{
+                CFS_POINT, COMPOSITIONFORM, ImmAssociateContext, ImmCreateContext, ImmGetContext,
+                ImmReleaseContext, ImmSetCompositionWindow,
             };
-            let _ = ImmSetCompositionWindow(ctx, &cf);
-            let _ = ImmReleaseContext(hwnd, ctx);
+            let _ = ImmAssociateContext(hwnd, ImmCreateContext());
+            let Some(field) = self.input.field else {
+                return;
+            };
+            let (buf, by) = self.caret_anchor(field);
+            let x = layout::INPUT_X + 6.0 + text_width(buf);
+            // 组合窗锚在框底附近，框顶 +17
+            let pt = POINT {
+                x: (x * self.dpi).round() as i32,
+                y: ((by + 12.0) * self.dpi).round() as i32,
+            };
+            let ctx = ImmGetContext(hwnd);
+            if !ctx.is_invalid() {
+                let cf = COMPOSITIONFORM {
+                    dwStyle: CFS_POINT,
+                    ptCurrentPos: pt,
+                    rcArea: windows::Win32::Foundation::RECT::default(),
+                };
+                let _ = ImmSetCompositionWindow(ctx, &cf);
+                let _ = ImmReleaseContext(hwnd, ctx);
+            }
         }
-    }}
+    }
 
     /// 光标/IME 共用锚点；y 取自 layout，设置页间隔框依赖 caret_ctx 伸缩
     fn caret_anchor(&self, field: InputField) -> (&str, f32) {
@@ -425,41 +443,48 @@ impl Panel {
 
     /// 按字段内容计算光标位置，与 input_field 绘制对齐。
     pub fn update_caret(&self) {
-        let Some(field) = self.input.field else { return };
+        let Some(field) = self.input.field else {
+            return;
+        };
         let (buf, by) = self.caret_anchor(field);
         let x = layout::INPUT_X + 6.0 + text_width(buf);
         // by 已含 CARET_Y_OFFSET，框内垂直居中
         let y = by;
         unsafe {
-            let _ = SetCaretPos(
-                (x * self.dpi).round() as i32,
-                (y * self.dpi).round() as i32,
-            );
+            let _ = SetCaretPos((x * self.dpi).round() as i32, (y * self.dpi).round() as i32);
         }
     }
-
 }
 
 /// 取显示器有效 DPI（百分比 / 96）。
-unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> { unsafe {
-    let mut cx = 0u32;
-    let mut cy = 0u32;
-    GetDpiForMonitor(
-        monitor,
-        windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
-        &mut cx,
-        &mut cy,
-    )
-    .ok()
-    .map(|_| cx as f32 / 96.0)
-}}
+unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
+    unsafe {
+        let mut cx = 0u32;
+        let mut cy = 0u32;
+        GetDpiForMonitor(
+            monitor,
+            windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
+            &mut cx,
+            &mut cy,
+        )
+        .ok()
+        .map(|_| cx as f32 / 96.0)
+    }
+}
 
-unsafe fn start_anim(hwnd: HWND) { unsafe {
-    SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
-}}
+unsafe fn start_anim(hwnd: HWND) {
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
+    }
+}
 
 /// 面板窗口过程
-pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+pub extern "system" fn panel_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     unsafe {
         match msg {
             WM_PAINT => {
@@ -472,11 +497,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
                     // take 成局部值，避免与后续 &Panel / 模型组装的不可变借用冲突
-                    let mut renderer = app
-                        .panel
-                        .renderer
-                        .take()
-                        .or_else(Renderer::new);
+                    let mut renderer = app.panel.renderer.take().or_else(Renderer::new);
                     if let Some(r) = renderer.as_mut() {
                         let model = PanelModel::from_app(app);
                         let view = app.panel.view;
@@ -528,13 +549,15 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                                 let in_panel = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                                 // 正在输入则绝不收起
                                 let focus_in_panel = app.panel.input.field.is_some()
-                                    || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
+                                    || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
+                                        == hwnd;
                                 // 鼠标在托盘图标上
                                 let near_tray = app.panel.cursor_near_anchor();
                                 if in_panel || focus_in_panel || near_tray {
                                     app.panel.outside_since = None;
                                 } else {
-                                    let now = windows::Win32::System::SystemInformation::GetTickCount64();
+                                    let now =
+                                        windows::Win32::System::SystemInformation::GetTickCount64();
                                     let since = *app.panel.outside_since.get_or_insert(now);
                                     let timeout: u64 = if preview { 300 } else { 2000 };
                                     if now - since > timeout {
@@ -580,8 +603,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let w = WindowFromPoint(pt);
-                    let still_here = w == hwnd
-                        || GetAncestor(w, GA_ROOT) == hwnd;
+                    let still_here = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                     if still_here {
                         app.panel.hovered = true;
                         let mut tm = TRACKMOUSEEVENT {
@@ -604,11 +626,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
                     let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
-                    let hit = app
-                        .panel
-                        .renderer
-                        .as_ref()
-                        .and_then(|r| r.hit_at(x, y));
+                    let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
                     if let Some(hit) = hit {
                         crate::app::handle_panel_hit(app, hit, hwnd);
                     }
@@ -617,7 +635,9 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
             }
             WM_CHAR => {
                 let app = app_from_tray(hwnd);
-                if let Some(app) = app && app.panel.input.field.is_some() {
+                if let Some(app) = app
+                    && app.panel.input.field.is_some()
+                {
                     let ch = (wparam.0 & 0xFFFF) as u16;
                     let mut confirm = false;
                     {
@@ -675,9 +695,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            WM_MOUSEACTIVATE => {
-                LRESULT(MA_ACTIVATE as isize)
-            }
+            WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
             WM_DESTROY => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -685,32 +703,34 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
 }
 
 /// 动画帧
-unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT { unsafe {
-    let app = app_from_tray(hwnd);
-    let Some(app) = app else {
-        let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-        return LRESULT(0);
-    };
-    let mut done = true;
-    if let Some(r) = app.panel.renderer.as_mut() {
-        if let Some(t) = &r.anim.appear {
-            if t.finished() {
-                r.anim.appear = None;
-            } else {
+unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
+    unsafe {
+        let app = app_from_tray(hwnd);
+        let Some(app) = app else {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            return LRESULT(0);
+        };
+        let mut done = true;
+        if let Some(r) = app.panel.renderer.as_mut() {
+            if let Some(t) = &r.anim.appear {
+                if t.finished() {
+                    r.anim.appear = None;
+                } else {
+                    done = false;
+                }
+            }
+            if r.spin_remaining() {
                 done = false;
             }
         }
-        if r.spin_remaining() {
-            done = false;
-        }
-    }
-    let _ = InvalidateRect(Some(hwnd), None, false);
+        let _ = InvalidateRect(Some(hwnd), None, false);
 
-    if done {
-        let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+        if done {
+            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+        }
+        LRESULT(0)
     }
-    LRESULT(0)
-}}
+}
 
 fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
     unsafe {
@@ -728,17 +748,19 @@ fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
 
 /// 等宽 12px 字号下的字符经验宽度
 fn text_width(s: &str) -> f32 {
-    s.chars().map(|c| if c.is_ascii() { 7.3 } else { 12.5 }).sum()
+    s.chars()
+        .map(|c| if c.is_ascii() { 7.3 } else { 12.5 })
+        .sum()
 }
 
 /// 读剪贴板 Unicode 文本
 fn read_clipboard_text() -> Option<String> {
     unsafe {
+        use windows::Win32::Foundation::HGLOBAL;
         use windows::Win32::System::DataExchange::{
             CloseClipboard, GetClipboardData, OpenClipboard,
         };
         use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-        use windows::Win32::Foundation::HGLOBAL;
 
         const CF_UNICODETEXT: u32 = 13;
         OpenClipboard(None).ok()?;

@@ -3,10 +3,10 @@
 use crate::platform::msg::WM_APP_WAKE_INSTANCE;
 use crate::platform::wide;
 
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
+use windows::core::PCWSTR;
 
 /// 托盘隐藏窗口类名
 pub const TRAY_WND_CLASS: &str = "QuotifyTrayWnd";
@@ -58,7 +58,12 @@ impl InstanceGuard {
         let class = wide(TRAY_WND_CLASS);
         unsafe {
             if let Ok(hwnd) = FindWindowW(PCWSTR(class.as_ptr()), None) {
-                let _ = PostMessageW(Some(hwnd), WM_APP_WAKE_INSTANCE, Default::default(), Default::default());
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_APP_WAKE_INSTANCE,
+                    Default::default(),
+                    Default::default(),
+                );
             }
         }
     }

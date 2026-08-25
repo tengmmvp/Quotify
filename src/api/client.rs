@@ -103,7 +103,9 @@ fn fetch_balance(api_key: &str) -> Result<Balance, FetchError> {
             .filter(|v| v.is_finite())
     };
     // availableBalance 优先，回退 balance
-    let available = num("availableBalance").or_else(|| num("balance")).unwrap_or(0.0);
+    let available = num("availableBalance")
+        .or_else(|| num("balance"))
+        .unwrap_or(0.0);
     Ok(Balance {
         available,
         recharged: num("rechargeAmount"),
@@ -198,13 +200,28 @@ mod tests {
     fn status_classification() {
         assert!(classify_status(200, "").is_none());
         assert!(classify_status(204, "").is_none());
-        assert!(matches!(classify_status(401, "denied"), Some(FetchError::Auth)));
+        assert!(matches!(
+            classify_status(401, "denied"),
+            Some(FetchError::Auth)
+        ));
         assert!(matches!(classify_status(403, ""), Some(FetchError::Auth)));
-        assert!(matches!(classify_status(429, "Too Many Requests"), Some(FetchError::Network(_))));
-        assert!(matches!(classify_status(500, ""), Some(FetchError::Network(_))));
-        assert!(matches!(classify_status(503, "busy"), Some(FetchError::Network(_))));
+        assert!(matches!(
+            classify_status(429, "Too Many Requests"),
+            Some(FetchError::Network(_))
+        ));
+        assert!(matches!(
+            classify_status(500, ""),
+            Some(FetchError::Network(_))
+        ));
+        assert!(matches!(
+            classify_status(503, "busy"),
+            Some(FetchError::Network(_))
+        ));
         // 其余非 2xx 为确定性业务错误
-        assert!(matches!(classify_status(404, "nope"), Some(FetchError::Api(_))));
+        assert!(matches!(
+            classify_status(404, "nope"),
+            Some(FetchError::Api(_))
+        ));
         assert!(matches!(classify_status(400, ""), Some(FetchError::Api(_))));
         // detail 拼接格式
         assert_eq!(

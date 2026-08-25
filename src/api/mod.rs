@@ -7,7 +7,12 @@ pub mod client;
 
 /// 套餐代际
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanVersion { V1, V2, V3, Unknown,}
+pub enum PlanVersion {
+    V1,
+    V2,
+    V3,
+    Unknown,
+}
 
 impl PlanVersion {
     pub fn label(self) -> &'static str {
@@ -152,7 +157,10 @@ fn window_minutes(item: &Value) -> Option<i64> {
     const MULTIPLIERS: &[(i64, i64)] =
         &[(1, 1440), (3, 60), (4, 1440), (5, 30 * 24 * 60), (6, 10080)];
     let unit = item.get("unit").and_then(Value::as_i64)?;
-    let number = item.get("number").and_then(Value::as_i64).filter(|&n| n > 0)?;
+    let number = item
+        .get("number")
+        .and_then(Value::as_i64)
+        .filter(|&n| n > 0)?;
     MULTIPLIERS
         .iter()
         .find(|(u, _)| *u == unit)
@@ -198,7 +206,10 @@ fn parse_reset_time(item: &Value) -> Option<DateTime<Utc>> {
 
 /// 解析限额桶
 fn parse_bucket(item: &Value) -> QuotaBucket {
-    let total = item.get("usage").and_then(Value::as_f64).filter(|v| *v > 0.0);
+    let total = item
+        .get("usage")
+        .and_then(Value::as_f64)
+        .filter(|v| *v > 0.0);
     let current = item.get("currentValue").and_then(Value::as_f64);
     let remaining = item.get("remaining").and_then(Value::as_f64);
 
@@ -212,10 +223,16 @@ fn parse_bucket(item: &Value) -> QuotaBucket {
         if used.is_finite() {
             (used.clamp(0.0, total) / total * 100.0).clamp(0.0, 100.0)
         } else {
-            item.get("percentage").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0)
+            item.get("percentage")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                .clamp(0.0, 100.0)
         }
     } else {
-        item.get("percentage").and_then(Value::as_f64).unwrap_or(0.0).clamp(0.0, 100.0)
+        item.get("percentage")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0)
     };
 
     QuotaBucket {
@@ -365,7 +382,10 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
         &v
     } else {
         if v.get("success").and_then(Value::as_bool) == Some(false) {
-            let msg = v.get("msg").and_then(Value::as_str).unwrap_or("unknown error");
+            let msg = v
+                .get("msg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
             let code = v.get("code").and_then(Value::as_i64);
             return Err(inband_error(code, msg));
         }

@@ -81,6 +81,10 @@ impl Theme {
             .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
             .and_then(|k| k.get_u32("AppsUseLightTheme"))
             .unwrap_or(1);
-        if val == 1 { Appearance::Light } else { Appearance::Dark }
+        if val == 1 {
+            Appearance::Light
+        } else {
+            Appearance::Dark
+        }
     }
 }

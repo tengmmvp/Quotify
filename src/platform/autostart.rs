@@ -19,8 +19,7 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         .create(RUN_KEY)
         .map_err(|e| format!("打开注册表 Run 键失败: {e}"))?;
     if on {
-        let exe = std::env::current_exe()
-            .map_err(|e| format!("获取 exe 路径失败: {e}"))?;
+        let exe = std::env::current_exe().map_err(|e| format!("获取 exe 路径失败: {e}"))?;
         let quoted = format!("\"{}\"", exe.display());
         key.set_string(VALUE_NAME, &quoted)
             .map_err(|e| format!("写入自启注册表失败: {e}"))

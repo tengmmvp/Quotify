@@ -28,7 +28,10 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     let resp = agent_long()
         .get(&url)
         // GitHub API 强制要求 User-Agent
-        .header("User-Agent", format!("quotify/{}", env!("CARGO_PKG_VERSION")))
+        .header(
+            "User-Agent",
+            format!("quotify/{}", env!("CARGO_PKG_VERSION")),
+        )
         .call()
         .map_err(|e| format!("network error: {e}"))?;
 
@@ -44,7 +47,10 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     if rel.draft || rel.prerelease {
         return Err("no stable release".into());
     }
-    Ok(ReleaseInfo { tag: rel.tag_name, url: rel.html_url })
+    Ok(ReleaseInfo {
+        tag: rel.tag_name,
+        url: rel.html_url,
+    })
 }
 
 /// 比较当前版本与远端 tag

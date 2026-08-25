@@ -87,7 +87,10 @@ impl Config {
     /// 选中账号
     pub fn selected_account(&self) -> Option<&Account> {
         let sel = self.selected.as_deref()?;
-        self.accounts.iter().find(|a| a.id == sel).or_else(|| self.accounts.first())
+        self.accounts
+            .iter()
+            .find(|a| a.id == sel)
+            .or_else(|| self.accounts.first())
     }
 }
 
@@ -170,9 +173,10 @@ pub fn load() -> Config {
 pub fn save(config: &Config) {
     let path = config_path();
     if let Ok(text) = toml::to_string_pretty(config)
-        && let Err(e) = std::fs::write(&path, text) {
-            crate::platform::log(&format!("config.toml 写入失败: {e}"));
-        }
+        && let Err(e) = std::fs::write(&path, text)
+    {
+        crate::platform::log(&format!("config.toml 写入失败: {e}"));
+    }
 }
 
 #[cfg(test)]
@@ -194,7 +198,10 @@ mod tests {
     #[test]
     fn corrupted_text_falls_back_to_default() {
         let cfg = parse_or_default("this is not valid toml ]][");
-        assert_eq!(cfg.general.poll_interval_secs, General::default().poll_interval_secs);
+        assert_eq!(
+            cfg.general.poll_interval_secs,
+            General::default().poll_interval_secs
+        );
         assert!(cfg.accounts.is_empty());
         assert!(cfg.selected.is_none());
     }

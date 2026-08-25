@@ -12,7 +12,9 @@ pub fn detect_system_lang() -> Lang {
     use windows::Win32::Globalization::GetUserDefaultUILanguage;
     let lang_id = unsafe { GetUserDefaultUILanguage() };
     // 0x0804 = 简体中文（中国），0x0404 = 繁体中文（中国台湾），0x0C04 = 繁体中文（中国香港）
-    matches!(lang_id, 0x0804 | 0x0404 | 0x0C04).then_some(Lang::Zh).unwrap_or(Lang::En)
+    matches!(lang_id, 0x0804 | 0x0404 | 0x0C04)
+        .then_some(Lang::Zh)
+        .unwrap_or(Lang::En)
 }
 
 /// 解析配置里的语言设置
@@ -293,11 +295,12 @@ mod tests {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'{'
-                && let Some(end) = s[i + 1..].find('}') {
-                    names.push(&s[i + 1..i + 1 + end]);
-                    i += end + 2;
-                    continue;
-                }
+                && let Some(end) = s[i + 1..].find('}')
+            {
+                names.push(&s[i + 1..i + 1 + end]);
+                i += end + 2;
+                continue;
+            }
             i += 1;
         }
         names.sort_unstable();
@@ -322,22 +325,77 @@ mod tests {
             };
         }
         check!(
-            five_hour, weekly, mcp_tools, resets_line, used_of, usage_section,
-            balance_label, updated_just_now, updated_ago, data_as_of, fetch_failed,
-            retry, settings, exit, not_configured_title, not_configured_hint,
-            loading, key_invalid, cancel, save, settings_general, poll_interval,
-            interval_1m, interval_5m, interval_15m, interval_30m, interval_custom,
-            interval_custom_unit, apply, language, follow_system, appearance_section,
-            theme_light, theme_dark, notifications, notify_threshold,
-            notify_threshold_desc, notify_reset_5h_opt, notify_reset_5h_desc,
-            notify_reset_weekly_opt, notify_reset_weekly_desc, autostart,
-            accounts_section, platform_section, add_account, account_name,
-            account_platform, platform_cn, platform_intl, account_type_label,
-            type_personal, type_team, team_badge, org_id_label, project_id_label,
-            api_key_label, check_update, up_to_date, err_auth, err_empty,
-            err_api, err_network, err_update, version_label,
-            notify_threshold_title, notify_reset_5h,
-            notify_reset_weekly, unit_day, unit_hour, unit_minute, unit_second,
+            five_hour,
+            weekly,
+            mcp_tools,
+            resets_line,
+            used_of,
+            usage_section,
+            balance_label,
+            updated_just_now,
+            updated_ago,
+            data_as_of,
+            fetch_failed,
+            retry,
+            settings,
+            exit,
+            not_configured_title,
+            not_configured_hint,
+            loading,
+            key_invalid,
+            cancel,
+            save,
+            settings_general,
+            poll_interval,
+            interval_1m,
+            interval_5m,
+            interval_15m,
+            interval_30m,
+            interval_custom,
+            interval_custom_unit,
+            apply,
+            language,
+            follow_system,
+            appearance_section,
+            theme_light,
+            theme_dark,
+            notifications,
+            notify_threshold,
+            notify_threshold_desc,
+            notify_reset_5h_opt,
+            notify_reset_5h_desc,
+            notify_reset_weekly_opt,
+            notify_reset_weekly_desc,
+            autostart,
+            accounts_section,
+            platform_section,
+            add_account,
+            account_name,
+            account_platform,
+            platform_cn,
+            platform_intl,
+            account_type_label,
+            type_personal,
+            type_team,
+            team_badge,
+            org_id_label,
+            project_id_label,
+            api_key_label,
+            check_update,
+            up_to_date,
+            err_auth,
+            err_empty,
+            err_api,
+            err_network,
+            err_update,
+            version_label,
+            notify_threshold_title,
+            notify_reset_5h,
+            notify_reset_weekly,
+            unit_day,
+            unit_hour,
+            unit_minute,
+            unit_second,
         );
     }
 }

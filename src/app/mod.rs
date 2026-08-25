@@ -3,17 +3,17 @@
 pub mod config;
 
 use chrono::{DateTime, Utc};
-use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU, MF_STRING,
-    PostQuitMessage, RegisterClassW, SetWindowLongPtrW, SM_CXSMICON, TrackPopupMenu,
-    TranslateMessage, WINDOW_EX_STYLE, WNDCLASSW, WS_POPUP, GWLP_USERDATA, MSG,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY,
+    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU,
+    MF_STRING, MSG, PostQuitMessage, RegisterClassW, SM_CXSMICON, SetWindowLongPtrW,
+    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
+    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WNDCLASSW, WS_POPUP,
 };
+use windows::core::PCWSTR;
 
 use crate::api::{FetchError, QuotaBucket, UsageSnapshot};
 use crate::app::config::{Config, DEFAULT_INTERVAL_SECS, MIN_POLL_SECS};
@@ -22,11 +22,11 @@ use crate::platform::msg::{
     WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
 };
 use crate::platform::wide;
-use crate::service::poller::{PollInterval, PollOutcome, Poller, PollTarget};
+use crate::service::poller::{PollInterval, PollOutcome, PollTarget, Poller};
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
-use crate::ui::panel::layout::INTERVAL_PRESETS;
 use crate::ui::panel::Panel;
+use crate::ui::panel::layout::INTERVAL_PRESETS;
 use crate::ui::tray::{self, TrayIcon};
 
 const IDM_SETTINGS: u16 = 1001;
@@ -70,7 +70,10 @@ impl App {
             strings: lang.strings(),
             lang,
             config,
-            data: AccountData { snapshot: None, last_error: None },
+            data: AccountData {
+                snapshot: None,
+                last_error: None,
+            },
             tray: None,
             poller: None,
             poll_target: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -105,7 +108,8 @@ impl App {
                 project_id: a.project_id.clone(),
             });
         *self.poll_target.lock().unwrap() = target;
-        *self.poll_interval.lock().unwrap() = self.config.general.poll_interval_secs.max(MIN_POLL_SECS);
+        *self.poll_interval.lock().unwrap() =
+            self.config.general.poll_interval_secs.max(MIN_POLL_SECS);
     }
 
     fn update_tray_icon(&mut self) {
@@ -213,7 +217,12 @@ impl App {
             if menu.is_invalid() {
                 return;
             }
-            let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings.as_ptr()));
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                IDM_SETTINGS as usize,
+                PCWSTR(settings.as_ptr()),
+            );
             let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit.as_ptr()));
             let _ = TrackPopupMenu(
                 menu,
@@ -278,12 +287,13 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             match code {
                 tray::NIN_POPUPOPEN => {
                     if let Some(app) = app
-                        && let Some(rect) = tray_rect(app) {
-                            let n = app.config.accounts.len();
-                            sync_main_height(app);
-                            app.panel.show_preview(hwnd, rect, n);
-                            apply_appearance(app);
-                        }
+                        && let Some(rect) = tray_rect(app)
+                    {
+                        let n = app.config.accounts.len();
+                        sync_main_height(app);
+                        app.panel.show_preview(hwnd, rect, n);
+                        apply_appearance(app);
+                    }
                 }
                 tray::NIN_POPUPCLOSE => {
                     if let Some(app) = app {
@@ -292,12 +302,13 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
                     if let Some(app) = app
-                        && let Some(rect) = tray_rect(app) {
-                            let n = app.config.accounts.len();
-                            sync_main_height(app);
-                            app.panel.toggle_pin(hwnd, rect, n);
-                            apply_appearance(app);
-                        }
+                        && let Some(rect) = tray_rect(app)
+                    {
+                        let n = app.config.accounts.len();
+                        sync_main_height(app);
+                        app.panel.toggle_pin(hwnd, rect, n);
+                        apply_appearance(app);
+                    }
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                     if let Some(app) = app {
@@ -329,11 +340,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     app.update_status = Some(*r);
                     if let Some(p) = app.panel.hwnd {
                         unsafe {
-                            let _ = InvalidateRect(
-                                Some(p),
-                                None,
-                                true,
-                            );
+                            let _ = InvalidateRect(Some(p), None, true);
                         }
                     }
                 }
@@ -342,10 +349,11 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
         WM_APP_WAKE_INSTANCE => {
             if let Some(app) = app_from(hwnd)
-                && let Some(rect) = tray_rect(app) {
-                    let n = app.config.accounts.len();
-                    app.panel.toggle_pin(hwnd, rect, n);
-                }
+                && let Some(rect) = tray_rect(app)
+            {
+                let n = app.config.accounts.len();
+                app.panel.toggle_pin(hwnd, rect, n);
+            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -356,15 +364,16 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 },
                 IDM_SETTINGS => {
                     if let Some(app) = app_from(hwnd)
-                        && let Some(rect) = tray_rect(app) {
-                            let n = app.config.accounts.len();
-                            app.panel.show_preview(hwnd, rect, n);
-                            app.panel.view = crate::ui::panel::PanelView::Settings;
-                            if let Some(p) = app.panel.hwnd {
-                                sync_customizing(app);
-                                relayout_panel(app, p);
-                            }
+                        && let Some(rect) = tray_rect(app)
+                    {
+                        let n = app.config.accounts.len();
+                        app.panel.show_preview(hwnd, rect, n);
+                        app.panel.view = crate::ui::panel::PanelView::Settings;
+                        if let Some(p) = app.panel.hwnd {
+                            sync_customizing(app);
+                            relayout_panel(app, p);
                         }
+                    }
                 }
                 _ => {}
             }
@@ -472,15 +481,18 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::SaveAccount => save_pending_account(app, panel_hwnd),
         Hit::ToggleThreshold => {
-            app.config.general.notify_threshold_enabled = !app.config.general.notify_threshold_enabled;
+            app.config.general.notify_threshold_enabled =
+                !app.config.general.notify_threshold_enabled;
             crate::app::config::save(&app.config);
         }
         Hit::ToggleReset5h => {
-            app.config.general.notify_reset_5h_enabled = !app.config.general.notify_reset_5h_enabled;
+            app.config.general.notify_reset_5h_enabled =
+                !app.config.general.notify_reset_5h_enabled;
             crate::app::config::save(&app.config);
         }
         Hit::ToggleResetWeekly => {
-            app.config.general.notify_reset_weekly_enabled = !app.config.general.notify_reset_weekly_enabled;
+            app.config.general.notify_reset_weekly_enabled =
+                !app.config.general.notify_reset_weekly_enabled;
             crate::app::config::save(&app.config);
         }
         Hit::ToggleAutostart => {
@@ -502,7 +514,10 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                     r.hover = None;
                 }
                 crate::app::config::save(&app.config);
-                app.data = AccountData { snapshot: None, last_error: None };
+                app.data = AccountData {
+                    snapshot: None,
+                    last_error: None,
+                };
                 app.sync_poll_context();
                 app.update_tray_icon();
                 if let Some(p) = &app.poller {
@@ -521,22 +536,28 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.input.org.clear();
             app.panel.input.project.clear();
             relayout_panel(app, panel_hwnd);
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
         Hit::InputName => {
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
         Hit::InputKey => {
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
         }
         Hit::InputOrg => {
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Org);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Org);
         }
         Hit::InputProject => {
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Project);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Project);
         }
         Hit::InputInterval => {
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
         }
         Hit::CustomizeInterval => {
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
@@ -545,7 +566,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 prefill_interval(app);
             }
             relayout_panel(app, panel_hwnd);
-            app.panel.focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
         }
         Hit::ApplyInterval => apply_interval(app, panel_hwnd),
         Hit::AccountSwitch => {
@@ -556,7 +578,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                     .selected_account()
                     .map(|a| a.id.clone())
                     .unwrap_or_default();
-                let idx = app.config.accounts.iter().position(|a| a.id == cur).unwrap_or(0);
+                let idx = app
+                    .config
+                    .accounts
+                    .iter()
+                    .position(|a| a.id == cur)
+                    .unwrap_or(0);
                 let next = (idx + 1) % n;
                 select_account(app, next);
             }
@@ -596,7 +623,10 @@ fn select_account(app: &mut App, i: usize) {
     if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
         app.config.selected = Some(id);
         crate::app::config::save(&app.config);
-        app.data = AccountData { snapshot: None, last_error: None };
+        app.data = AccountData {
+            snapshot: None,
+            last_error: None,
+        };
         app.sync_poll_context();
         app.update_tray_icon();
         if let Some(p) = &app.poller {
@@ -609,7 +639,10 @@ fn select_account(app: &mut App, i: usize) {
 fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
     use crate::ui::panel::InputField;
     if !app.panel.pending_team
-        && matches!(app.panel.input.field, Some(InputField::Org) | Some(InputField::Project))
+        && matches!(
+            app.panel.input.field,
+            Some(InputField::Org) | Some(InputField::Project)
+        )
     {
         app.panel.clear_input(panel_hwnd);
     }
@@ -623,7 +656,11 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         return;
     }
     // 名称留空默认 Default
-    let name = if name.is_empty() { "Default".to_string() } else { name };
+    let name = if name.is_empty() {
+        "Default".to_string()
+    } else {
+        name
+    };
 
     let acc = crate::app::config::Account {
         id: app.config.new_account_id(),
@@ -646,7 +683,10 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     crate::app::config::save(&app.config);
     app.panel.adding_account = false;
     app.panel.clear_input(panel_hwnd);
-    app.data = AccountData { snapshot: None, last_error: None };
+    app.data = AccountData {
+        snapshot: None,
+        last_error: None,
+    };
     app.sync_poll_context();
     app.update_tray_icon();
     if let Some(p) = &app.poller {
@@ -657,15 +697,23 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
 
 /// 应用自定义轮询间隔（分钟）
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
-    if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0)
-        && let Some(secs) = mins.checked_mul(60) {
-            app.config.general.poll_interval_secs = secs.max(MIN_POLL_SECS);
-            crate::app::config::save(&app.config);
-            app.sync_poll_context();
-            if let Some(p) = &app.poller {
-                p.reschedule();
-            }
+    if let Some(mins) = app
+        .panel
+        .input
+        .interval
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|m| *m > 0)
+        && let Some(secs) = mins.checked_mul(60)
+    {
+        app.config.general.poll_interval_secs = secs.max(MIN_POLL_SECS);
+        crate::app::config::save(&app.config);
+        app.sync_poll_context();
+        if let Some(p) = &app.poller {
+            p.reschedule();
         }
+    }
     sync_customizing(app);
     app.panel.clear_input(panel_hwnd);
     relayout_panel(app, panel_hwnd);
@@ -742,10 +790,14 @@ fn sync_main_height(app: &mut App) {
     app.panel.main_h = match app.data.snapshot.as_ref() {
         None => 300,
         Some(snap) => {
-            let rows = [snap.five_hour.is_some(), snap.weekly.is_some(), snap.mcp.is_some()]
-                .iter()
-                .filter(|b| **b)
-                .count() as i32;
+            let rows = [
+                snap.five_hour.is_some(),
+                snap.weekly.is_some(),
+                snap.mcp.is_some(),
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count() as i32;
             let bal = snap.balance.is_some() as i32;
             // 顶栏 + 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
             16 + if snap.has_meta() { 52 } else { 38 } + 42 + rows * 52 + bal * 40 + 40
@@ -765,12 +817,15 @@ fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
     if app.panel.anchor.is_none() {
         return;
     }
-    app.panel.place(panel_hwnd, app.panel.view_height(app.config.accounts.len()), false);
+    app.panel.place(
+        panel_hwnd,
+        app.panel.view_height(app.config.accounts.len()),
+        false,
+    );
     unsafe {
         let _ = InvalidateRect(Some(panel_hwnd), None, true);
     }
 }
-
 
 /// 应用入口
 pub fn run() -> i32 {
@@ -805,8 +860,12 @@ pub fn run() -> i32 {
             PCWSTR(class_name.as_ptr()),
             PCWSTR(class_name.as_ptr()),
             WS_POPUP,
-            0, 0, 0, 0,
-            None, None,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
             Some(hinst.into()),
             None,
         )
@@ -833,7 +892,12 @@ pub fn run() -> i32 {
         // 诊断后门，仅 debug 生效：QUOTIFY_DIAG=adding 自动弹设置-添加账号页
         #[cfg(debug_assertions)]
         if std::env::var("QUOTIFY_DIAG").as_deref() == Ok("adding") {
-            let rect = tray_rect(&app).unwrap_or(RECT { left: 1300, top: 880, right: 1340, bottom: 920 });
+            let rect = tray_rect(&app).unwrap_or(RECT {
+                left: 1300,
+                top: 880,
+                right: 1340,
+                bottom: 920,
+            });
             {
                 let n = app.config.accounts.len();
                 app.panel.show_preview(hwnd, rect, n);

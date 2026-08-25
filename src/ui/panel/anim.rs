@@ -26,7 +26,10 @@ pub struct Tween {
 
 impl Tween {
     pub fn now(duration_ms: u32) -> Self {
-        Self { start: std::time::Instant::now(), duration_ms }
+        Self {
+            start: std::time::Instant::now(),
+            duration_ms,
+        }
     }
 
     pub fn progress(&self) -> f32 {
@@ -42,8 +45,7 @@ impl Tween {
 /// 是否尊重系统「减少动态效果」
 pub fn animations_allowed() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
-        SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-        SystemParametersInfoW,
+        SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,
     };
     const SPI_GETCLIENTAREAANIMATION: u32 = 0x1042;
     let mut enabled = windows::core::BOOL::default();

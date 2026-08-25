@@ -76,7 +76,7 @@ impl Theme {
                 action_text: rgba(0x26, 0x25, 0x1E, 1.0),
                 ok: rgba(0x3F, 0xA3, 0x77, 1.0),
                 danger: rgba(0xE2, 0x5A, 0x77, 1.0),
-                logo_tile: rgba(0x8C, 0x8C, 0x8C, 1.0),
+                logo_tile: rgba(0x2D, 0x2D, 0x2D, 1.0),
             },
         }
     }

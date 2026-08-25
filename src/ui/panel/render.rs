@@ -15,13 +15,15 @@ use windows_numerics::{Matrix3x2, Vector2};
 use windows::Win32::Graphics::Direct2D::{
     D2D1CreateFactory, D2D1_DRAW_TEXT_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT,
-    ID2D1HwndRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1SolidColorBrush,
+    D2D1_RENDER_TARGET_TYPE_DEFAULT, D2D1_ROUNDED_RECT, D2D1_CAP_STYLE_FLAT,
+    D2D1_DASH_STYLE_DASH, D2D1_STROKE_STYLE_PROPERTIES,
+    ID2D1HwndRenderTarget, ID2D1Factory, ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWriteCreateFactory, DWRITE_FACTORY_TYPE_SHARED, DWRITE_TEXT_ALIGNMENT_LEADING,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, IDWriteFactory, IDWriteTextFormat,
+    DWRITE_PARAGRAPH_ALIGNMENT_NEAR, DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
+    IDWriteFactory, IDWriteTextFormat,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -49,6 +51,8 @@ pub enum Hit {
     InputKey,
     InputInterval,
     Language(&'static str),
+    /// 外观模式选择（"" = 跟随系统 / "light" / "dark"）
+    Appearance(&'static str),
     /// 添加账号时的平台选择（"cn" / "intl"）
     Platform(&'static str),
     /// 添加账号：保存
@@ -65,14 +69,13 @@ pub enum Hit {
 /// 进度条等数值的动画插值状态。
 pub struct AnimState {
     pub appear: Option<Tween>,
-    pub bars: [f32; 3],
     /// 刷新按钮剩余旋转弧度（>0 表示在转）
     pub spin: f32,
 }
 
 impl AnimState {
     pub fn new() -> Self {
-        Self { appear: None, bars: [0.0; 3], spin: 0.0 }
+        Self { appear: None, spin: 0.0 }
     }
 }
 
@@ -111,6 +114,8 @@ pub struct Renderer {
     target_dpi: f32,
     /// logo 的 Z 字形路径几何（30×30 viewBox，懒构建缓存）
     logo_geo: Option<ID2D1PathGeometry>,
+    /// 虚线描边样式（小票撕线，懒构建缓存）
+    dash_style: Option<ID2D1StrokeStyle>,
 }
 
 impl Renderer {
@@ -135,6 +140,7 @@ impl Renderer {
                 font_fallback: false,
                 target_dpi: 0.0,
                 logo_geo: None,
+                dash_style: None,
             })
         }
     }
@@ -261,28 +267,29 @@ impl Renderer {
         let w = (rect.right - rect.left) as f32;
         let h = (rect.bottom - rect.top) as f32;
 
-        // 弹出动画：整帧上浮 + 内容透明度
+        // 弹出动画：内容上浮 + 渐入。纸面（背景）必须始终不透明、全幅
+        // 绘制——若连背景一起位移/半透明，首帧会露出未初始化的交换链
+        // 内容、后续帧错位刷新，表现为弹出时的抖动。
         let (dy, alpha) = match &self.anim.appear {
             Some(t) if animations_allowed() => {
                 let p = ease_out_cubic(t.progress());
-                ((1.0 - p) * 10.0, p)
+                ((1.0 - p) * 6.0, p)
             }
             _ => (0.0, 1.0),
         };
 
         let bg = self.theme.bg;
         let black = self.black.clone();
-        let solid = |c: [f32; 4]| -> ID2D1SolidColorBrush {
+        let _solid = |c: [f32; 4]| -> ID2D1SolidColorBrush {
             target
                 .CreateSolidColorBrush(&windows::Win32::Graphics::Direct2D::Common::D2D1_COLOR_F {
                     r: c[0], g: c[1], b: c[2], a: c[3] * alpha,
                 }, None)
                 .unwrap_or_else(|_| black.clone().expect("fallback brush"))
         };
-        let _bg_brush = solid(bg);
-        // 背景（含动画位移）
-        let bg_rect = D2D_RECT_F { left: 0.0, top: dy, right: w, bottom: h + dy };
-        target.FillRectangle(&bg_rect, &_bg_brush);
+        let bg_brush = self.brush(target, bg, 1.0);
+        let bg_rect = D2D_RECT_F { left: 0.0, top: 0.0, right: w, bottom: h };
+        target.FillRectangle(&bg_rect, &bg_brush);
 
         match view {
             PanelView::Main => self.draw_main(target, app, w, h, dy, alpha),
@@ -305,27 +312,45 @@ impl Renderer {
         let mut y = dy + 16.0;
         let snap = app.data.snapshot.as_ref();
 
-        // ── 顶栏：无数据时以 logo 作为标识；有数据按原方案显示账号名 ──
+        // ── 顶栏：账号名 + 套餐副标题（hero meta，参考 ai-usagebar）──
         let account = app.config.selected_account();
         let title = account.map(|a| a.name.as_str()).unwrap_or("Quotify");
-        if snap.is_none() {
-            self.logo(target, pad, y + 1.0, 22.0, alpha);
-            self.text(target, title, pad + 30.0, y + 2.0, w - pad * 2.0 - 90.0, 22.0, 15.0, 500, self.theme.text_primary, alpha);
-        } else {
-            self.text(target, title, pad, y + 2.0, w - pad * 2.0 - 90.0, 22.0, 15.0, 500, self.theme.text_primary, alpha);
+        // 副标题只留代际与档位（「V3 · Max」）——产品名由图标承担
+        let meta = snap.and_then(|s| {
+            let v = s.plan_version.label();
+            let tier = {
+                let t = s.tier.label();
+                if t.is_empty() { s.plan_label.clone().unwrap_or_default() } else { t.to_string() }
+            };
+            match (v.is_empty(), tier.is_empty()) {
+                (false, false) => Some(format!("{v} · {tier}")),
+                (false, true) => Some(v.to_string()),
+                (true, false) => Some(tier),
+                (true, true) => None,
+            }
+        });
+        // 左侧 logo 磁贴常驻（32px，对两行文字块垂直居中；单行时缩小）
+        let (logo_size, logo_y) = if meta.is_some() { (32.0, y + 5.0) } else { (22.0, y + 1.0) };
+        self.logo(target, pad, logo_y, logo_size, alpha);
+        let tx = pad + logo_size + 10.0;
+        let tw = w - tx - 88.0;
+        self.text(target, title, tx, y + 2.0, tw, 22.0, 16.0, 500, self.theme.text_primary, alpha);
+        if let Some(m) = &meta {
+            self.text(target, m, tx + 1.0, y + 24.0, tw, 17.0, 12.0, 400, self.theme.text_secondary, alpha);
         }
         let btn_r = 16.0;
         let refresh_cx = w - pad - btn_r - 30.0;
         let settings_cx = w - pad - btn_r;
-        self.icon_button(target, Hit::Refresh, refresh_cx, y + 12.0, btn_r, self.anim.spin);
-        self.sliders(target, Hit::Settings, settings_cx, y + 12.0, btn_r);
+        let btn_cy = if snap.is_some() { y + 19.0 } else { y + 12.0 };
+        self.icon_button(target, Hit::Refresh, refresh_cx, btn_cy, btn_r, self.anim.spin);
+        self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
         if app.config.accounts.len() > 1 {
             self.hits.push((
                 Hit::AccountSwitch,
-                D2D_RECT_F { left: pad, top: y, right: w - 110.0, bottom: y + 26.0 },
+                D2D_RECT_F { left: pad, top: y, right: w - 110.0, bottom: y + if snap.is_some() { 42.0 } else { 26.0 } },
             ));
         }
-        y += 38.0;
+        y += if snap.is_some() { 52.0 } else { 38.0 };
 
         // ── 数据态 ──
         match (snap, &app.data.last_error) {
@@ -353,80 +378,97 @@ impl Renderer {
                     self.text_aligned(target, t2, &sub_rect, 14.0, 400, self.theme.text_secondary, alpha, 1, false);
                 }
             }
+            (None, Some(e)) => {
+                // 错误卡：danger 轻染底 + hairline 边（参考 ai-usagebar 的
+                // BorderSurface），居中错误信息 + 重试——替代底部挤在一行
+                // 的小字提示
+                let msg = e.to_string();
+                let body_top = y + 10.0;
+                let body_h = (dy + h - 16.0) - body_top;
+                let cx = w / 2.0;
+                let card_h = 96.0;
+                let card_top = body_top + (body_h - card_h) / 2.0;
+                let card = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F { left: pad, top: card_top, right: w - pad, bottom: card_top + card_h },
+                    radiusX: RADIUS,
+                    radiusY: RADIUS,
+                };
+                let fill = self.brush(
+                    target,
+                    [self.theme.danger[0], self.theme.danger[1], self.theme.danger[2], 0.06],
+                    alpha,
+                );
+                target.FillRoundedRectangle(&card, &fill);
+                let edge = self.brush(
+                    target,
+                    [self.theme.danger[0], self.theme.danger[1], self.theme.danger[2], 0.35],
+                    alpha,
+                );
+                target.DrawRoundedRectangle(&card, &edge, 1.0, None);
+                // 错误标题（居中，danger）
+                let title_rect = D2D_RECT_F { left: pad + 12.0, top: card_top + 18.0, right: w - pad - 12.0, bottom: card_top + 40.0 };
+                self.text_aligned(target, &msg, &title_rect, 13.0, 500, self.theme.danger, alpha, 1, false);
+                // 重试（居中描边按钮）
+                self.outline_button(target, Hit::Retry, cx - 44.0, card_top + 50.0, 88.0, 28.0, s.retry, alpha);
+            }
             _ => {
                 if let Some(snap) = snap {
-                    // 套餐标识：纯文字（版本 mono Ember · 等级 500 墨色）
-                    let v = snap.plan_version.label();
-                    let t = snap.tier.label();
-                    let fallback = snap.plan_label.clone().unwrap_or_default();
-                    let tier_text = if !t.is_empty() { t } else { &fallback };
-                    let mut bx = pad;
-                    if !v.is_empty() {
-                        self.text_rect_opts(
-                            target,
-                            v,
-                            &D2D_RECT_F { left: bx, top: y + 2.0, right: bx + 60.0, bottom: y + 18.0 },
-                            12.0,
-                            500,
-                            self.theme.accent,
-                            alpha,
-                            false,
-                            true,
-                        );
-                        bx += v.chars().count() as f32 * 7.3 + 10.0;
-                    }
-                    let shown = if tier_text.is_empty() { "GLM" } else { tier_text };
-                    self.text(target, shown, bx, y + 1.0, w - pad - bx, 18.0, 13.0, 500, self.theme.text_primary, alpha);
+                    // 区块刊头：hairline + 墨色强调块 + 标题（与设置页同款）
+                    self.divider(target, pad, y + 2.0, w - pad * 2.0, alpha);
+                    y += 14.0;
+                    let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+                    target.FillRectangle(
+                        &D2D_RECT_F { left: pad, top: y + 1.0, right: pad + 3.0, bottom: y + 13.0 },
+                        &bar,
+                    );
+                    self.text(target, s.usage_section, pad + 7.0, y, w - pad * 2.0 - 7.0, 17.0, 12.0, 600, self.theme.text_tertiary, alpha);
                     y += 26.0;
 
-                    // 5h / 周 两条进度（MCP 另行处理）
-                    let rows: [(Option<&crate::api::QuotaBucket>, &str, f32); 2] = [
-                        (snap.five_hour.as_ref(), s.five_hour, self.anim.bars[0]),
-                        (snap.weekly.as_ref(), s.weekly, self.anim.bars[1]),
-                    ];
-                    let mut row_y = y;
-                    for (bucket, label, anim_v) in rows.iter() {
-                        if let Some(b) = bucket {
-                            row_y = self.quota_row(target, label, b, *anim_v, row_y, w, alpha, app.lang);
+                    // 指标行：Session (5h) / Weekly / MCP tools
+                    let detail_of = |cur: Option<f64>, tot: Option<f64>| -> Option<String> {
+                        match (cur, tot) {
+                            (Some(c), Some(t)) if t > 0.0 => Some(
+                                s.used_of
+                                    .replace("{cur}", &fmt::compact_number(c))
+                                    .replace("{tot}", &fmt::compact_number(t)),
+                            ),
+                            _ => None,
                         }
+                    };
+                    if let Some(b) = snap.five_hour.as_ref() {
+                        y = self.metric_row(target, s.five_hour, b.used_percent, detail_of(b.current, b.total), b.resets_at, y, w, alpha, app.lang);
                     }
-                    if let Some(mcp) = &snap.mcp {
-                        let b = crate::api::QuotaBucket {
-                            used_percent: mcp.used_percent,
-                            resets_at: None,
-                            total: if mcp.total > 0.0 { Some(mcp.total) } else { None },
-                            current: if mcp.current_value > 0.0 { Some(mcp.current_value) } else { None },
+                    if let Some(b) = snap.weekly.as_ref() {
+                        y = self.metric_row(target, s.weekly, b.used_percent, detail_of(b.current, b.total), b.resets_at, y, w, alpha, app.lang);
+                    }
+                    if let Some(m) = snap.mcp.as_ref() {
+                        let detail = if m.total > 0.0 {
+                            Some(s.used_of
+                                .replace("{cur}", &fmt::compact_number(m.current_value))
+                                .replace("{tot}", &fmt::compact_number(m.total)))
+                        } else {
+                            None
                         };
-                        row_y = self.quota_row(target, s.mcp_tools, &b, self.anim.bars[2], row_y, w, alpha, app.lang);
-                    }
-                    y = row_y + 4.0;
-
-                    // 迷你柱状图 + Top 模型（图表两侧仅留 10px，尽量贴满面板宽）
-                    if let Some(mu) = &snap.model_usage {
-                        if !mu.series.is_empty() {
-                            y = self.sparkline(target, &mu.series, 10.0, y, w - 20.0, alpha);
-                        }
-                        if !mu.by_model.is_empty() {
-                            let mut line = String::new();
-                            for (name, tokens) in mu.by_model.iter().take(3) {
-                                if !line.is_empty() {
-                                    line.push_str("  ·  ");
-                                }
-                                line.push_str(&format!("{name} {}", fmt::compact_number(*tokens as f64)));
-                            }
-                            self.text(target, &line, pad, y, w - pad * 2.0, 18.0, 12.0, 400, self.theme.text_tertiary, alpha);
-                            y += 20.0;
-                        }
+                        y = self.metric_row(target, s.mcp_tools, m.used_percent, detail, m.resets_at, y, w, alpha, app.lang);
                     }
 
-                    // 余额（国内版，等宽数值）
+                    // 余额（国内版）：撕线之下的「总额」行——刊头（带强调块）+ 右等宽数值
                     if let Some(b) = &snap.balance {
+                        y += 6.0;
+                        self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
+                        y += 14.0;
+                        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+                        target.FillRectangle(
+                            &D2D_RECT_F { left: pad, top: y + 1.0, right: pad + 3.0, bottom: y + 13.0 },
+                            &bar,
+                        );
+                        self.text(target, s.balance_label, pad + 7.0, y, 140.0, 17.0, 12.0, 600, self.theme.text_tertiary, alpha);
                         let line = format!("¥{:.2}", b.available);
-                        self.text_mono_r(target, &line, w - pad - 140.0, y, 140.0, 18.0, 12.0, 500, self.theme.text_secondary, alpha);
-                        y += 20.0;
+                        self.text_mono_r(target, &line, w - pad - 140.0, y, 140.0, 18.0, 12.0, 500, self.theme.text_primary, alpha);
                     }
                 }
-                // 失败态标注（有旧数据时）
+                // 底部固定行：失败态（错误 + 重试按钮）或更新时间（居中弱字）
+                let footer_y = dy + h - 36.0;
                 if let Some(e) = &app.data.last_error {
                     let line = match app.data.snapshot.as_ref() {
                         Some(snap) => format!(
@@ -436,101 +478,98 @@ impl Renderer {
                         ),
                         None => e.to_string(),
                     };
-                    self.text(target, &line, pad, y + 6.0, w - pad * 2.0 - 70.0, 34.0, 12.0, 400, self.theme.text_secondary, alpha);
-                    // 重试按钮（主样式 Ink）
-                    self.pill_button(target, Hit::Retry, w - pad - 62.0, y, 62.0, 28.0, s.retry, alpha, true);
+                    self.text(target, &line, pad, footer_y + 6.0, w - pad * 2.0 - 74.0, 30.0, 12.0, 400, self.theme.text_secondary, alpha);
+                    self.outline_button(target, Hit::Retry, w - pad - 62.0, footer_y + 4.0, 62.0, 26.0, s.retry, alpha);
+                } else if let Some(snap) = app.data.snapshot.as_ref() {
+                    let fresh = (chrono::Local::now() - snap.queried_at).num_seconds() < 60;
+                    let text = if fresh {
+                        s.updated_just_now.to_string()
+                    } else {
+                        s.updated_ago.replace("{t}", &fmt::ago(snap.queried_at, app.lang))
+                    };
+                    self.text_aligned(
+                        target,
+                        &text,
+                        &D2D_RECT_F { left: pad, top: footer_y + 8.0, right: w - pad, bottom: footer_y + 25.0 },
+                        12.0,
+                        400,
+                        self.theme.text_tertiary,
+                        alpha,
+                        1,
+                        false,
+                    );
                 }
             }
         }
     }}
 
-    unsafe fn quota_row(
+    /// 指标行（参考 ai-usagebar 的 MetricRow）：左侧常规字重标签 +
+    /// 右侧等宽粗体百分数、5px 胶囊细条（墨色填充）、脚注一行
+    /// （绝对值 · 重置倒计时与钟点）。用量 ≥90% 时数值与填充转 Crimson。
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn metric_row(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         label: &str,
-        b: &crate::api::QuotaBucket,
-        anim_v: f32,
+        used_percent: f64,
+        detail: Option<String>,
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
         y: f32,
         w: f32,
         alpha: f32,
         lang: crate::ui::i18n::Lang,
     ) -> f32 { unsafe {
         let pad = 20.0;
+        let strings = lang.strings();
+        let critical = used_percent >= 90.0;
         // 拷贝所需颜色（后续调用 &mut self 的 text/brush，不能持有 theme 引用）
-        let (c_primary, c_tertiary, c_track, tier_color) = (
+        let (c_label, c_value, c_caption, c_track) = (
             self.theme.text_primary,
+            if critical { self.theme.danger } else { self.theme.text_primary },
             self.theme.text_tertiary,
             self.theme.track,
-            self.theme.tier_color(b.used_percent),
         );
 
-        // 标签行：名称（eyebrow 风 13/500）+ 右侧等宽数值
-        let right = if let (Some(cur), Some(tot)) = (b.current, b.total) {
-            format!("{} / {}", fmt::compact_number(cur), fmt::compact_number(tot))
-        } else {
-            fmt::percent(b.used_percent)
-        };
-        self.text(target, label, pad, y + 2.0, w - pad * 2.0 - 150.0, 18.0, 13.0, 500, c_tertiary, alpha);
-        self.text_mono_r(target, &right, w - pad - 140.0, y, 140.0, 18.0, 13.0, 500, c_primary, alpha);
+        // 标签行：名称（常规字重，近墨色）+ 右侧粗体百分数
+        self.text(target, label, pad, y + 2.0, w - pad * 2.0 - 110.0, 19.0, 14.0, 400, c_label, alpha);
+        let pct = fmt::percent(used_percent);
+        self.text_mono_r(target, &pct, w - pad - 100.0, y + 1.0, 100.0, 19.0, 14.0, 600, c_value, alpha);
 
-        // 进度条（加粗 10px，4px 圆角，档位色）
-        let bar_h = 10.0;
-        let bar_y = y + 24.0;
-        let track = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: pad, top: bar_y, right: w - pad, bottom: bar_y + bar_h },
-            radiusX: RADIUS,
-            radiusY: RADIUS,
-        };
+        // 长条矩形细条（5px 直角，与面板锐利纸感的边框语言一致；
+        // 墨色填充，critical 转警示色）
+        let bar_h = 5.0;
+        let bar_y = y + 22.0;
+        let track = D2D_RECT_F { left: pad, top: bar_y, right: w - pad, bottom: bar_y + bar_h };
         let track_brush = self.brush(target, c_track, alpha);
-        target.FillRoundedRectangle(&track, &track_brush);
-
-        let frac = (anim_v / 100.0).clamp(0.0, 1.0);
-        if frac > 0.003 {
-            let fg_w = (w - pad * 2.0) * frac;
-            let fg = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: pad, top: bar_y, right: pad + fg_w, bottom: bar_y + bar_h },
-                radiusX: RADIUS,
-                radiusY: RADIUS,
-            };
-            let fill = self.brush(target, tier_color, alpha);
-            target.FillRoundedRectangle(&fg, &fill);
+        target.FillRectangle(&track, &track_brush);
+        let frac = (used_percent / 100.0).clamp(0.0, 1.0) as f32;
+        if frac > 0.004 {
+            // 最小可见长度 2px，避免 0.x% 时出现针尖
+            let fg_w = ((w - pad * 2.0) * frac).max(2.0);
+            let fg = D2D_RECT_F { left: pad, top: bar_y, right: pad + fg_w, bottom: bar_y + bar_h };
+            let fill = self.brush(target, c_value, alpha);
+            target.FillRectangle(&fg, &fill);
         }
 
-        // 倒计时在进度条下方（右对齐，等宽 11）
-        if let Some(r) = b.resets_at {
-            let cd_text = format!("{} {}", fmt::countdown(r, lang), lang.strings().resets_in);
-            self.text_mono_r(target, &cd_text, w - pad - 160.0, bar_y + bar_h + 4.0, 160.0, 14.0, 11.0, 400, c_tertiary, alpha);
+        // 脚注：重置倒计时居左、绝对用量居右（各居其位，弱字一行）
+        if let Some(r) = resets_at {
+            let line = strings.resets_line.replace("{t}", &fmt::countdown(r, lang));
+            self.text(target, &line, pad, bar_y + bar_h + 5.0, (w - pad * 2.0) * 0.55, 16.0, 11.0, 400, c_caption, alpha);
         }
-        bar_y + bar_h + 18.0
-    }}
-
-    unsafe fn sparkline(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        series: &[(String, i64)],
-        x: f32,
-        y: f32,
-        width: f32,
-        alpha: f32,
-    ) -> f32 { unsafe {
-        let h = 52.0; // 充分利用面板空间
-        let max = series.iter().map(|(_, v)| *v).max().unwrap_or(1).max(1) as f32;
-        let n = series.len().max(1) as f32;
-        let gap = 2.0;
-        let bw = ((width - gap * (n - 1.0)) / n).clamp(2.0, 12.0);
-        // 模型用量柱：Forest 低调绿（Ember 留给文字强调）
-        let brush = self.brush(target, self.theme.ok, alpha * 0.75);
-        for (i, (_, v)) in series.iter().enumerate() {
-            let bh = (*v as f32 / max * h).max(2.0);
-            let bx = x + i as f32 * (bw + gap);
-            let r = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F { left: bx, top: y + h - bh, right: bx + bw, bottom: y + h },
-                radiusX: 1.0,
-                radiusY: 1.0,
-            };
-            target.FillRoundedRectangle(&r, &brush);
+        if let Some(d) = detail {
+            self.text_rect_opts(
+                target,
+                &d,
+                &D2D_RECT_F { left: pad + (w - pad * 2.0) * 0.55, top: bar_y + bar_h + 5.0, right: w - pad, bottom: bar_y + bar_h + 21.0 },
+                11.0,
+                400,
+                c_caption,
+                alpha,
+                true,
+                false,
+            );
         }
-        y + h + 8.0
+        y + 52.0
     }}
 
     /// 设置视图。
@@ -622,7 +661,12 @@ impl Renderer {
                 None => ("—".to_string(), "—".to_string()),
             };
             self.account_card(target, Hit::RemoveAccount(idx), &acc.name, platform, &version, &tier, pad, y, cw, alpha);
-            y += 48.0 + 12.0;
+            y += 40.0 + 8.0;
+            // key 鉴权失败：卡片下方给修复指引（danger 弱字）
+            if matches!(app.data.last_error, Some(crate::api::FetchError::Auth(_))) {
+                self.text(target, s.key_invalid, pad + 2.0, y - 4.0, cw, 16.0, 12.0, 400, self.theme.danger, alpha);
+                y += 18.0;
+            }
         } else {
             // 添加账号独占一行：占满内容区，视觉对称
             self.pill_button(target, Hit::AddAccount, pad, y + 2.0, cw, 30.0, s.add_account, alpha, false);
@@ -664,8 +708,9 @@ impl Renderer {
             y += 10.0;
         }
 
-        // ── 语言 ──
-        y = self.section_label(target, s.language, pad, y, w, alpha, true);
+        // ── 通用：语言 / 外观 / 开机自启 ──
+        y = self.section_label(target, s.settings_general, pad, y, w, alpha, true);
+        y = self.sub_label(target, s.language, pad, y, cw, alpha);
         let langs: [(Hit, &str); 3] = [
             (Hit::Language(""), s.follow_system),
             (Hit::Language("zh"), "中文"),
@@ -673,7 +718,18 @@ impl Renderer {
         ];
         let cur_lang = app.config.general.language.as_deref().unwrap_or("");
         y = self.segmented_raw(target, &langs, |h| matches!(h, Hit::Language(v) if *v == cur_lang), pad, y, cw, alpha);
-        y += 10.0;
+        y += 2.0;
+        // 外观：跟随系统 / 浅色 / 深色
+        y = self.sub_label(target, s.appearance_section, pad, y, cw, alpha);
+        let themes: [(Hit, &str); 3] = [
+            (Hit::Appearance(""), s.follow_system),
+            (Hit::Appearance("light"), s.theme_light),
+            (Hit::Appearance("dark"), s.theme_dark),
+        ];
+        let cur_theme = app.config.general.appearance.as_deref().unwrap_or("");
+        y = self.segmented_raw(target, &themes, |h| matches!(h, Hit::Appearance(v) if *v == cur_theme), pad, y, cw, alpha);
+        y += 2.0;
+        y = self.toggle_row(target, Hit::ToggleAutostart, s.autostart, "", crate::platform::autostart::is_enabled(), pad, y, cw, alpha);
 
         // ── 通知 ──
         y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
@@ -681,12 +737,6 @@ impl Renderer {
         y = self.toggle_row(target, Hit::ToggleThreshold, s.notify_threshold, s.notify_threshold_desc, g.notify_threshold_enabled, pad, y, cw, alpha);
         y = self.toggle_row(target, Hit::ToggleReset5h, s.notify_reset_5h_opt, s.notify_reset_5h_desc, g.notify_reset_5h_enabled, pad, y, cw, alpha);
         y = self.toggle_row(target, Hit::ToggleResetWeekly, s.notify_reset_weekly_opt, s.notify_reset_weekly_desc, g.notify_reset_weekly_enabled, pad, y, cw, alpha);
-        y += 6.0;
-
-        // ── 通用：开机自启 ──
-        y = self.section_label(target, s.settings_general, pad, y, w, alpha, true);
-        y = self.toggle_row(target, Hit::ToggleAutostart, s.autostart, "", crate::platform::autostart::is_enabled(), pad, y, cw, alpha);
-        y += 6.0;
 
         // ── 关于：检查更新 + 版本（底部）──
         let update_label = match &app.update_status {
@@ -707,17 +757,35 @@ impl Renderer {
 
     // ── 绘制小部件 ──
 
+    /// 区块主标题：左侧 3×13 墨色强调块 + 紧随标题（子标题无强调块，
+    /// 层级一眼可辨）。hairline 分隔线贴近上方内容（上 2px / 下 10px）。
     unsafe fn section_label(&mut self, target: &ID2D1HwndRenderTarget, label: &str, x: f32, y: f32, _w: f32, alpha: f32, rule: bool) -> f32 { unsafe {
         let mut ny = y;
         if rule {
-            // hairline 分隔（Stone 1px）——纸感分层先于阴影
-            self.divider(target, x, ny + 5.0, _w - x * 2.0, alpha);
-            ny += 10.0;
+            self.divider(target, x, ny + 2.0, _w - x * 2.0, alpha);
+            ny += 12.0;
         }
         if !label.is_empty() {
-            self.text(target, label, x, ny, _w, 16.0, 12.0, 500, self.theme.text_tertiary, alpha);
+            let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+            target.FillRectangle(
+                &D2D_RECT_F { left: x, top: ny + 1.0, right: x + 3.0, bottom: ny + 14.0 },
+                &bar,
+            );
+            self.text(target, label, x + 7.0, ny, _w - 7.0, 17.0, 13.0, 600, self.theme.text_tertiary, alpha);
+            ny + 21.0
+        } else {
+            // 纯分隔（无标题）：只留少量空隙给紧随的内容（如版本行）
+            ny + 6.0
         }
-        ny + 20.0
+    }}
+
+    /// 区块内子项标签（「语言」「外观」「名称」「API Key」）：
+    /// 控件标签统一 13/400 次级色、无强调块；开关行标题同号但用墨色。
+    /// 字阶体系：16 导航标题 / 13·500 区块主标题（带强调块）/
+    /// 13·400 控件标签 / 12·400 描述文字。
+    unsafe fn sub_label(&mut self, target: &ID2D1HwndRenderTarget, label: &str, x: f32, y: f32, w: f32, alpha: f32) -> f32 { unsafe {
+        self.text(target, label, x, y + 1.0, w, 17.0, 13.0, 400, self.theme.text_secondary, alpha);
+        y + 21.0
     }}
 
     /// 自绘输入框：Linen 底 + hairline 描边（聚焦时 Ember 描边）+ 等宽文本。
@@ -752,6 +820,33 @@ impl Renderer {
         self.line(target, x, y, x + width, y, &b, 1.0);
     }}
 
+    /// 小票撕线：虚线分隔（指标区与余额行之间）。
+    unsafe fn dashed_divider(&mut self, target: &ID2D1HwndRenderTarget, x: f32, y: f32, width: f32, alpha: f32) { unsafe {
+        if self.dash_style.is_none() {
+            self.dash_style = self.factory.CreateStrokeStyle(
+                &D2D1_STROKE_STYLE_PROPERTIES {
+                    startCap: D2D1_CAP_STYLE_FLAT,
+                    endCap: D2D1_CAP_STYLE_FLAT,
+                    dashCap: D2D1_CAP_STYLE_FLAT,
+                    dashStyle: D2D1_DASH_STYLE_DASH,
+                    ..Default::default()
+                },
+                None,
+            ).ok();
+        }
+        let b = self.brush(target, self.theme.border, alpha * 0.8);
+        match self.dash_style.clone() {
+            Some(style) => target.DrawLine(
+                Vector2 { X: x, Y: y },
+                Vector2 { X: x + width, Y: y },
+                &b,
+                1.0,
+                &style,
+            ),
+            None => self.line(target, x, y, x + width, y, &b, 1.0),
+        }
+    }}
+
     unsafe fn toggle_row(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -764,8 +859,9 @@ impl Renderer {
         w: f32,
         alpha: f32,
     ) -> f32 { unsafe {
-        // 标题 14/400（body-sm），描述 12/400；开关右侧垂直居中
-        self.text(target, title, x, y + 1.0, w - 56.0, 18.0, 14.0, 400, self.theme.text_primary, alpha);
+        // 标题 13/400 墨色（控件标签字号），描述 12/400 tertiary；
+        // 开关右侧垂直居中
+        self.text(target, title, x, y + 1.0, w - 56.0, 18.0, 13.0, 400, self.theme.text_primary, alpha);
         let mut ty = y + 19.0;
         if !desc.is_empty() {
             self.text(target, desc, x, ty, w - 56.0, 14.0, 12.0, 400, self.theme.text_tertiary, alpha);
@@ -793,7 +889,8 @@ impl Renderer {
             radiusY: knob / 2.0,
         };
         target.FillEllipse(&ellipse, &kb);
-        self.hits.push((hit, D2D_RECT_F { left: x, top: y, right: x + w, bottom: ty + 2.0 }));
+        // 命中区只覆盖开关本体（含 8px 容差）——点击行文字/空白不翻转
+        self.hits.push((hit, D2D_RECT_F { left: tx - 8.0, top: cy - 6.0, right: tx + tw + 8.0, bottom: cy + th + 6.0 }));
         ty + 9.0
     }}
 
@@ -837,15 +934,16 @@ impl Renderer {
             }
             let color = if sel { self.theme.action_text } else { self.theme.text_secondary };
             let tx = x + i as f32 * seg_w;
-            let rect = D2D_RECT_F { left: tx, top: y + 5.0, right: tx + seg_w, bottom: y + h - 2.0 };
-            // 选项文字在段内居中（视觉平衡）
-            self.text_aligned(target, label, &rect, 12.0, 400, color, alpha, 1, false);
+            let rect = D2D_RECT_F { left: tx, top: y, right: tx + seg_w, bottom: y + h };
+            // 选项文字在段内水平 + 垂直双居中
+            self.text_aligned_vc(target, label, &rect, 13.0, 400, color, alpha, 1, false);
             self.hits.push((*hit, D2D_RECT_F { left: tx, top: y, right: tx + seg_w, bottom: y + h }));
         }
         y + h + 10.0
     }}
 
-    /// 单账号卡片：名称 + 三段信息行（平台 / 套餐版本 / 等级），右上删除。
+    /// 单账号卡片（单行）：名称 + 三枚名牌（平台描边 / 版本底纹 /
+    /// 等级实色——Max Ember、Pro 墨、Lite 灰），右上删除。
     #[allow(clippy::too_many_arguments)]
     unsafe fn account_card(
         &mut self,
@@ -860,8 +958,9 @@ impl Renderer {
         w: f32,
         alpha: f32,
     ) { unsafe {
+        let h = 40.0;
         let card = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 48.0 },
+            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + h },
             radiusX: RADIUS,
             radiusY: RADIUS,
         };
@@ -869,26 +968,83 @@ impl Renderer {
         target.FillRoundedRectangle(&card, &fill);
         let edge = self.brush(target, self.theme.border, alpha * 0.8);
         target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-        // 账号名
-        self.text(target, name, x + 12.0, y + 7.0, w - 56.0, 16.0, 14.0, 500, self.theme.text_primary, alpha);
-        // 三段信息行（平台 · 版本 · 等级），三等分且每格居中
-        let cell = (w - 24.0) / 3.0;
-        for (i, text) in [platform, version, tier].iter().enumerate() {
-            let cx = x + 12.0 + cell * i as f32;
-            self.text_aligned(
-                target,
-                text,
-                &D2D_RECT_F { left: cx, top: y + 27.0, right: cx + cell, bottom: y + 42.0 },
-                11.0,
-                400,
-                self.theme.text_secondary,
-                alpha,
-                1,
-                true,
-            );
+        // 账号名（15/500，卡片内垂直居中——与名牌同一垂直基准）
+        self.text_aligned_vc(
+            target,
+            name,
+            &D2D_RECT_F { left: x + 12.0, top: y, right: x + w - 60.0, bottom: y + h },
+            15.0,
+            500,
+            self.theme.text_primary,
+            alpha,
+            0,
+            false,
+        );
+        let name_w = est_width(name, 15.0);
+        // 名牌行：紧随名称之后，6px 间隔，垂直居中。三枚统一为第一枚的
+        // 描边样式（透明底 + hairline 边），仅等级牌的边/字按档位取墨阶色
+        let mut bx = x + 12.0 + name_w + 10.0;
+        let by = y + (h - 17.0) / 2.0;
+        let max_bx = x + w - 56.0; // 给右侧 × 留位
+        // 平台：基础描边牌
+        let pw = est_width(platform, 10.5) + 14.0;
+        if bx + pw <= max_bx {
+            self.badge(target, platform, bx, by, pw, self.theme.border, self.theme.text_secondary, alpha, false);
+            bx += pw + 6.0;
         }
-        // 删除 ×（右上）
-        self.x_button(target, remove, x + w - 26.0, y + 8.0);
+        // 版本：基础描边牌（等宽数字）
+        let vw = est_width(version, 10.5) + 14.0;
+        if bx + vw <= max_bx && version != "—" {
+            self.badge(target, version, bx, by, vw, self.theme.border, self.theme.text_secondary, alpha, true);
+            bx += vw + 6.0;
+        }
+        // 等级：描边样式不变，边框与文字按档位走墨阶
+        if bx + 40.0 <= max_bx && tier != "—" {
+            let (edge, fg) = self.tier_badge_colors(tier);
+            let tw = est_width(tier, 10.5) + 14.0;
+            self.badge(target, tier, bx, by, tw, edge, fg, alpha, false);
+        }
+        // 删除 ×（右上，垂直居中）
+        self.x_button(target, remove, x + w - 24.0, y + 15.0);
+    }}
+
+    /// 等级名牌配色：墨阶梯度——Max = 墨（最深，旗舰）、Pro = 次级灰
+    /// （中坚）、Lite = 最浅（入门）。描边与文字同色系。
+    fn tier_badge_colors(&self, tier: &str) -> ([f32; 4], [f32; 4]) {
+        let t = tier.trim().to_ascii_lowercase();
+        if t.contains("max") {
+            (self.theme.text_primary, self.theme.text_primary)
+        } else if t.contains("pro") {
+            (self.theme.text_secondary, self.theme.text_secondary)
+        } else {
+            (self.theme.border, self.theme.text_tertiary)
+        }
+    }
+
+    /// 名牌（统一基础样式）：透明底 + hairline 描边 + 居中文字。
+    /// 颜色由调用方给（平台/版本中性，等级走墨阶）。
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn badge(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        edge_color: [f32; 4],
+        fg: [f32; 4],
+        alpha: f32,
+        mono: bool,
+    ) { unsafe {
+        let r = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 17.0 },
+            radiusX: 2.5,
+            radiusY: 2.5,
+        };
+        let edge = self.brush(target, edge_color, alpha * 0.9);
+        target.DrawRoundedRectangle(&r, &edge, 1.0, None);
+        let rect = D2D_RECT_F { left: x, top: y, right: x + w, bottom: y + 17.0 };
+        self.text_aligned_vc(target, label, &rect, 10.5, 400, fg, alpha, 1, mono);
     }}
 
     /// 按钮：primary = Ink 填充（画布上的深墨块）；次级 = Linen 填充。
@@ -1195,6 +1351,45 @@ impl Renderer {
         let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }}
 
+    /// 垂直居中版 text_aligned（分段选项等：矩形内水平 + 垂直双居中）。
+    /// 共享的缓存 format 被临时改段落对齐，绘制后立即还原。
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn text_aligned_vc(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        s: &str,
+        rect: &D2D_RECT_F,
+        size: f32,
+        weight: u16,
+        color: [f32; 4],
+        alpha: f32,
+        align: u8,
+        mono: bool,
+    ) { unsafe {
+        let Some(fmt) = self.format(size, weight, mono) else { return };
+        let align_set = match align {
+            1 => DWRITE_TEXT_ALIGNMENT_CENTER,
+            2 => DWRITE_TEXT_ALIGNMENT_TRAILING,
+            _ => DWRITE_TEXT_ALIGNMENT_LEADING,
+        };
+        let _ = fmt.SetTextAlignment(align_set);
+        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        let brush = self.brush(target, color, alpha);
+        let w16: Vec<u16> = s.encode_utf16().collect();
+        if !w16.is_empty() {
+            let _ = target.DrawText(
+                &w16,
+                &fmt,
+                rect as *const D2D_RECT_F,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS(0),
+                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+    }}
+
     /// 应用 logo（assets/logo.svg 的矢量重绘）：圆角磁贴 + 白色 Z 字形。
     /// 几何按 30×30 viewBox 构建一次，绘制时以矩阵缩放平移，任意 DPI 无损。
     unsafe fn logo(
@@ -1271,6 +1466,12 @@ impl Renderer {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// 估算比例字体文本像素宽（名牌排布用）：ASCII ≈ 0.58×字号，
+/// 全角 CJK ≈ 1.0×字号。
+fn est_width(s: &str, size: f32) -> f32 {
+    s.chars().map(|c| if c.is_ascii() { size * 0.58 } else { size }).sum()
 }
 
 impl Default for AnimState {

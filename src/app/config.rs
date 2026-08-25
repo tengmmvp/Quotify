@@ -14,6 +14,8 @@ pub struct General {
     pub poll_interval_secs: u64,
     /// 界面语言；None = 跟随系统
     pub language: Option<String>,
+    /// 外观模式；None = 跟随系统，可选 "light" / "dark"
+    pub appearance: Option<String>,
     /// 用量阈值预警开关（默认关，避免打扰）
     pub notify_threshold_enabled: bool,
     /// 预警阈值百分比
@@ -29,6 +31,7 @@ impl Default for General {
         Self {
             poll_interval_secs: 300,
             language: None,
+            appearance: None,
             notify_threshold_enabled: false,
             notify_threshold_percent: 80,
             notify_reset_5h_enabled: false,
@@ -94,6 +97,8 @@ const TEMPLATE: &str = r#"# Quotify 配置文件
 poll_interval_secs = 300
 # 界面语言：留空跟随系统，可设 "zh" 或 "en"
 language = ""
+# 外观：留空跟随系统，可设 "light" 或 "dark"
+appearance = ""
 # 用量阈值预警（默认关闭）
 notify_threshold_enabled = false
 notify_threshold_percent = 80

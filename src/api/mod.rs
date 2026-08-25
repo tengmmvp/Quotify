@@ -110,6 +110,8 @@ pub struct McpUsage {
     pub current_value: f64,
     /// 总量（绝对值）
     pub total: f64,
+    /// 月度重置时刻（真实响应携带 `nextResetTime`）
+    pub resets_at: Option<DateTime<Utc>>,
     /// 按模型明细（已集成，渲染待接）
     #[allow(dead_code)]
     pub details: Vec<McpDetail>,
@@ -126,21 +128,10 @@ pub struct UsageSnapshot {
     pub five_hour: Option<QuotaBucket>,
     pub weekly: Option<QuotaBucket>,
     pub mcp: Option<McpUsage>,
-    /// 近 24h 模型用量（独立端点，可选，失败不阻塞主数据）
-    pub model_usage: Option<ModelUsage>,
     /// 账户余额（仅国内版，可选）
     pub balance: Option<Balance>,
     /// 本地时刻：何时查询成功
     pub queried_at: DateTime<Local>,
-}
-
-/// 模型用量明细（`model-usage` 端点，时间窗内按模型/时段的 token 消耗）。
-#[derive(Debug, Clone, Default)]
-pub struct ModelUsage {
-    /// (时间标签, 该时段全部模型 token 合计)
-    pub series: Vec<(String, i64)>,
-    /// (模型名, 窗口内 token 合计)，按量降序
-    pub by_model: Vec<(String, i64)>,
 }
 
 /// 账户余额（国内版 `query-customer-account-report` 端点）。
@@ -303,6 +294,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                     used_percent: bucket.used_percent,
                     current_value: bucket.current.unwrap_or(0.0),
                     total: bucket.total.unwrap_or(0.0),
+                    resets_at: bucket.resets_at,
                     details: parse_mcp_details(item),
                 });
             }
@@ -336,9 +328,26 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
         five_hour,
         weekly,
         mcp,
-        model_usage: None,
         balance: None,
         queried_at: Local::now(),
+    }
+}
+
+/// 信封内业务失败 → 错误分类。鉴权失败常以 HTTP 200 + `code:401` /
+/// `success:false` 出现（ai-usagebar 抓包证实），需归为 `Auth` 才能触发
+/// 设置页的修复提示；其余归 `Api`。
+fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
+    let m = msg.to_ascii_lowercase();
+    if code == Some(401)
+        || code == Some(403)
+        || m.contains("unauthorized")
+        || m.contains("token")
+        || m.contains("api key")
+        || m.contains("apikey")
+    {
+        FetchError::Auth(msg.to_string())
+    } else {
+        FetchError::Api(format!("接口错误: {msg}"))
     }
 }
 
@@ -349,13 +358,14 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
 
     if v.get("success").and_then(Value::as_bool) == Some(false) {
         let msg = v.get("msg").and_then(Value::as_str).unwrap_or("未知错误");
-        return Err(FetchError::Api(format!("接口错误: {msg}")));
+        let code = v.get("code").and_then(Value::as_i64);
+        return Err(inband_error(code, msg));
     }
     // 信封里的 `code` 与 `success` 并存（CodexBar 实测），非 200 视为业务错误
     if let Some(code) = v.get("code").and_then(Value::as_i64) {
         if code != 200 {
             let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
-            return Err(FetchError::Api(format!("接口错误 code {code}: {msg}")));
+            return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
         }
     }
     let data = v
@@ -481,10 +491,24 @@ mod tests {
 
     #[test]
     fn business_error_maps_to_api() {
-        let body = r#"{ "success": false, "msg": "token invalid" }"#;
+        let body = r#"{ "success": false, "msg": "boom" }"#;
         let err = parse_response(body).unwrap_err();
         assert!(matches!(err, FetchError::Api(_)));
-        assert!(err.to_string().contains("token invalid"));
+        assert!(err.to_string().contains("boom"));
+    }
+
+    /// 无效 key 常见形态：HTTP 200 + success:false + code 401 / token 字样
+    /// → 必须归 Auth（设置页修复提示只认 Auth）
+    #[test]
+    fn in_band_auth_failures_map_to_auth() {
+        for body in [
+            r#"{ "code": 401, "msg": "Unauthorized", "data": null, "success": false }"#,
+            r#"{ "success": false, "msg": "token invalid" }"#,
+            r#"{ "success": true, "code": 403, "msg": "forbidden" }"#,
+        ] {
+            let err = parse_response(body).unwrap_err();
+            assert!(matches!(err, FetchError::Auth(_)), "{body} → {err:?}");
+        }
     }
 
     #[test]

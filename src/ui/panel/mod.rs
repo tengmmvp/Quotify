@@ -90,13 +90,18 @@ pub struct Panel {
     pub input: PanelInput,
     /// 轮询间隔自定义模式（显示输入行）
     pub customizing_interval: bool,
-    /// 展开动画的当前布局（物理像素；锚定底边做高度生长）
+    /// 展开动画的当前布局（物理像素；relayout 同步）
     pub(crate) anim_x: i32,
     pub(crate) anim_w: i32,
     pub(crate) anim_full_h: i32,
     pub(crate) anim_bottom: i32,
-    class_registered: bool,
+    #[allow(dead_code)]
     hide_anim: bool,
+    class_registered: bool,
+    /// 主视图动态高度（逻辑像素；按指标行数/余额/副标题由 app 侧计算）
+    pub(crate) main_h: i32,
+    /// 账号当前处于鉴权失败状态（设置页账号卡下显示修复提示，高度联动）
+    pub(crate) account_error: bool,
     /// Pinned 模式下鼠标离开面板/托盘区的起始时刻（持续在外 2s 才收起）
     pub(crate) outside_since: Option<u64>,
     /// 显示器缩放（逻辑 → 物理像素）
@@ -120,6 +125,8 @@ impl Panel {
             anim_w: 0,
             anim_full_h: 0,
             anim_bottom: 0,
+            main_h: 300,
+            account_error: false,
             class_registered: false,
             hide_anim: false,
             outside_since: None,
@@ -133,11 +140,19 @@ impl Panel {
     }
 
     /// 面板逻辑高度（含单账号卡片 60；自定义输入行展开时 +40）。
-    fn view_height(&self, _accounts: usize) -> i32 {
+    fn view_height(&self, accounts: usize) -> i32 {
         match self.view {
-            PanelView::Main => 380,
+            // 动态：随指标行数 / 余额 / 副标题伸缩（sync_main_height 维护）
+            PanelView::Main => self.main_h,
             PanelView::Settings if self.adding_account => 258,
-            PanelView::Settings => 576 + if self.customizing_interval { 40 } else { 0 },
+            // 设置页随内容伸缩：账号卡(48) vs 添加按钮(38)、自定义间隔行(+30)、
+            // key 失效提示行(+18)；底部留 30px 余量（按钮边框需完整呈现）
+            PanelView::Settings => {
+                let account_block = if accounts > 0 { 48 } else { 38 };
+                let error_line = if self.account_error { 18 } else { 0 };
+                let base = 42 + 33 + account_block + error_line + 33 + 40 + 63 + 63 + 28 + 33 + 126 + 18 + 29 + 30;
+                base + if self.customizing_interval { 40 } else { 10 }
+            }
         }
     }
 
@@ -262,6 +277,22 @@ impl Panel {
         if let Some(h) = self.hwnd {
             unsafe { SetTimer(Some(h), TIMER_CLOSE_DEBOUNCE, 400, None) };
         }
+    }
+
+    /// 光标是否在托盘图标锚点附近（±24px，纯本地矩形比较——
+    /// Shell_NotifyIconGetRect 是跨进程同步调用，高频轮询会与 Explorer 互锁）。
+    pub(crate) fn cursor_near_anchor(&self) -> bool {
+        let pt = unsafe {
+            let mut p = POINT::default();
+            let _ = GetCursorPos(&mut p);
+            p
+        };
+        self.anchor
+            .map(|a| {
+                pt.x >= a.left - 24 && pt.x <= a.right + 24
+                    && pt.y >= a.top - 24 && pt.y <= a.bottom + 24
+            })
+            .unwrap_or(false)
     }
 
     fn begin_hide(&mut self, hwnd: HWND) {
@@ -479,7 +510,13 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         let app = app_from_tray(hwnd);
                         if let Some(app) = app {
                             let _ = KillTimer(Some(hwnd), TIMER_CLOSE_DEBOUNCE);
-                            if !app.panel.hovered && app.panel.mode == PanelMode::Preview {
+                            // 防抖到期时光标已回到托盘图标上：收回意图取消
+                            // （悬停语义优先），后续交给外部巡检定时器继续盯
+                            let near_tray = app.panel.cursor_near_anchor();
+                            if !app.panel.hovered
+                                && app.panel.mode == PanelMode::Preview
+                                && !near_tray
+                            {
                                 app.panel.begin_hide(hwnd);
                             }
                         }
@@ -503,7 +540,9 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                                 // 输入状态中（正在打字）绝不收起
                                 let focus_in_panel = app.panel.input.field.is_some()
                                     || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
-                                if in_panel || focus_in_panel {
+                                // 鼠标悬停在托盘图标上（锚点矩形判定）
+                                let near_tray = app.panel.cursor_near_anchor();
+                                if in_panel || focus_in_panel || near_tray {
                                     app.panel.outside_since = None;
                                 } else {
                                     let now = windows::Win32::System::SystemInformation::GetTickCount64();
@@ -688,7 +727,6 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT { unsafe {
         return LRESULT(0);
     };
     let mut done = true;
-    let hiding = app.panel.hide_anim;
     if let Some(r) = app.panel.renderer.as_mut() {
         if let Some(t) = &r.anim.appear {
             if t.finished() {
@@ -701,42 +739,13 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT { unsafe {
             done = false;
         }
     }
-    if let Some(r) = app.panel.renderer.as_ref() {
-        let _ = r;
-    }
-    // 展开动画：高度自 88% 生长到 100%（锚定底边，Win11 flyout 风格）；
-    // 收起反向收缩。不依赖 layered，与硬件呈现兼容。
-    if let Some(t) = app
-        .panel
-        .renderer
-        .as_ref()
-        .and_then(|r| r.anim.appear.as_ref())
-    {
-        let p = anim::ease_out_cubic(t.progress());
-        let k = if hiding { 1.0 - p } else { p };
-        let scale = 0.88 + 0.12 * k;
-        let (x, w, full_h, bottom) = (
-            app.panel.anim_x,
-            app.panel.anim_w,
-            app.panel.anim_full_h,
-            app.panel.anim_bottom,
-        );
-        if w > 0 && full_h > 0 {
-            let h = (full_h as f32 * scale).round() as i32;
-            let y = bottom - h;
-            let _ = SetWindowPos(hwnd, None, x, y, w, h, SWP_NOACTIVATE | SWP_NOCOPYBITS);
-        }
-    }
+    // 弹出只做内容级变换（渲染器内部的上浮 + 透明度）——不做逐帧
+    // 窗口高度生长：高度变化会强制 HwndRenderTarget 每帧重建（重新
+    // 分配缓冲），正是弹出瞬间「duang」顿挫的来源。收起同样直接隐藏。
     let _ = InvalidateRect(Some(hwnd), None, false);
 
     if done {
         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-        if hiding {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-            let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
-            // 收起后归还 D2D 等运行时占用的物理页，静止时保持低内存
-            crate::platform::trim_working_set();
-        }
     }
     LRESULT(0)
 }}

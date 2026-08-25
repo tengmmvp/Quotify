@@ -30,9 +30,8 @@ pub struct Theme {
     pub action: [f32; 4],
     /// 主按钮文字
     pub action_text: [f32; 4],
-    /// 档位色：正常 Forest / 警告 Amber / 危险 Crimson（暖色系）
+    /// 档位色：正常 Forest / 危险 Crimson（暖色系）
     pub ok: [f32; 4],
-    pub warn: [f32; 4],
     pub danger: [f32; 4],
     /// logo 磁贴底色（与主按钮同源）
     pub logo_tile: [f32; 4],
@@ -61,7 +60,6 @@ impl Theme {
                 action: rgba(0x26, 0x25, 0x1E, 1.0),
                 action_text: rgba(0xF7, 0xF7, 0xF4, 1.0),
                 ok: rgba(0x34, 0x78, 0x5C, 1.0),
-                warn: rgba(0xC0, 0x85, 0x32, 1.0),
                 danger: rgba(0xCF, 0x2D, 0x56, 1.0),
                 logo_tile: rgba(0x26, 0x25, 0x1E, 1.0),
             },
@@ -77,21 +75,9 @@ impl Theme {
                 action: rgba(0xEC, 0xE9, 0xE2, 1.0),
                 action_text: rgba(0x26, 0x25, 0x1E, 1.0),
                 ok: rgba(0x3F, 0xA3, 0x77, 1.0),
-                warn: rgba(0xD4, 0xA0, 0x4C, 1.0),
                 danger: rgba(0xE2, 0x5A, 0x77, 1.0),
-                logo_tile: rgba(0x6A, 0x6A, 0x6A, 1.0),
+                logo_tile: rgba(0x8C, 0x8C, 0x8C, 1.0),
             },
-        }
-    }
-
-    /// 按用量百分比的档位色。
-    pub fn tier_color(&self, used_percent: f64) -> [f32; 4] {
-        if used_percent < 70.0 {
-            self.ok
-        } else if used_percent < 90.0 {
-            self.warn
-        } else {
-            self.danger
         }
     }
 

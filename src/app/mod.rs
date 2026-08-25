@@ -130,6 +130,11 @@ impl App {
             }
         }
         self.update_tray_icon();
+        // 数据/错误状态变化要立即反映到打开的面板（设置页修复提示、
+        // 主页动态高度与错误卡都依赖这次重算 + 重绘）
+        if let Some(p) = self.panel.hwnd {
+            relayout_panel(self, p);
+        }
         // 面板未展示时归还 TLS 等运行时页面；面板展示中不归（避免换页抖动）
         if self.panel.mode == crate::ui::panel::PanelMode::Hidden {
             crate::platform::trim_working_set();
@@ -239,7 +244,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     if let Some(app) = app {
                         if let Some(rect) = tray_rect(app) {
                             let n = app.config.accounts.len();
+                            sync_main_height(app);
+                            apply_appearance(app);
                             app.panel.show_preview(hwnd, rect, n);
+                            // 渲染器在 show_at 内才创建：显示后再应用一次，
+                            // 保证显式选择的外观从首帧生效
+                            apply_appearance(app);
                         }
                     }
                 }
@@ -252,7 +262,10 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     if let Some(app) = app {
                         if let Some(rect) = tray_rect(app) {
                             let n = app.config.accounts.len();
+                            sync_main_height(app);
+                            apply_appearance(app);
                             app.panel.toggle_pin(hwnd, rect, n);
+                            apply_appearance(app);
                         }
                     }
                 }
@@ -394,6 +407,16 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
         }
+        Hit::Appearance(tag) => {
+            app.config.general.appearance = if tag.is_empty() { None } else { Some(tag.to_string()) };
+            crate::app::config::save(&app.config);
+            apply_appearance(app);
+            if let Some(p) = app.panel.hwnd {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(p), None, true);
+                }
+            }
+        }
         Hit::Platform(tag) => {
             app.panel.pending_platform = if tag == "intl" {
                 crate::api::client::Platform::Intl
@@ -434,6 +457,9 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 if let Some(p) = &app.poller {
                     p.refresh_now();
                 }
+                // 数据已清：立即重算 account_error 与动态高度（提示行、
+                // 账号块的伸缩不能等下一轮轮询回来才生效）
+                relayout_panel(app, panel_hwnd);
             }
         }
         Hit::AddAccount => {
@@ -527,9 +553,11 @@ fn select_account(app: &mut App, panel_hwnd: HWND, i: usize) {
 fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     let name = app.panel.input.name.trim().to_string();
     let key = app.panel.input.key.trim().to_string();
-    if name.is_empty() || key.is_empty() {
+    if key.is_empty() {
         return;
     }
+    // 名称留空时默认「Default」，避免空用户名出现在顶栏/账号卡
+    let name = if name.is_empty() { "Default".to_string() } else { name };
 
     let acc = crate::app::config::Account {
         id: app.config.new_account_id(),
@@ -597,7 +625,8 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
             }
         }
         Some(InputField::Key) => {
-            if !app.panel.input.name.trim().is_empty() && !app.panel.input.key.trim().is_empty() {
+            // 名称可留空（保存时默认 Default），key 必填
+            if !app.panel.input.key.trim().is_empty() {
                 save_pending_account(app, panel_hwnd);
             }
         }
@@ -606,8 +635,47 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
     }
 }
 
+/// 解析生效外观：配置显式指定则用之，否则跟随系统。
+fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appearance {
+    match setting {
+        Some(s) if s.eq_ignore_ascii_case("light") => crate::ui::panel::theme::Appearance::Light,
+        Some(s) if s.eq_ignore_ascii_case("dark") => crate::ui::panel::theme::Appearance::Dark,
+        _ => crate::ui::panel::theme::Theme::system_appearance(),
+    }
+}
+
+/// 把生效外观应用到渲染器（即时换肤；渲染器尚未创建时由创建路径兜底）。
+fn apply_appearance(app: &mut App) {
+    let appearance = resolved_appearance(app.config.general.appearance.as_deref());
+    if let Some(r) = app.panel.renderer.as_mut() {
+        r.theme = crate::ui::panel::theme::Theme::new(appearance);
+    }
+}
+
+/// 按数据内容重算主视图高度（指标行数 / 余额 / 副标题都会伸缩面板）。
+fn sync_main_height(app: &mut App) {
+    app.panel.main_h = match app.data.snapshot.as_ref() {
+        None => 300,
+        Some(snap) => {
+            let has_meta = !snap.plan_version.label().is_empty()
+                || !snap.tier.label().is_empty()
+                || snap.plan_label.as_deref().is_some_and(|s| !s.is_empty());
+            let rows = [snap.five_hour.is_some(), snap.weekly.is_some(), snap.mcp.is_some()]
+                .iter()
+                .filter(|b| **b)
+                .count() as i32;
+            let bal = snap.balance.is_some() as i32;
+            // 顶栏 + 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
+            16 + if has_meta { 52 } else { 38 } + 42 + rows * 52 + bal * 40 + 40
+        }
+    };
+}
+
 /// 视图切换后面板重定位重设尺寸。
 fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
+    sync_main_height(app);
+    app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth(_)));
+    apply_appearance(app);
     let Some(anchor) = app.panel.anchor else { return };
     unsafe {
         use windows::Win32::UI::WindowsAndMessaging::*;

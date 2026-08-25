@@ -21,6 +21,8 @@ pub struct General {
     pub language: Option<String>,
     /// 外观模式；None = 跟随系统，可选 "light" / "dark"
     pub appearance: Option<String>,
+    /// 网络代理地址；None = 直连，形如 "http://host:port" / "socks5://host:port"
+    pub proxy: Option<String>,
     /// 用量阈值预警开关
     pub notify_threshold_enabled: bool,
     /// 预警阈值百分比
@@ -29,6 +31,10 @@ pub struct General {
     pub notify_reset_5h_enabled: bool,
     /// 周额度重置提醒
     pub notify_reset_weekly_enabled: bool,
+    /// 高峰区间开始 HH:MM
+    pub peak_start: String,
+    /// 高峰区间结束 HH:MM
+    pub peak_end: String,
 }
 
 impl Default for General {
@@ -37,10 +43,13 @@ impl Default for General {
             poll_interval_secs: DEFAULT_INTERVAL_SECS,
             language: None,
             appearance: None,
+            proxy: None,
             notify_threshold_enabled: false,
             notify_threshold_percent: 80,
             notify_reset_5h_enabled: false,
             notify_reset_weekly_enabled: false,
+            peak_start: "14:00".into(),
+            peak_end: "18:00".into(),
         }
     }
 }
@@ -115,12 +124,17 @@ poll_interval_secs = 300
 language = ""
 # 外观：留空跟随系统，可设 "light" / "dark"
 appearance = ""
+# 网络代理：留空直连，可设 "http://host:port" 或 "socks5://host:port"
+proxy = ""
 # 用量阈值预警（默认关闭）
 notify_threshold_enabled = false
 notify_threshold_percent = 80
 # 重置提醒（默认关闭）
 notify_reset_5h_enabled = false
 notify_reset_weekly_enabled = false
+# 高峰区间（工作日生效），HH:MM 格式
+peak_start = "14:00"
+peak_end = "18:00"
 
 # 受监控的账号（建议在设置页添加；此处仅为字段示例）
 # [[accounts]]

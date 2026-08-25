@@ -108,15 +108,6 @@ pub struct UsageSnapshot {
     pub queried_at: DateTime<Local>,
 }
 
-impl UsageSnapshot {
-    /// 是否携带套餐元信息：代际/档位/原始标签任一存在
-    pub fn has_meta(&self) -> bool {
-        !self.plan_version.label().is_empty()
-            || !self.tier.label().is_empty()
-            || self.plan_label.as_deref().is_some_and(|s| !s.is_empty())
-    }
-}
-
 /// 账户余额，仅国内版
 #[derive(Debug, Clone, Default)]
 pub struct Balance {

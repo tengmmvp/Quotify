@@ -30,6 +30,8 @@ pub struct Theme {
     /// 档位色：正常 Forest / 危险 Crimson
     pub ok: [f32; 4],
     pub danger: [f32; 4],
+    /// 峰谷提示琥珀黄
+    pub peak: [f32; 4],
     /// logo 磁贴底色，与主按钮同源
     pub logo_tile: [f32; 4],
 }
@@ -56,6 +58,7 @@ impl Theme {
                 action_text: rgba(0xF7, 0xF7, 0xF4, 1.0),
                 ok: rgba(0x34, 0x78, 0x5C, 1.0),
                 danger: rgba(0xCF, 0x2D, 0x56, 1.0),
+                peak: rgba(0xD9, 0x94, 0x00, 1.0),
                 logo_tile: rgba(0x26, 0x25, 0x1E, 1.0),
             },
             Appearance::Dark => Self {
@@ -70,6 +73,7 @@ impl Theme {
                 action_text: rgba(0x26, 0x25, 0x1E, 1.0),
                 ok: rgba(0x3F, 0xA3, 0x77, 1.0),
                 danger: rgba(0xE2, 0x5A, 0x77, 1.0),
+                peak: rgba(0xFF, 0xC1, 0x4D, 1.0),
                 logo_tile: rgba(0x2D, 0x2D, 0x2D, 1.0),
             },
         }

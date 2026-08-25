@@ -32,11 +32,78 @@ pub mod msg {
     pub const WM_APP_UPDATE_RESULT: u32 = WM_APP + 4;
 }
 
-/// 归还工作集，静止时保持低内存；换出页面按需换回
-pub fn trim_working_set() {
-    unsafe {
-        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
-        use windows::Win32::System::Threading::GetCurrentProcess;
-        let _ = EmptyWorkingSet(GetCurrentProcess());
+/// 用默认浏览器打开链接
+pub fn open_url(url: &str) {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
+    let verb = wide("open");
+    let w = wide(url);
+    let r = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(verb.as_ptr()),
+            PCWSTR(w.as_ptr()),
+            None,
+            None,
+            SW_SHOW,
+        )
+    };
+    // 返回值 <= 32 表示失败
+    if r.0 as isize <= 32 {
+        log(&format!("[Quotify] 打开链接失败: {url}"));
     }
+}
+
+/// 模态保存文件对话框；取消返回 None
+pub fn save_dialog(default_name: &str) -> Option<std::path::PathBuf> {
+    file_dialog(default_name, true)
+}
+
+/// 模态打开文件对话框；取消返回 None
+pub fn open_dialog() -> Option<std::path::PathBuf> {
+    file_dialog("", false)
+}
+
+/// 传统文件对话框共用实现
+fn file_dialog(default_name: &str, save: bool) -> Option<std::path::PathBuf> {
+    use windows::Win32::UI::Controls::Dialogs::{
+        GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT,
+        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    };
+    use windows::core::PWSTR;
+    // 过滤串以双 nul 收尾
+    let filter: Vec<u16> = "JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    let mut file = [0u16; 260];
+    for (i, c) in default_name.encode_utf16().take(259).enumerate() {
+        file[i] = c;
+    }
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: std::mem::size_of::<OPENFILENAMEW>() as u32,
+        lpstrFilter: PCWSTR(filter.as_ptr()),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        Flags: OFN_PATHMUSTEXIST
+            | if save {
+                OFN_OVERWRITEPROMPT
+            } else {
+                OFN_FILEMUSTEXIST
+            },
+        ..Default::default()
+    };
+    let ok = unsafe {
+        if save {
+            GetSaveFileNameW(&mut ofn)
+        } else {
+            GetOpenFileNameW(&mut ofn)
+        }
+    };
+    if !ok.as_bool() {
+        return None;
+    }
+    let len = file.iter().position(|&c| c == 0).unwrap_or(0);
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &file[..len],
+    )))
 }

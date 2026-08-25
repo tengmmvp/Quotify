@@ -1,0 +1,30 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: 组装发布正文
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $size = "{0:N1}MB" -f ((Get-Item target/release/Quotify.exe).Length / 1MB)
+          (Get-Content .github/release-template.md -Raw) `
+            -replace '\{tag\}', $tag -replace '\{size\}', $size |
+            Set-Content release-body.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: target/release/Quotify.exe
+          body_path: release-body.md
+          generate_release_notes: true

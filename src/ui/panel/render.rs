@@ -13,7 +13,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
-    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
     D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
     ID2D1HwndRenderTarget, ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
@@ -74,6 +74,10 @@ pub enum Hit {
     InputInterval,
     InputOrg,
     InputProject,
+    InputProxy,
+    InputPeakStart,
+    InputPeakEnd,
+    ApplyPeak,
     Language(LanguageChoice),
     Appearance(AppearanceChoice),
     Platform(Platform),
@@ -86,6 +90,11 @@ pub enum Hit {
     AddAccount,
     RemoveAccount(usize),
     CheckUpdate,
+    OpenDownload,
+    ExportConfig,
+    ImportConfig,
+    /// 峰谷徽标悬停区，无点击语义
+    UsageInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,10 +155,13 @@ pub struct Renderer {
     pub hits: Vec<(Hit, D2D_RECT_F)>,
     pub hover: Option<Hit>,
     pub anim: AnimState,
+    /// 本帧待绘的峰谷说明卡片位置，绘制期由徽标填入、draw 尾部统一画以盖过数据行
+    pending_tip: Option<(f32, f32, f32)>,
     font_fallback: bool,
     target_dpi: f32,
     anim_allowed: bool,
     logo_geo: Option<ID2D1PathGeometry>,
+    bolt_geo: Option<ID2D1PathGeometry>,
     dash_style: Option<ID2D1StrokeStyle>,
 }
 
@@ -169,10 +181,12 @@ impl Renderer {
                 hits: Vec::new(),
                 hover: None,
                 anim: AnimState::new(),
+                pending_tip: None,
                 font_fallback: false,
                 target_dpi: 0.0,
                 anim_allowed: animations_allowed(),
                 logo_geo: None,
+                bolt_geo: None,
                 dash_style: None,
             })
         }
@@ -224,81 +238,7 @@ impl Renderer {
         dpi: f32,
     ) {
         unsafe {
-            let dpi = if dpi.is_finite() && dpi >= 1.0 {
-                dpi
-            } else {
-                1.0
-            };
-            let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
-            let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
-            // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准
-            let need_rebuild = match self.target.as_ref() {
-                Some(t) => {
-                    let sz = t.GetPixelSize();
-                    sz.width != w_px || sz.height != h_px || self.target_dpi != dpi
-                }
-                None => true,
-            };
-            if need_rebuild {
-                // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫
-                let size_only = self.target.is_some() && self.target_dpi == dpi;
-                let resized = size_only
-                    && self.target.as_ref().is_some_and(|t| {
-                        t.Resize(&D2D_SIZE_U {
-                            width: w_px,
-                            height: h_px,
-                        })
-                        .is_ok()
-                    });
-                if !resized {
-                    self.target = None;
-                    let pf = D2D1_PIXEL_FORMAT {
-                        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                        alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                    };
-                    // DPI 经创建 props 显式给定
-                    let props = D2D1_RENDER_TARGET_PROPERTIES {
-                        r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
-                        pixelFormat: pf,
-                        dpiX: dpi * 96.0,
-                        dpiY: dpi * 96.0,
-                        ..Default::default()
-                    };
-                    let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                        hwnd,
-                        pixelSize: D2D_SIZE_U {
-                            width: w_px,
-                            height: h_px,
-                        },
-                        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-                    };
-                    match self.factory.CreateHwndRenderTarget(&props, &hwnd_props) {
-                        Ok(target) => {
-                            let black = target
-                                .CreateSolidColorBrush(
-                                    &D2D1_COLOR_F {
-                                        r: 0.0,
-                                        g: 0.0,
-                                        b: 0.0,
-                                        a: 1.0,
-                                    },
-                                    None,
-                                )
-                                .ok();
-                            self.black = black;
-                            self.target = Some(target);
-                            self.target_dpi = dpi;
-                        }
-                        Err(e) => {
-                            crate::platform::log(&format!(
-                                "[Quotify] CreateHwndRenderTarget 失败: {e}"
-                            ));
-                            return;
-                        }
-                    }
-                }
-            }
-            let Some(target) = self.target.clone() else {
+            let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
                 return;
             };
             let rect_logical = RECT {
@@ -315,10 +255,7 @@ impl Renderer {
                 Err(e) => {
                     // 设备丢失：丢弃 target 与设备绑定资源，下帧整建——不清理则面板永久空白
                     crate::platform::log(&format!("[Quotify] EndDraw 失败: {e}"));
-                    self.target = None;
-                    self.black = None;
-                    self.logo_geo = None;
-                    self.dash_style = None;
+                    self.drop_device_resources();
                 }
             }
         }
@@ -358,6 +295,15 @@ impl Renderer {
             PanelView::Main => self.draw_main(target, model, w, h, dy, alpha),
             PanelView::Settings => self.draw_settings(target, panel, model, w, dy, alpha),
         }
+
+        // 峰谷说明卡片最后画，盖过数据行
+        if let Some((x, y, tw)) = self.pending_tip.take() {
+            let tip = model
+                .strings
+                .peak_tip
+                .replace("{r}", &crate::ui::peak::fmt_range(model.peak_range));
+            self.tip_card(target, x, y, tw, alpha, &tip);
+        }
     }
 
     /// 主视图
@@ -395,20 +341,20 @@ impl Renderer {
                 (true, true) => None,
             }
         });
-        let (logo_size, logo_y) = if meta.is_some() {
-            (32.0, y + 5.0)
-        } else {
-            (22.0, y + 1.0)
-        };
+        // 顶栏区域恒定 52 高：logo 恒 38px，logo/文本块/箭头/右按钮
+        // 全部以行中心 y+26 对齐，等级有无不改变布局
+        let (logo_size, logo_y) = (38.0, y + 7.0);
         self.logo(target, pad, logo_y, logo_size, alpha);
         let tx = pad + logo_size + 10.0;
         let tw = w - tx - 88.0;
+        let block_h = if meta.is_some() { 39.0 } else { 22.0 };
+        let block_top = y + 26.0 - block_h / 2.0;
         let title_disp = ellipsize_px(title, 16.0, tw);
         self.text(
             target,
             &title_disp,
             tx,
-            y + 2.0,
+            block_top,
             tw,
             22.0,
             16.0,
@@ -416,12 +362,26 @@ impl Renderer {
             self.theme.text_primary,
             alpha,
         );
+        // 多账号时账号名后给下拉箭头，与 logo 中心对齐；命中区只覆盖箭头附近
+        if model.accounts_count > 1 {
+            let ax = tx + est_width(&title_disp, 16.0) + 6.0;
+            self.chevron(target, ax, y + 26.0, self.theme.text_secondary, alpha);
+            self.hits.push((
+                Hit::AccountSwitch,
+                D2D_RECT_F {
+                    left: ax - 10.0,
+                    top: y + 12.0,
+                    right: ax + 20.0,
+                    bottom: y + 40.0,
+                },
+            ));
+        }
         if let Some(m) = &meta {
             self.text(
                 target,
                 m,
                 tx + 1.0,
-                y + 24.0,
+                block_top + 22.0,
                 tw,
                 17.0,
                 12.0,
@@ -433,7 +393,7 @@ impl Renderer {
         let btn_r = 16.0;
         let refresh_cx = w - pad - btn_r - 30.0;
         let settings_cx = w - pad - btn_r;
-        let btn_cy = if snap.is_some() { y + 19.0 } else { y + 12.0 };
+        let btn_cy = y + 26.0;
         self.icon_button(
             target,
             Hit::Refresh,
@@ -443,23 +403,8 @@ impl Renderer {
             self.anim.spin,
         );
         self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
-        if model.accounts_count > 1 {
-            self.hits.push((
-                Hit::AccountSwitch,
-                D2D_RECT_F {
-                    left: pad,
-                    top: y,
-                    right: w - 110.0,
-                    bottom: y + if snap.is_some() { 42.0 } else { 26.0 },
-                },
-            ));
-        }
-        // 与 sync_main_height 同用 has_meta 谓词，否则内容会与 footer 重叠
-        y += if snap.is_some_and(|s| s.has_meta()) {
-            52.0
-        } else {
-            38.0
-        };
+        // 顶栏恒定 52，与 sync_main_height 一致
+        y += 52.0;
 
         // ── 数据态 ──
         match (snap, model.error) {
@@ -611,6 +556,10 @@ impl Renderer {
                         self.theme.text_tertiary,
                         alpha,
                     );
+                    // 高峰期标题旁给琥珀黄闪电徽标，悬停展开说明
+                    if crate::ui::peak::is_peak_now(model.peak_range) {
+                        self.peak_badge(target, y, w, alpha, s);
+                    }
                     y += 26.0;
 
                     let detail_of = |cur: Option<f64>, tot: Option<f64>| -> Option<String> {
@@ -985,6 +934,7 @@ impl Renderer {
                 name_y,
                 cw,
                 &input.name,
+                "",
                 input.field == Some(super::InputField::Name),
                 alpha,
             );
@@ -998,6 +948,7 @@ impl Renderer {
                 key_y,
                 cw,
                 &input.key,
+                "",
                 input.field == Some(super::InputField::Key),
                 alpha,
             );
@@ -1013,6 +964,7 @@ impl Renderer {
                     org_y,
                     cw,
                     &input.org,
+                    "",
                     input.field == Some(super::InputField::Org),
                     alpha,
                 );
@@ -1026,6 +978,7 @@ impl Renderer {
                     project_y,
                     cw,
                     &input.project,
+                    "",
                     input.field == Some(super::InputField::Project),
                     alpha,
                 );
@@ -1059,7 +1012,7 @@ impl Renderer {
             );
             return;
         }
-        // 单账号：有则显示账号卡片，叉掉后回到添加；无则显示添加按钮
+        // 当前活跃账号卡片（有则显示）；添加入口常驻，支持继续添加账号
         if let Some(acc) = model.account {
             let platform = if acc.platform == Platform::Cn {
                 s.platform_cn
@@ -1115,21 +1068,20 @@ impl Renderer {
                 );
                 y += 18.0;
             }
-        } else {
-            // 添加账号独占一行：占满内容区，视觉对称
-            self.pill_button(
-                target,
-                Hit::AddAccount,
-                pad,
-                y + 2.0,
-                cw,
-                30.0,
-                s.add_account,
-                alpha,
-                false,
-            );
-            y += 36.0;
         }
+        // 添加账号独占一行：占满内容区，视觉对称
+        self.pill_button(
+            target,
+            Hit::AddAccount,
+            pad,
+            y + 2.0,
+            cw,
+            30.0,
+            s.add_account,
+            alpha,
+            false,
+        );
+        y += 36.0;
 
         // ── 轮询间隔：分段第 5 段「自定义」，选中时下方展开输入行 ──
         y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
@@ -1178,6 +1130,7 @@ impl Renderer {
                 iy,
                 96.0,
                 &input.interval,
+                "",
                 input.field == Some(super::InputField::Interval),
                 alpha,
             );
@@ -1207,6 +1160,139 @@ impl Renderer {
         } else {
             y += 10.0;
         }
+
+        // ── 通知 ──
+        y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
+        y = self.toggle_row(
+            target,
+            Hit::ToggleThreshold,
+            s.notify_threshold,
+            s.notify_threshold_desc,
+            model.threshold_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        y = self.toggle_row(
+            target,
+            Hit::ToggleReset5h,
+            s.notify_reset_5h_opt,
+            s.notify_reset_5h_desc,
+            model.reset_5h_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        y = self.toggle_row(
+            target,
+            Hit::ToggleResetWeekly,
+            s.notify_reset_weekly_opt,
+            s.notify_reset_weekly_desc,
+            model.reset_weekly_enabled,
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+
+        // ── 高峰区间：工作日生效，自定义起止 ──
+        self.section_label(target, s.peak_section, pad, y, w, alpha, true);
+        // y 钉在 layout::peak_input_y，与光标、高度公式同源
+        let pky = dy
+            + layout::peak_input_y(
+                model.accounts_count > 0,
+                panel.account_error,
+                panel.customizing_interval,
+            );
+        // 当前配置值作为弱色占位提示，输入即覆盖，无需删除
+        let start_buf = panel.input.peak_start.as_str();
+        let end_buf = panel.input.peak_end.as_str();
+        // 非法状态（格式错误或两端相等）给红框，提示等待修正；空缓冲表示未编辑不判
+        let bad = |v: &str| !v.is_empty() && crate::ui::peak::parse_hhmm(v).is_none();
+        let peak_bad = bad(start_buf)
+            || bad(end_buf)
+            || matches!(
+                (
+                    crate::ui::peak::parse_hhmm(start_buf),
+                    crate::ui::peak::parse_hhmm(end_buf),
+                ),
+                (Some(s), Some(e)) if s == e
+            );
+        self.text(
+            target,
+            s.peak_start_label,
+            pad,
+            pky + 7.0,
+            26.0,
+            14.0,
+            12.0,
+            400,
+            self.theme.text_tertiary,
+            alpha,
+        );
+        self.input_field(
+            target,
+            Hit::InputPeakStart,
+            layout::PEAK_START_X,
+            pky,
+            64.0,
+            start_buf,
+            model.peak_start_raw,
+            panel.input.field == Some(super::InputField::PeakStart),
+            alpha,
+        );
+        self.text(
+            target,
+            s.peak_end_label,
+            pad + 100.0,
+            pky + 7.0,
+            26.0,
+            14.0,
+            12.0,
+            400,
+            self.theme.text_tertiary,
+            alpha,
+        );
+        self.input_field(
+            target,
+            Hit::InputPeakEnd,
+            layout::PEAK_END_X,
+            pky,
+            64.0,
+            end_buf,
+            model.peak_end_raw,
+            panel.input.field == Some(super::InputField::PeakEnd),
+            alpha,
+        );
+        self.outline_button(
+            target,
+            Hit::ApplyPeak,
+            w - pad - 48.0,
+            pky - 1.0,
+            48.0,
+            28.0,
+            s.apply,
+            alpha,
+        );
+        if peak_bad {
+            let edge = self.brush(target, self.theme.danger, alpha);
+            for bx in [layout::PEAK_START_X, layout::PEAK_END_X] {
+                target.DrawRectangle(
+                    &D2D_RECT_F {
+                        left: bx,
+                        top: pky,
+                        right: bx + 64.0,
+                        bottom: pky + layout::INPUT_H,
+                    },
+                    &edge,
+                    1.4,
+                    None,
+                );
+            }
+        }
+        y = pky + layout::INPUT_H + 8.0;
 
         // ── 通用：语言 / 外观 / 开机自启 ──
         y = self.section_label(target, s.settings_general, pad, y, w, alpha, true);
@@ -1265,41 +1351,59 @@ impl Renderer {
             alpha,
         );
 
-        // ── 通知 ──
-        y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
-        y = self.toggle_row(
+        // ── 网络代理：地址留空直连，提示在框内占位 ──
+        y = self.section_label(target, s.network_section, pad, y, w, alpha, true);
+        self.sub_label(target, s.proxy_label, pad, y, cw, alpha);
+        // y 钉在 layout::proxy_input_y，与光标、高度公式同源
+        let py = dy
+            + layout::proxy_input_y(
+                model.accounts_count > 0,
+                panel.account_error,
+                panel.customizing_interval,
+            );
+        let proxy_disp: String = if panel.input.proxy.is_empty() {
+            model.proxy.unwrap_or("").to_string()
+        } else {
+            panel.input.proxy.clone()
+        };
+        self.input_field(
             target,
-            Hit::ToggleThreshold,
-            s.notify_threshold,
-            s.notify_threshold_desc,
-            model.threshold_enabled,
-            pad,
-            y,
+            Hit::InputProxy,
+            layout::INPUT_X,
+            py,
             cw,
+            &proxy_disp,
+            s.proxy_hint,
+            panel.input.field == Some(super::InputField::Proxy),
             alpha,
         );
-        y = self.toggle_row(
+        y = py + layout::INPUT_H + 6.0;
+
+        // ── 配置管理：导出 / 导入，位于关于区之前 ──
+        y = self.section_label(target, s.backup_section, pad, y, w, alpha, true);
+        let pair_w = 104.0 * 2.0 + 12.0;
+        let bx = pad + (cw - pair_w) / 2.0;
+        self.outline_button(
             target,
-            Hit::ToggleReset5h,
-            s.notify_reset_5h_opt,
-            s.notify_reset_5h_desc,
-            model.reset_5h_enabled,
-            pad,
+            Hit::ExportConfig,
+            bx,
             y,
-            cw,
+            104.0,
+            28.0,
+            s.export_config,
             alpha,
         );
-        y = self.toggle_row(
+        self.outline_button(
             target,
-            Hit::ToggleResetWeekly,
-            s.notify_reset_weekly_opt,
-            s.notify_reset_weekly_desc,
-            model.reset_weekly_enabled,
-            pad,
+            Hit::ImportConfig,
+            bx + 116.0,
             y,
-            cw,
+            104.0,
+            28.0,
+            s.import_config,
             alpha,
         );
+        y += 28.0 + 12.0;
 
         // ── 关于：检查更新 + 版本，位于底部 ──
         let update_label = match model.update {
@@ -1313,14 +1417,32 @@ impl Renderer {
             None => s.check_update.into(),
         };
         y = self.section_label(target, "", pad, y, w, alpha, true);
-        // 左「当前版本」12px，右描边小按钮——字号一致、视觉平衡
+        // 有新版时先给一行下载入口；版本行保持设置页收尾
+        if model.update_available {
+            let bw = 104.0;
+            self.pill_button(
+                target,
+                Hit::OpenDownload,
+                (w - bw) / 2.0,
+                y + 2.0,
+                bw,
+                30.0,
+                s.go_download,
+                alpha,
+                true,
+            );
+            y += 38.0;
+        }
+        // 左「当前版本」12px，右描边小按钮——字号一致、视觉平衡；
+        // 按钮宽随文案自适应，英文失败/新版本文案不折行
         let ver_line = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
+        let btn_w = (est_width(&update_label, 12.0) + 28.0).max(104.0);
         self.text(
             target,
             &ver_line,
             pad,
             y + 7.0,
-            w - pad * 2.0 - 124.0,
+            w - pad * 2.0 - btn_w - 12.0,
             16.0,
             12.0,
             400,
@@ -1330,9 +1452,9 @@ impl Renderer {
         self.outline_button(
             target,
             Hit::CheckUpdate,
-            w - pad - 104.0,
+            w - pad - btn_w,
             y + 1.0,
-            104.0,
+            btn_w,
             28.0,
             &update_label,
             alpha,
@@ -1414,7 +1536,8 @@ impl Renderer {
         y + 21.0
     }
 
-    /// 自绘输入框；光标用系统 caret——CreateCaret，IME 候选窗跟随其定位
+    /// 自绘输入框；光标用系统 caret——CreateCaret，IME 候选窗跟随其定位。
+    /// content 为空且未聚焦时显示弱色占位提示
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
@@ -1424,6 +1547,7 @@ impl Renderer {
         y: f32,
         w: f32,
         content: &str,
+        placeholder: &str,
         active: bool,
         alpha: f32,
     ) {
@@ -1442,32 +1566,47 @@ impl Renderer {
         };
         let edge = self.brush(target, edge_color, alpha);
         target.DrawRectangle(&rect, &edge, 1.2, None);
-        // 只显示末尾可视部分（等宽 7.3px/字符）
-        let max_chars = (((w - 12.0) / 7.3).floor() as usize).max(1);
-        let vis: String = content
-            .chars()
-            .rev()
-            .take(max_chars)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        self.text_rect_opts(
-            target,
-            &vis,
-            &D2D_RECT_F {
-                left: x + 6.0,
-                top: y + 6.0,
-                right: x + w - 4.0,
-                bottom: y + 22.0,
-            },
-            12.0,
-            400,
-            self.theme.text_primary,
-            alpha,
-            Align::Left,
-            true,
-        );
+        let text_rect = D2D_RECT_F {
+            left: x + 6.0,
+            top: y + 6.0,
+            right: x + w - 4.0,
+            bottom: y + 22.0,
+        };
+        if content.is_empty() && !placeholder.is_empty() {
+            self.text_rect_opts(
+                target,
+                placeholder,
+                &text_rect,
+                12.0,
+                400,
+                self.theme.text_tertiary,
+                alpha,
+                Align::Left,
+                false,
+            );
+        } else {
+            // 只显示末尾可视部分（等宽 7.3px/字符）
+            let max_chars = (((w - 12.0) / 7.3).floor() as usize).max(1);
+            let vis: String = content
+                .chars()
+                .rev()
+                .take(max_chars)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            self.text_rect_opts(
+                target,
+                &vis,
+                &text_rect,
+                12.0,
+                400,
+                self.theme.text_primary,
+                alpha,
+                Align::Left,
+                true,
+            );
+        }
         self.hits.push((
             hit,
             D2D_RECT_F {
@@ -2436,6 +2575,334 @@ impl Renderer {
             sink.Close().ok()?;
             Some(geo)
         }
+    }
+
+    /// 建立或复用 HwndRenderTarget；失败返回 None
+    unsafe fn ensure_target(
+        &mut self,
+        hwnd: HWND,
+        rect_phys: &RECT,
+        dpi: f32,
+    ) -> Option<ID2D1HwndRenderTarget> {
+        let dpi = if dpi.is_finite() && dpi >= 1.0 {
+            dpi
+        } else {
+            1.0
+        };
+        let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
+        let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
+        // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准
+        let need_rebuild = match self.target.as_ref() {
+            Some(t) => {
+                let sz = t.GetPixelSize();
+                sz.width != w_px || sz.height != h_px || self.target_dpi != dpi
+            }
+            None => true,
+        };
+        if need_rebuild {
+            // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫
+            let size_only = self.target.is_some() && self.target_dpi == dpi;
+            let resized = size_only
+                && self.target.as_ref().is_some_and(|t| {
+                    t.Resize(&D2D_SIZE_U {
+                        width: w_px,
+                        height: h_px,
+                    })
+                    .is_ok()
+                });
+            if !resized {
+                self.target = None;
+                let pf = D2D1_PIXEL_FORMAT {
+                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                };
+                // 软件渲染：硬件路径会拉起 d3d11+显卡驱动栈，驱动内部提交
+                // 占 60MB+，远超本程序预算；窗口小，软光栅耗时可忽略
+                let props = D2D1_RENDER_TARGET_PROPERTIES {
+                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+                    pixelFormat: pf,
+                    dpiX: dpi * 96.0,
+                    dpiY: dpi * 96.0,
+                    ..Default::default()
+                };
+                let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+                    hwnd,
+                    pixelSize: D2D_SIZE_U {
+                        width: w_px,
+                        height: h_px,
+                    },
+                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+                };
+                match self.factory.CreateHwndRenderTarget(&props, &hwnd_props) {
+                    Ok(target) => {
+                        let black = target
+                            .CreateSolidColorBrush(
+                                &D2D1_COLOR_F {
+                                    r: 0.0,
+                                    g: 0.0,
+                                    b: 0.0,
+                                    a: 1.0,
+                                },
+                                None,
+                            )
+                            .ok();
+                        self.black = black;
+                        self.target = Some(target);
+                        self.target_dpi = dpi;
+                    }
+                    Err(e) => {
+                        crate::platform::log(&format!(
+                            "[Quotify] CreateHwndRenderTarget 失败: {e}"
+                        ));
+                        return None;
+                    }
+                }
+            }
+        }
+        self.target.clone()
+    }
+
+    /// 设备丢失时丢弃设备绑定资源，下帧整建
+    fn drop_device_resources(&mut self) {
+        self.target = None;
+        self.black = None;
+        self.logo_geo = None;
+        self.bolt_geo = None;
+        self.dash_style = None;
+    }
+
+    /// 账号切换弹窗绘制；hover 为行索引
+    pub unsafe fn paint_popup(
+        &mut self,
+        hwnd: HWND,
+        rect_phys: &RECT,
+        model: &PanelModel,
+        dpi: f32,
+        hover: Option<usize>,
+    ) {
+        let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
+            return;
+        };
+        let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
+        let h = (rect_phys.bottom - rect_phys.top) as f32 / dpi;
+        let (dy, alpha) = match &self.anim.appear {
+            Some(t) if self.anim_allowed => {
+                let p = ease_out_cubic(t.progress());
+                ((1.0 - p) * 6.0, p)
+            }
+            _ => (0.0, 1.0),
+        };
+        target.BeginDraw();
+        let bg_rect = D2D_RECT_F {
+            left: 0.0,
+            top: 0.0,
+            right: w,
+            bottom: h,
+        };
+        let bg = self.brush(&target, self.theme.bg, 1.0);
+        target.FillRectangle(&bg_rect, &bg);
+
+        let selected = model.account.map(|a| a.index);
+        for (i, acc) in model.accounts.iter().enumerate() {
+            let top = 6.0 + dy + i as f32 * 36.0;
+            if selected == Some(i) || hover == Some(i) {
+                let row = D2D_RECT_F {
+                    left: 6.0,
+                    top,
+                    right: w - 6.0,
+                    bottom: top + 32.0,
+                };
+                let fill = self.brush(&target, self.theme.track, alpha);
+                target.FillRectangle(&row, &fill);
+            }
+            let name = ellipsize_px(&acc.name, 14.0, w - 16.0 - 64.0);
+            self.text(
+                &target,
+                &name,
+                16.0,
+                top + 8.0,
+                w - 16.0 - 60.0,
+                18.0,
+                14.0,
+                500,
+                self.theme.text_primary,
+                alpha,
+            );
+            let s = model.strings;
+            let platform = if acc.platform == crate::api::client::Platform::Cn {
+                s.platform_cn
+            } else {
+                s.platform_intl
+            };
+            let label = if acc.team {
+                format!("{platform} · {}", s.team_badge)
+            } else {
+                platform.to_string()
+            };
+            let bw = est_width(&label, 10.5) + 14.0;
+            let bx = w - 10.0 - bw;
+            self.badge(
+                &target,
+                &label,
+                bx,
+                top + 10.0,
+                bw,
+                self.theme.border,
+                self.theme.text_secondary,
+                alpha,
+                true,
+            );
+        }
+        match target.EndDraw(None, None) {
+            Ok(()) => {}
+            Err(e) => {
+                crate::platform::log(&format!("[Quotify] 弹窗 EndDraw 失败: {e}"));
+                self.drop_device_resources();
+            }
+        }
+    }
+
+    /// 下拉小箭头（∨）
+    unsafe fn chevron(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        x: f32,
+        cy: f32,
+        color: [f32; 4],
+        alpha: f32,
+    ) {
+        let b = self.brush(target, color, alpha);
+        let half = 5.0;
+        self.line(target, x, cy - 3.0, x + half, cy + 3.0, &b, 1.8);
+        self.line(
+            target,
+            x + half,
+            cy + 3.0,
+            x + half * 2.0,
+            cy - 3.0,
+            &b,
+            1.8,
+        );
+    }
+
+    /// 高峰徽标：闪电 + 文字整组右对齐，字号与区块标题一致、垂直居中
+    unsafe fn peak_badge(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        title_y: f32,
+        w: f32,
+        alpha: f32,
+        s: &Strings,
+    ) {
+        let pad = 20.0;
+        // 与 12px 标题行视觉平衡：文字同 12px，闪电 14px 居中
+        let bh = 14.0;
+        let bw = bh * (7.0 / 13.0);
+        let badge_w = bw + 4.0 + est_width(s.peak_badge, 12.0);
+        let bx = w - pad - badge_w;
+        if self.bolt_geo.is_none() {
+            self.bolt_geo = self.build_bolt_glyph();
+        }
+        if let Some(geo) = self.bolt_geo.clone() {
+            let b = self.brush(target, self.theme.peak, alpha);
+            let m = Matrix3x2 {
+                M11: bh / 13.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: bh / 13.0,
+                M31: bx,
+                M32: title_y + 1.0,
+            };
+            target.SetTransform(&m);
+            target.FillGeometry(&geo, &b, None);
+            target.SetTransform(&Matrix3x2::identity());
+        }
+        let tx = bx + bw + 4.0;
+        self.text(
+            target,
+            s.peak_badge,
+            tx,
+            title_y,
+            w - tx,
+            17.0,
+            12.0,
+            600,
+            self.theme.peak,
+            alpha,
+        );
+        let hit_w = badge_w;
+        self.hits.push((
+            Hit::UsageInfo,
+            D2D_RECT_F {
+                left: bx - 3.0,
+                top: title_y - 3.0,
+                right: bx + hit_w + 3.0,
+                bottom: title_y + 18.0,
+            },
+        ));
+        if self.hover == Some(Hit::UsageInfo) {
+            self.pending_tip = Some((bx, title_y + 22.0, w));
+        }
+    }
+
+    /// 7×13 单位闪电多边形
+    fn build_bolt_glyph(&self) -> Option<ID2D1PathGeometry> {
+        unsafe {
+            let geo = self.factory.CreatePathGeometry().ok()?;
+            let sink = geo.Open().ok()?;
+            sink.BeginFigure(Vector2 { X: 4.5, Y: 0.0 }, D2D1_FIGURE_BEGIN_FILLED);
+            sink.AddLine(Vector2 { X: 0.5, Y: 7.5 });
+            sink.AddLine(Vector2 { X: 3.2, Y: 7.5 });
+            sink.AddLine(Vector2 { X: 2.5, Y: 13.0 });
+            sink.AddLine(Vector2 { X: 6.5, Y: 5.0 });
+            sink.AddLine(Vector2 { X: 3.8, Y: 5.0 });
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            sink.Close().ok()?;
+            Some(geo)
+        }
+    }
+
+    /// 峰谷说明卡片：不透明底圆角卡，盖在数据行上方
+    unsafe fn tip_card(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        x: f32,
+        y: f32,
+        w: f32,
+        alpha: f32,
+        tip: &str,
+    ) {
+        let pad = 20.0;
+        let cw = (w - pad * 2.0).min(300.0);
+        let cx = x.min(pad + w - pad - cw).max(pad);
+        let card = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: cx,
+                top: y,
+                right: cx + cw,
+                bottom: y + 48.0,
+            },
+            radiusX: 6.0,
+            radiusY: 6.0,
+        };
+        // 底色取 bg 但不透明，避免透出被盖住的数据行
+        let [r, g, b, _] = self.theme.bg;
+        let fill = self.brush(target, [r, g, b, alpha], 1.0);
+        target.FillRoundedRectangle(&card, &fill);
+        let line = self.brush(target, self.theme.border, alpha);
+        target.DrawRoundedRectangle(&card, &line, 1.0, None);
+        self.text(
+            target,
+            tip,
+            cx + 10.0,
+            y + 8.0,
+            cw - 20.0,
+            32.0,
+            11.0,
+            400,
+            self.theme.text_secondary,
+            alpha,
+        );
     }
 }
 

@@ -52,6 +52,7 @@ pub struct App {
     poll_interval: PollInterval,
     tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
     pub(crate) panel: Panel,
+    pub(crate) popup: crate::ui::panel::popup::AccountPopup,
     hwnd: Option<HWND>,
     pub(crate) update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
     update_checking: bool,
@@ -80,6 +81,7 @@ impl App {
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
             tray_icon: None,
             panel: Panel::new(),
+            popup: crate::ui::panel::popup::AccountPopup::new(),
             hwnd: None,
             update_status: None,
             update_checking: false,
@@ -157,9 +159,6 @@ impl App {
         self.update_tray_icon();
         if let Some(p) = self.panel.hwnd {
             relayout_panel(self, p);
-        }
-        if self.panel.mode == crate::ui::panel::PanelMode::Hidden {
-            crate::platform::trim_working_set();
         }
     }
 
@@ -278,6 +277,24 @@ fn check_threshold(
     }
 }
 
+/// lparam 指向的宽字符串是否为 "ImmersiveColorSet"
+fn is_immersive_color_set(lparam: LPARAM) -> bool {
+    let p = lparam.0 as *const u16;
+    if p.is_null() {
+        return false;
+    }
+    let mut expect = "ImmersiveColorSet".encode_utf16();
+    unsafe {
+        loop {
+            match (expect.next(), *p) {
+                (Some(a), b) if a == b => {}
+                (None, 0) => return true,
+                _ => return false,
+            }
+        }
+    }
+}
+
 /// 托盘隐藏窗口过程
 extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
@@ -337,11 +354,40 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
                 if !boxed.is_null() {
                     let r = unsafe { Box::from_raw(boxed) };
+                    app.panel.update_available = match r.as_ref() {
+                        Ok(info) => {
+                            crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION"))
+                        }
+                        Err(_) => false,
+                    };
                     app.update_status = Some(*r);
                     if let Some(p) = app.panel.hwnd {
+                        relayout_panel(app, p);
                         unsafe {
                             let _ = InvalidateRect(Some(p), None, true);
                         }
+                    }
+                }
+            }
+            LRESULT(0)
+        }
+        windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE => {
+            // 外观未显式指定时，系统主题切换即时重绘面板
+            if is_immersive_color_set(lparam)
+                && let Some(app) = app_from(hwnd)
+                && !app.config.general.appearance.as_deref().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("light") || s.eq_ignore_ascii_case("dark")
+                })
+            {
+                apply_appearance(app);
+                if let Some(p) = app.panel.hwnd {
+                    unsafe {
+                        let _ = InvalidateRect(Some(p), None, true);
+                    }
+                }
+                if let Some(p) = app.popup.hwnd {
+                    unsafe {
+                        let _ = InvalidateRect(Some(p), None, true);
                     }
                 }
             }
@@ -401,6 +447,10 @@ fn app_from(hwnd: HWND) -> Option<&'static mut App> {
 /// 面板命中处理
 pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
     use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
+    // 弹窗开着时点面板任意处（箭头除外，箭头是开关）即收起弹窗
+    if !matches!(hit, Hit::AccountSwitch) && app.popup.is_open() {
+        app.popup.close();
+    }
     match hit {
         Hit::Refresh | Hit::Retry => {
             if let Some(p) = &app.poller {
@@ -504,6 +554,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::RemoveAccount(i) => {
             if i < app.config.accounts.len() {
+                app.popup.close();
                 let removed_id = app.config.accounts[i].id.clone();
                 app.config.accounts.remove(i);
                 if app.config.selected.as_deref() == Some(removed_id.as_str()) {
@@ -559,6 +610,19 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
         }
+        Hit::InputProxy => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Proxy);
+        }
+        Hit::InputPeakStart => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakStart);
+        }
+        Hit::InputPeakEnd => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakEnd);
+        }
+        Hit::ApplyPeak => apply_peak(app, panel_hwnd),
         Hit::CustomizeInterval => {
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.customizing_interval = true;
@@ -572,26 +636,28 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::ApplyInterval => apply_interval(app, panel_hwnd),
         Hit::AccountSwitch => {
             let n = app.config.accounts.len();
-            if n > 1 {
-                let cur = app
-                    .config
-                    .selected_account()
-                    .map(|a| a.id.clone())
-                    .unwrap_or_default();
-                let idx = app
-                    .config
-                    .accounts
-                    .iter()
-                    .position(|a| a.id == cur)
-                    .unwrap_or(0);
-                let next = (idx + 1) % n;
-                select_account(app, next);
+            let parent = app.hwnd();
+            let panel = app.panel.hwnd;
+            if n > 1
+                && let Some(panel_hwnd) = panel
+            {
+                app.popup.toggle(parent, panel_hwnd, n);
             }
         }
+        Hit::OpenDownload => {
+            if let Some(Ok(info)) = app.update_status.as_ref() {
+                crate::platform::open_url(&info.url);
+            }
+        }
+        // 悬停徽标无点击语义
+        Hit::UsageInfo => {}
+        Hit::ExportConfig => export_config(app),
+        Hit::ImportConfig => import_config(app, panel_hwnd),
         Hit::CheckUpdate => {
             if !app.update_checking {
                 app.update_checking = true;
                 app.update_status = None;
+                app.panel.update_available = false;
                 struct SendHwnd(HWND);
                 unsafe impl Send for SendHwnd {}
                 let tray = SendHwnd(app.hwnd());
@@ -619,7 +685,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     }
 }
 
-fn select_account(app: &mut App, i: usize) {
+pub(crate) fn select_account(app: &mut App, i: usize) {
     if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
         app.config.selected = Some(id);
         crate::app::config::save(&app.config);
@@ -719,6 +785,120 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
+/// 应用高峰区间：未编辑的框沿用当前配置值；两值合法且不相等才写入
+fn apply_peak(app: &mut App, panel_hwnd: HWND) {
+    let start = if app.panel.input.peak_start.trim().is_empty() {
+        app.config.general.peak_start.clone()
+    } else {
+        app.panel.input.peak_start.trim().to_string()
+    };
+    let end = if app.panel.input.peak_end.trim().is_empty() {
+        app.config.general.peak_end.clone()
+    } else {
+        app.panel.input.peak_end.trim().to_string()
+    };
+    if let (Some(s), Some(e)) = (
+        crate::ui::peak::parse_hhmm(&start),
+        crate::ui::peak::parse_hhmm(&end),
+    ) && s != e
+    {
+        app.config.general.peak_start = start;
+        app.config.general.peak_end = end;
+        crate::app::config::save(&app.config);
+        app.panel.clear_input(panel_hwnd);
+    } else {
+        crate::platform::log("[Quotify] 高峰区间格式无效，应为 HH:MM 且两端不相等");
+    }
+    relayout_panel(app, panel_hwnd);
+}
+
+/// 应用网络代理；立即重建连接并触发一次拉取验证
+fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
+    let raw = app.panel.input.proxy.trim().to_string();
+    app.config.general.proxy = if raw.is_empty() { None } else { Some(raw) };
+    crate::app::config::save(&app.config);
+    if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
+        crate::platform::log(&format!("[Quotify] 代理地址无效，保持原连接: {e}"));
+    }
+    app.panel.input.field = None;
+    if let Some(p) = &app.poller {
+        p.refresh_now();
+    }
+    relayout_panel(app, panel_hwnd);
+}
+
+/// 导出配置为明文 JSON；文件内容含 API key，由用户自行保管
+fn export_config(app: &App) {
+    let Some(path) = crate::platform::save_dialog("quotify-config.json") else {
+        return;
+    };
+    let result = serde_json::to_string_pretty(&app.config)
+        .map_err(|e| e.to_string())
+        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
+    if let Err(e) = result {
+        crate::platform::log(&format!("[Quotify] 导出失败: {e}"));
+    }
+}
+
+/// 导入配置 JSON；模态期间冻结面板巡检防止误收起
+fn import_config(app: &mut App, panel_hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+    unsafe {
+        let _ = KillTimer(Some(panel_hwnd), crate::ui::panel::TIMER_OUTSIDE_CHECK);
+    }
+    let picked = crate::platform::open_dialog();
+    unsafe {
+        let _ = SetTimer(
+            Some(panel_hwnd),
+            crate::ui::panel::TIMER_OUTSIDE_CHECK,
+            200,
+            None,
+        );
+    }
+    let parsed = picked
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<Config>(&text).ok());
+
+    let notify_body = match parsed {
+        Some(cfg) => {
+            app.popup.close();
+            app.config = cfg;
+            if app.config.selected_account().is_none() {
+                app.config.selected = None;
+            }
+            if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
+                crate::platform::log(&format!("[Quotify] 导入的代理地址无效，保持原连接: {e}"));
+            }
+            if let Some(r) = app.panel.renderer.as_mut() {
+                r.hits.clear();
+                r.hover = None;
+            }
+            crate::app::config::save(&app.config);
+            app.panel.adding_account = false;
+            app.panel.input.field = None;
+            app.data = AccountData {
+                snapshot: None,
+                last_error: None,
+            };
+            app.sync_poll_context();
+            app.update_tray_icon();
+            if let Some(p) = &app.poller {
+                p.refresh_now();
+            }
+            relayout_panel(app, panel_hwnd);
+            app.strings.import_done.to_string()
+        }
+        None => {
+            crate::platform::log("[Quotify] 配置导入失败：文件不可读或格式无效");
+            app.strings.import_failed.to_string()
+        }
+    };
+    let hwnd = app.hwnd();
+    let tray_id = app.tray.as_ref().map(|t| t.tray_id()).unwrap_or(1);
+    crate::platform::notify::show(hwnd, tray_id, NOTIFY_TITLE, &notify_body);
+}
+
 /// 非预设间隔展开自定义行并预填；预设则收起
 fn sync_customizing(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
@@ -766,6 +946,11 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
             }
         }
         Some(InputField::Interval) => apply_interval(app, panel_hwnd),
+        Some(InputField::Proxy) => apply_proxy(app, panel_hwnd),
+        Some(InputField::PeakStart) => {
+            app.panel.focus_input(panel_hwnd, InputField::PeakEnd);
+        }
+        Some(InputField::PeakEnd) => apply_peak(app, panel_hwnd),
         None => {}
     }
 }
@@ -778,10 +963,23 @@ fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appear
     }
 }
 
+/// 解析配置中的高峰区间；格式无效或两端相等回退官方默认，start > end 视为跨午夜
+pub fn peak_range_of(config: &Config) -> crate::ui::peak::PeakRange {
+    let s = crate::ui::peak::parse_hhmm(&config.general.peak_start);
+    let e = crate::ui::peak::parse_hhmm(&config.general.peak_end);
+    match (s, e) {
+        (Some(s), Some(e)) if s != e => (s, e),
+        _ => crate::ui::peak::DEFAULT_PEAK,
+    }
+}
+
 /// 应用生效外观；渲染器未创建时由创建路径兜底
 fn apply_appearance(app: &mut App) {
     let appearance = resolved_appearance(app.config.general.appearance.as_deref());
     if let Some(r) = app.panel.renderer.as_mut() {
+        r.theme = crate::ui::panel::theme::Theme::new(appearance);
+    }
+    if let Some(r) = app.popup.renderer.as_mut() {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }
 }
@@ -799,8 +997,8 @@ fn sync_main_height(app: &mut App) {
             .filter(|b| **b)
             .count() as i32;
             let bal = snap.balance.is_some() as i32;
-            // 顶栏 + 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
-            16 + if snap.has_meta() { 52 } else { 38 } + 42 + rows * 52 + bal * 40 + 40
+            // 顶栏（恒定 52）+ 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
+            16 + 52 + 42 + rows * 52 + bal * 40 + 40
         }
     };
 }
@@ -836,6 +1034,10 @@ pub fn run() -> i32 {
         let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
 
         let config = config::load();
+        // 配置的代理在首次请求前生效；地址无效仅记录，不阻断启动
+        if let Err(e) = crate::api::client::set_proxy(config.general.proxy.clone()) {
+            crate::platform::log(&format!("[Quotify] 代理地址无效，保持直连: {e}"));
+        }
         let app = Box::new(App::new(config));
         let mut app = app;
 

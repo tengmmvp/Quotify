@@ -1,6 +1,6 @@
 //! 用量查询 HTTP 客户端
 
-use std::sync::OnceLock;
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -12,27 +12,84 @@ pub(crate) const MAX_BODY_BYTES: u64 = 1024 * 1024;
 /// 非 2xx 错误消息携带的 body 前缀长度（字符数）上限
 const ERR_BODY_CHARS: usize = 160;
 
-/// 5s 短超时 Agent
-static AGENT_SHORT: OnceLock<ureq::Agent> = OnceLock::new();
-/// 15s 长超时 Agent
-static AGENT_LONG: OnceLock<ureq::Agent> = OnceLock::new();
-
-fn agent_short() -> &'static ureq::Agent {
-    AGENT_SHORT.get_or_init(|| build_agent(5))
+/// 双超时 Agent 缓存
+struct AgentCache {
+    proxy: Option<String>,
+    short: ureq::Agent,
+    long: ureq::Agent,
 }
 
-pub(crate) fn agent_long() -> &'static ureq::Agent {
-    AGENT_LONG.get_or_init(|| build_agent(15))
+static AGENTS: RwLock<Option<AgentCache>> = RwLock::new(None);
+
+fn agents_read() -> RwLockReadGuard<'static, Option<AgentCache>> {
+    AGENTS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn agents_write() -> RwLockWriteGuard<'static, Option<AgentCache>> {
+    AGENTS.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 缓存缺失时按无代理构建
+fn agents() -> AgentCache {
+    if let Some(c) = agents_read().as_ref() {
+        return AgentCache {
+            proxy: c.proxy.clone(),
+            short: c.short.clone(),
+            long: c.long.clone(),
+        };
+    }
+    let cache = AgentCache {
+        proxy: None,
+        short: build_agent(5, None),
+        long: build_agent(15, None),
+    };
+    *agents_write() = Some(AgentCache {
+        proxy: cache.proxy.clone(),
+        short: cache.short.clone(),
+        long: cache.long.clone(),
+    });
+    cache
+}
+
+fn agent_short() -> ureq::Agent {
+    agents().short
+}
+
+pub(crate) fn agent_long() -> ureq::Agent {
+    agents().long
+}
+
+/// 设置代理并重建两个 Agent
+pub fn set_proxy(proxy: Option<String>) -> Result<(), String> {
+    let proxy = proxy
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if agents_read().as_ref().is_some_and(|c| c.proxy == proxy) {
+        return Ok(());
+    }
+    let parsed = match proxy.as_deref() {
+        Some(p) => match ureq::Proxy::new(p) {
+            Ok(px) => Some(px),
+            Err(e) => return Err(e.to_string()),
+        },
+        None => None,
+    };
+    let short = build_agent(5, parsed.as_ref());
+    let long = build_agent(15, parsed.as_ref());
+    *agents_write() = Some(AgentCache { proxy, short, long });
+    Ok(())
 }
 
 /// 统一配置：全局超时 + https_only；状态码不转错误，集中在 `http_get_text` 分类
-fn build_agent(timeout_secs: u64) -> ureq::Agent {
-    ureq::Agent::config_builder()
+fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
+    let mut builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .https_only(true)
-        .http_status_as_error(false)
-        .build()
-        .into()
+        .http_status_as_error(false);
+    if let Some(p) = proxy {
+        builder = builder.proxy(Some(p.clone()));
+    }
+    builder.build().into()
 }
 
 /// API 平台
@@ -115,7 +172,7 @@ fn fetch_balance(api_key: &str) -> Result<Balance, FetchError> {
 }
 
 fn http_get(url: &str, api_key: &str) -> Result<Value, FetchError> {
-    let body = http_get_text(agent_short(), url, api_key, &[])?;
+    let body = http_get_text(&agent_short(), url, api_key, &[])?;
     serde_json::from_str(&body).map_err(|e| FetchError::Api(format!("parse failed: {e}")))
 }
 
@@ -187,7 +244,7 @@ fn fetch_quota(
         extra.push(("Bigmodel-Organization", org));
         extra.push(("Bigmodel-Project", project));
     }
-    let body_text = http_get_text(agent_long(), &url, auth, &extra)?;
+    let body_text = http_get_text(&agent_long(), &url, auth, &extra)?;
     parse_response(&body_text)
 }
 

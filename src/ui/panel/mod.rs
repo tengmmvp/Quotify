@@ -3,6 +3,7 @@
 pub mod anim;
 pub mod layout;
 pub mod model;
+pub mod popup;
 pub mod render;
 pub mod theme;
 
@@ -14,7 +15,9 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForMonitor;
-use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+};
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
@@ -28,7 +31,7 @@ const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE_DEBOUNCE: usize = 2;
-const TIMER_OUTSIDE_CHECK: usize = 3;
+pub(crate) const TIMER_OUTSIDE_CHECK: usize = 3;
 
 /// DPI 探测失败时的兜底值
 pub(crate) const FALLBACK_DPI: f32 = 1.5;
@@ -58,6 +61,12 @@ pub enum InputField {
     Org,
     /// 团队版：项目 ID
     Project,
+    /// 设置页：网络代理地址
+    Proxy,
+    /// 设置页：高峰区间开始
+    PeakStart,
+    /// 设置页：高峰区间结束
+    PeakEnd,
 }
 
 /// 自绘输入缓冲
@@ -69,6 +78,9 @@ pub struct PanelInput {
     pub interval: String,
     pub org: String,
     pub project: String,
+    pub proxy: String,
+    pub peak_start: String,
+    pub peak_end: String,
 }
 
 pub struct Panel {
@@ -88,9 +100,18 @@ pub struct Panel {
     pub(crate) anim_full_h: i32,
     pub(crate) anim_bottom: i32,
     pub(crate) caret_ctx: (bool, bool),
+    /// 用户拖动过窗口；重开面板前 place 保持拖后位置而非锚点
+    pub(crate) dragged: bool,
+    /// 本次按下的屏幕坐标；松手时位移小于阈值视为点击而非拖动
+    pub(crate) press_at: Option<(i32, i32)>,
+    /// 手动拖动进行中：光标相对窗口左上的偏移。
+    /// 不用系统 HTCAPTION 模态拖动——Win11 对拖到顶边强制贴靠预览
+    pub(crate) drag_offset: Option<(i32, i32)>,
     class_registered: bool,
     pub(crate) main_h: i32,
     pub(crate) account_error: bool,
+    /// 检查到比当前更新的版本
+    pub update_available: bool,
     pub(crate) outside_since: Option<u64>,
     dpi: f32,
 }
@@ -115,7 +136,11 @@ impl Panel {
             anim_bottom: 0,
             main_h: 300,
             account_error: false,
+            update_available: false,
             caret_ctx: (false, false),
+            dragged: false,
+            press_at: None,
+            drag_offset: None,
             class_registered: false,
             outside_since: None,
             dpi: FALLBACK_DPI,
@@ -137,24 +162,33 @@ impl Panel {
             }
             // 逐段对照 draw_settings 的 y 累加链（dy=0）；间隔行展开 +40、收起 +10：
             PanelView::Settings => {
-                // 有账号：卡片 40 + 卡后间距 8；无账号：添加按钮行 36 含 2 余量
-                let account_block = if accounts > 0 { 48 } else { 38 };
+                // 有账号：卡片 48 + 常驻添加按钮行 36；无账号：仅添加按钮行
+                let account_block = if accounts > 0 { 84 } else { 38 };
                 // 鉴权失败提示行
                 let error_line = if self.account_error { 18 } else { 0 };
                 let base = 42 // 顶部留白 12 + 导航行 30，返回箭头 + 居中标题
-                    + 33 // 账号区标题 21 + 12 余量，该区实绘不带分隔线
+                    + 21 // 账号区标题，实绘不带分隔线
                     + account_block
                     + error_line
                     + 33 // 轮询区标题：分隔线上隙 12 + 标题 21
                     + 40 // 间隔分段控件：段体 30 + 段后间距 10
+                    + 33 // 通用区标题
                     + 63 // 语言行：sub_label 21 + segmented 40 + 行后 2
                     + 63 // 外观行，同语言行
                     + 28 // 开机自启开关行：标题 19 + 行后 9，无描述行
+                    + 33 // 网络代理区标题：同轮询区标题
+                    + 21 // 代理子标签
+                    + 26 // 代理输入框
+                    + 6 // 输入框后下隙，提示文字为框内占位
                     + 33 // 通知区标题：分隔线上隙 12 + 标题 21
                     + 126 // 三个通知开关行：标题 19 + 描述 14 + 行后 9 = 42 × 3
+                    + 67 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
+                    + 73 // 配置管理区：标题 33 + 按钮 28 + 行后 12
                     + 18 // 关于区纯分隔，无标题：上隙 12 + 下隙 6
                     + 29 // 版本行：描边按钮顶偏移 1 + 高 28
-                    + 30; // 底部余量，按钮边框需完整呈现
+                    + 16 // 底部余量，按钮边框需完整呈现
+                    // 有新版时版本行上方的「前往下载」行：按钮 30 + 行距 8
+                    + if self.update_available { 38 } else { 0 };
                 base + if self.customizing_interval { 40 } else { 10 }
             }
         }
@@ -203,6 +237,11 @@ impl Panel {
                     return None;
                 }
             };
+            // 剥掉最大化框：Win11 对可最大化窗口的「拖到顶边 = 贴靠最大化」
+            // 会把拖动中的窗口弹回，无最大化能力则不参与
+            let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+            let nosnap = style & !(WS_MAXIMIZEBOX.0 as isize);
+            let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, nosnap);
             let pref = windows::Win32::Graphics::Dwm::DWMWCP_DEFAULT;
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -210,6 +249,14 @@ impl Panel {
                 &pref as *const _ as *const core::ffi::c_void,
                 std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>()
                     as u32,
+            );
+            // 禁用 DWM 位置过渡：弹出/拖动时的系统平滑会与自绘动画叠加显卡顿
+            let disable: i32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                windows::Win32::Graphics::Dwm::DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disable as *const i32 as *const core::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
             );
             self.hwnd = Some(hwnd);
             Some(hwnd)
@@ -228,26 +275,35 @@ impl Panel {
             self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
             let w = self.px(PANEL_WIDTH);
-            let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
-            let h = self.px(logical_h).min(max_h);
-            let (x, y) = match self.anchor {
-                Some(anchor) => {
-                    let ax = (anchor.left + anchor.right) / 2;
-                    let mut x = ax - w / 2;
-                    let mut y = anchor.top - h - self.px(8);
-                    if x < mi.rcWork.left + 8 {
-                        x = mi.rcWork.left + 8;
-                    }
-                    if x + w > mi.rcWork.right - 8 {
-                        x = mi.rcWork.right - 8 - w;
-                    }
-                    if y < mi.rcWork.top + 8 {
-                        y = mi.rcWork.top + 8;
-                    }
-                    (x, y)
+            let (x, y) = if self.dragged {
+                // 拖动后保持用户位置，只重算高度
+                let mut wr = RECT::default();
+                let _ = GetWindowRect(hwnd, &mut wr);
+                (wr.left, wr.top)
+            } else if let Some(anchor) = self.anchor {
+                let ax = (anchor.left + anchor.right) / 2;
+                let mut x = ax - w / 2;
+                let mut y = anchor.top - self.px(logical_h) - self.px(8);
+                if x < mi.rcWork.left + 8 {
+                    x = mi.rcWork.left + 8;
                 }
-                None => (0, 0),
+                if x + w > mi.rcWork.right - 8 {
+                    x = mi.rcWork.right - 8 - w;
+                }
+                if y < mi.rcWork.top + 8 {
+                    y = mi.rcWork.top + 8;
+                }
+                (x, y)
+            } else {
+                (0, 0)
             };
+            // 拖动后高度受当前位置到工作区底边的空间限制
+            let max_h = if self.dragged {
+                (mi.rcWork.bottom - y - 8).max(self.px(200))
+            } else {
+                (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200))
+            };
+            let h = self.px(logical_h).min(max_h);
             let flags = if show {
                 SWP_SHOWWINDOW | SWP_NOCOPYBITS
             } else {
@@ -266,16 +322,22 @@ impl Panel {
         let Some(hwnd) = self.ensure_window(parent) else {
             return;
         };
+        // 先于 place 读取：place 的 SetWindowPos 带 SWP_SHOWWINDOW 会置可见位
+        let fresh = unsafe { !IsWindowVisible(hwnd).as_bool() };
         self.anchor = Some(anchor);
+        // 拖动仅临时查看；面板重新弹出时回到托盘锚点
+        self.dragged = false;
         let logical_h = self.view_height(accounts);
         self.place(hwnd, logical_h, true);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // 整窗不用 layered alpha——与 HwndRenderTarget 交换链呈现不兼容
-            if let Some(r) = self.renderer.as_mut() {
-                r.anim.appear = Some(anim::Tween::now(180));
+            if fresh {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.anim.appear = Some(anim::Tween::now(180));
+                }
+                start_anim(hwnd);
             }
-            start_anim(hwnd);
             // 巡检首延给足弹出宽限，防弹出瞬间即被误收回
             SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 1200, None);
             let _ = InvalidateRect(Some(hwnd), None, true);
@@ -399,8 +461,8 @@ impl Panel {
             let Some(field) = self.input.field else {
                 return;
             };
-            let (buf, by) = self.caret_anchor(field);
-            let x = layout::INPUT_X + 6.0 + text_width(buf);
+            let (buf, bx, by) = self.caret_anchor(field);
+            let x = bx + 6.0 + text_width(buf);
             // 组合窗锚在框底附近，框顶 +17
             let pt = POINT {
                 x: (x * self.dpi).round() as i32,
@@ -419,8 +481,8 @@ impl Panel {
         }
     }
 
-    /// 光标/IME 共用锚点；y 取自 layout，设置页间隔框依赖 caret_ctx 伸缩
-    fn caret_anchor(&self, field: InputField) -> (&str, f32) {
+    /// 光标/IME 共用锚点；x/y 取自 layout，设置页各框随分区伸缩
+    fn caret_anchor(&self, field: InputField) -> (&str, f32, f32) {
         let y = match field {
             InputField::Name => layout::ADD_NAME_Y,
             InputField::Key => layout::ADD_KEY_Y,
@@ -430,15 +492,26 @@ impl Panel {
             }
             InputField::Org => layout::ADD_ORG_Y,
             InputField::Project => layout::ADD_PROJECT_Y,
+            InputField::Proxy => {
+                let (has_account, auth_error) = self.caret_ctx;
+                layout::proxy_input_y(has_account, auth_error, self.customizing_interval)
+            }
+            InputField::PeakStart | InputField::PeakEnd => {
+                let (has_account, auth_error) = self.caret_ctx;
+                layout::peak_input_y(has_account, auth_error, self.customizing_interval)
+            }
         } + layout::CARET_Y_OFFSET;
-        let buf = match field {
-            InputField::Name => self.input.name.as_str(),
-            InputField::Key => self.input.key.as_str(),
-            InputField::Interval => self.input.interval.as_str(),
-            InputField::Org => self.input.org.as_str(),
-            InputField::Project => self.input.project.as_str(),
+        let (buf, bx) = match field {
+            InputField::Name => (self.input.name.as_str(), layout::INPUT_X),
+            InputField::Key => (self.input.key.as_str(), layout::INPUT_X),
+            InputField::Interval => (self.input.interval.as_str(), layout::INPUT_X),
+            InputField::Org => (self.input.org.as_str(), layout::INPUT_X),
+            InputField::Project => (self.input.project.as_str(), layout::INPUT_X),
+            InputField::Proxy => (self.input.proxy.as_str(), layout::INPUT_X),
+            InputField::PeakStart => (self.input.peak_start.as_str(), layout::PEAK_START_X),
+            InputField::PeakEnd => (self.input.peak_end.as_str(), layout::PEAK_END_X),
         };
-        (buf, y)
+        (buf, bx, y)
     }
 
     /// 按字段内容计算光标位置，与 input_field 绘制对齐。
@@ -446,8 +519,8 @@ impl Panel {
         let Some(field) = self.input.field else {
             return;
         };
-        let (buf, by) = self.caret_anchor(field);
-        let x = layout::INPUT_X + 6.0 + text_width(buf);
+        let (buf, bx, by) = self.caret_anchor(field);
+        let x = bx + 6.0 + text_width(buf);
         // by 已含 CARET_Y_OFFSET，框内垂直居中
         let y = by;
         unsafe {
@@ -488,8 +561,6 @@ pub extern "system" fn panel_wndproc(
     unsafe {
         match msg {
             WM_PAINT => {
-                #[cfg(debug_assertions)]
-                let t0 = std::time::Instant::now();
                 // 不走 BeginPaint：验证客户区后直接渲染
                 let _ = ValidateRect(Some(hwnd), None);
                 let app = app_from_tray(hwnd);
@@ -505,13 +576,6 @@ pub extern "system" fn panel_wndproc(
                         r.paint(hwnd, &rect, &app.panel, &model, view, dpi);
                     }
                     app.panel.renderer = renderer;
-                }
-                #[cfg(debug_assertions)]
-                {
-                    let dt = t0.elapsed();
-                    if dt.as_millis() > 30 {
-                        eprintln!("[Quotify] WM_PAINT 耗时 {}ms", dt.as_millis());
-                    }
                 }
                 LRESULT(0)
             }
@@ -545,8 +609,11 @@ pub extern "system" fn panel_wndproc(
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
-                                // 子控件同样算在面板内
-                                let in_panel = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
+                                // 子控件与账号弹窗同样算在面板内，光标移向弹窗不能收起
+                                let root = GetAncestor(w, GA_ROOT);
+                                let in_panel = w == hwnd
+                                    || root == hwnd
+                                    || app.popup.hwnd.is_some_and(|p| root == p);
                                 // 正在输入则绝不收起
                                 let focus_in_panel = app.panel.input.field.is_some()
                                     || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
@@ -573,6 +640,34 @@ pub extern "system" fn panel_wndproc(
                 }
             }
             WM_MOUSEMOVE => {
+                let mut app = app_from_tray(hwnd);
+                // 手动拖动跟随：光标减按下偏移，钳制在工作区内
+                if let Some(app) = app.as_mut()
+                    && let Some((ox, oy)) = app.panel.drag_offset
+                {
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
+                    let mut wr = RECT::default();
+                    let _ = GetWindowRect(hwnd, &mut wr);
+                    let w = wr.right - wr.left;
+                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                    let mut mi = MONITORINFO {
+                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                        ..Default::default()
+                    };
+                    let _ = GetMonitorInfoW(monitor, &mut mi);
+                    // 四方向都可越出屏幕，仅保留窗口一角在工作区内可抓回
+                    let x = (cursor.x - ox).clamp(
+                        mi.rcWork.left - w + 64,
+                        (mi.rcWork.right - 64).max(mi.rcWork.left - w + 64),
+                    );
+                    let y = (cursor.y - oy).clamp(
+                        mi.rcWork.top - (wr.bottom - wr.top) + 64,
+                        mi.rcWork.bottom - 48,
+                    );
+                    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                    return LRESULT(0);
+                }
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
                     if !app.panel.hovered {
@@ -623,12 +718,33 @@ pub extern "system" fn panel_wndproc(
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
+                let mut app = app_from_tray(hwnd);
+                // 手动拖动结束：恢复完整高度并记拖动态
+                if let Some(app) = app.as_mut()
+                    && app.panel.drag_offset.take().is_some()
+                {
+                    let _ = ReleaseCapture();
+                    app.panel.dragged = true;
+                    let n = app.config.accounts.len();
+                    let logical_h = app.panel.view_height(n);
+                    app.panel.place(hwnd, logical_h, true);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    return LRESULT(0);
+                }
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
-                    let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
-                    let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
-                    if let Some(hit) = hit {
-                        crate::app::handle_panel_hit(app, hit, hwnd);
+                    // 按下→松手位移过大视为拖动尾程，不触发点击
+                    let moved_far = app.panel.press_at.take().is_some_and(|(px, py)| {
+                        let mut cursor = POINT::default();
+                        let _ = GetCursorPos(&mut cursor);
+                        (cursor.x - px).abs() + (cursor.y - py).abs() > 8
+                    });
+                    if !moved_far {
+                        let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
+                        let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
+                        if let Some(hit) = hit {
+                            crate::app::handle_panel_hit(app, hit, hwnd);
+                        }
                     }
                 }
                 LRESULT(0)
@@ -648,6 +764,9 @@ pub extern "system" fn panel_wndproc(
                             Some(InputField::Key) => &mut input.key,
                             Some(InputField::Org) => &mut input.org,
                             Some(InputField::Project) => &mut input.project,
+                            Some(InputField::Proxy) => &mut input.proxy,
+                            Some(InputField::PeakStart) => &mut input.peak_start,
+                            Some(InputField::PeakEnd) => &mut input.peak_end,
                             _ => &mut input.interval,
                         };
                         match char::from_u32(ch as u32) {
@@ -675,6 +794,45 @@ pub extern "system" fn panel_wndproc(
                     }
                     app.panel.update_caret();
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONDOWN => {
+                // 任意空白处按下进入手动拖动，长设置页可拖到可视范围。
+                // 不用系统 HTCAPTION 模态拖动：Win11 拖到屏幕顶边会强制贴靠预览
+                let mut app = app_from_tray(hwnd);
+                let (x, y) = if let Some(app) = app.as_ref() {
+                    (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi)
+                } else {
+                    (0.0, 0.0)
+                };
+                let hit_none = app
+                    .as_ref()
+                    .and_then(|a| a.panel.renderer.as_ref())
+                    .map(|r| r.hit_at(x, y).is_none())
+                    .unwrap_or(true);
+                let mut cursor = POINT::default();
+                let _ = GetCursorPos(&mut cursor);
+                if let Some(app) = app.as_mut() {
+                    app.panel.press_at = Some((cursor.x, cursor.y));
+                    if hit_none {
+                        let mut wr = RECT::default();
+                        let _ = GetWindowRect(hwnd, &mut wr);
+                        app.panel.drag_offset = Some((cursor.x - wr.left, cursor.y - wr.top));
+                        let _ = SetCapture(hwnd);
+                    }
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_EXITSIZEMOVE => {
+                let app = app_from_tray(hwnd);
+                if let Some(app) = app {
+                    // 拖动结束：保持当前位置恢复完整高度
+                    app.panel.dragged = true;
+                    let n = app.config.accounts.len();
+                    let logical_h = app.panel.view_height(n);
+                    app.panel.place(hwnd, logical_h, true);
+                    let _ = InvalidateRect(Some(hwnd), None, true);
                 }
                 LRESULT(0)
             }

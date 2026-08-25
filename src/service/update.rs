@@ -18,7 +18,6 @@ struct GithubRelease {
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub tag: String,
-    #[allow(dead_code)]
     pub url: String,
 }
 

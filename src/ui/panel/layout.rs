@@ -30,15 +30,48 @@ pub const ADD_PROJECT_Y: f32 = 365.0;
 /// caret 高 16 在 26 高框内垂直居中的偏移
 pub const CARET_Y_OFFSET: f32 = 5.0;
 
+/// 高峰区间输入框 x（设置页内容区 pad = 20）
+pub const PEAK_START_X: f32 = 48.0;
+pub const PEAK_END_X: f32 = 148.0;
+
 /// 设置页自定义间隔输入框顶 y，随账号块与错误行伸缩
 pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
     let mut y = 12.0 + NAV_H + SECTION_LABEL_H;
+    // 有账号：卡片 40 + 间距 8；随后常驻的添加按钮行再占 36
     y += if has_account {
-        40.0 + 8.0 + if auth_error { 18.0 } else { 0.0 }
+        40.0 + 8.0 + if auth_error { 18.0 } else { 0.0 } + 36.0
     } else {
         36.0
     };
     y + 12.0 + SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP + 2.0
+}
+
+/// 设置页高峰区间输入行顶 y，位于通知区之后
+pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
+    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流已含 +10 间隙，比 IY 多 8
+    let after_interval = if customizing { 38.0 } else { 8.0 };
+    interval_input_y(has_account, auth_error)
+        + after_interval
+        + 33.0 // 通知区标题
+        + 126.0 // 三个通知开关行
+        + 33.0 // 高峰区间区标题
+}
+
+/// 设置页代理输入框顶 y，与 draw_settings 的 y 推进链逐段对齐
+pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
+    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流已含 +10 间隙，比 IY 多 8
+    let after_interval = if customizing { 38.0 } else { 8.0 };
+    interval_input_y(has_account, auth_error)
+        + after_interval
+        + 33.0 // 通知区标题
+        + 126.0 // 三个通知开关行
+        + 67.0 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
+        + 33.0 // 通用区标题
+        + 63.0 // 语言行
+        + 63.0 // 外观行
+        + 28.0 // 开机自启行
+        + 33.0 // 网络代理区标题
+        + 21.0 // 代理子标签
 }
 
 /// 添加页总高（逻辑像素），团队版追加组织/项目两行

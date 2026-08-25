@@ -657,8 +657,8 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
 
 /// 应用自定义轮询间隔（分钟）
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
-    if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0) {
-        if let Some(secs) = mins.checked_mul(60) {
+    if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0)
+        && let Some(secs) = mins.checked_mul(60) {
             app.config.general.poll_interval_secs = secs.max(MIN_POLL_SECS);
             crate::app::config::save(&app.config);
             app.sync_poll_context();
@@ -666,7 +666,6 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
                 p.reschedule();
             }
         }
-    }
     sync_customizing(app);
     app.panel.clear_input(panel_hwnd);
     relayout_panel(app, panel_hwnd);

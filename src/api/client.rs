@@ -134,16 +134,33 @@ fn http_get_text(
     }
     let resp = req.call().map_err(|e| FetchError::Network(e.to_string()))?;
     let status = resp.status().as_u16();
-    if status == 401 || status == 403 {
-        return Err(FetchError::Auth);
-    }
     if !(200..=299).contains(&status) {
         // 错误路径 body 只进消息前缀，读取失败按空串处理
         let body = read_body_capped(resp.into_body()).unwrap_or_default();
         let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
-        return Err(FetchError::Api(format!("HTTP {status}: {prefix}")));
+        return Err(classify_status(status, &prefix).expect("非 2xx 必有分类"));
     }
     read_body_capped(resp.into_body()).map_err(|e| FetchError::Network(e.to_string()))
+}
+
+/// 非 2xx 状态分类：401/403 → `Auth`，429/5xx → `Network`，其余 → `Api`
+fn classify_status(status: u16, detail: &str) -> Option<FetchError> {
+    if status == 401 || status == 403 {
+        return Some(FetchError::Auth);
+    }
+    if (200..=299).contains(&status) {
+        return None;
+    }
+    let text = if detail.is_empty() {
+        format!("HTTP {status}")
+    } else {
+        format!("HTTP {status}: {detail}")
+    };
+    Some(if status == 429 || status >= 500 {
+        FetchError::Network(text)
+    } else {
+        FetchError::Api(text)
+    })
 }
 
 /// 按上限读 body；无效 UTF-8 以 `?` 替换，对齐 ureq 默认行为
@@ -170,4 +187,29 @@ fn fetch_quota(
     }
     let body_text = http_get_text(agent_long(), &url, auth, &extra)?;
     parse_response(&body_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_status;
+    use crate::api::FetchError;
+
+    #[test]
+    fn status_classification() {
+        assert!(classify_status(200, "").is_none());
+        assert!(classify_status(204, "").is_none());
+        assert!(matches!(classify_status(401, "denied"), Some(FetchError::Auth)));
+        assert!(matches!(classify_status(403, ""), Some(FetchError::Auth)));
+        assert!(matches!(classify_status(429, "Too Many Requests"), Some(FetchError::Network(_))));
+        assert!(matches!(classify_status(500, ""), Some(FetchError::Network(_))));
+        assert!(matches!(classify_status(503, "busy"), Some(FetchError::Network(_))));
+        // 其余非 2xx 为确定性业务错误
+        assert!(matches!(classify_status(404, "nope"), Some(FetchError::Api(_))));
+        assert!(matches!(classify_status(400, ""), Some(FetchError::Api(_))));
+        // detail 拼接格式
+        assert_eq!(
+            classify_status(429, "slow down").unwrap().to_string(),
+            "HTTP 429: slow down"
+        );
+    }
 }

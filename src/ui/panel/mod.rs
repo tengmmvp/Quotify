@@ -726,7 +726,7 @@ fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
     }
 }
 
-/// 等宽 12px 字号下的字符实测宽度
+/// 等宽 12px 字号下的字符经验宽度
 fn text_width(s: &str) -> f32 {
     s.chars().map(|c| if c.is_ascii() { 7.3 } else { 12.5 }).sum()
 }

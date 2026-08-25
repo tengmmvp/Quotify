@@ -147,9 +147,10 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-/// `unit` 时间单位代码 → 分钟乘数
+/// `unit` 单位代码 → 分钟乘数：1/4=天、3=小时、5=月、6=周
 fn window_minutes(item: &Value) -> Option<i64> {
-    const MULTIPLIERS: &[(i64, i64)] = &[(1, 1440), (3, 60), (4, 1440), (5, 1), (6, 10080)];
+    const MULTIPLIERS: &[(i64, i64)] =
+        &[(1, 1440), (3, 60), (4, 1440), (5, 30 * 24 * 60), (6, 10080)];
     let unit = item.get("unit").and_then(Value::as_i64)?;
     let number = item.get("number").and_then(Value::as_i64).filter(|&n| n > 0)?;
     MULTIPLIERS
@@ -164,16 +165,28 @@ fn limits_of(data: &Value) -> Option<&Vec<Value>> {
         .or_else(|| data.as_array())
 }
 
+/// 条目类型标识
+fn entry_kind(item: &Value) -> &str {
+    item.get("type")
+        .or_else(|| item.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
 /// 额度桶判定
 fn is_quota_entry(item: &Value) -> bool {
-    let t = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let t = entry_kind(item);
     t.eq_ignore_ascii_case("TOKENS_LIMIT") || t.eq_ignore_ascii_case("CREDIT_LIMIT")
 }
 
 fn is_credit_entry(item: &Value) -> bool {
-    item.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|t| t.eq_ignore_ascii_case("CREDIT_LIMIT"))
+    entry_kind(item).eq_ignore_ascii_case("CREDIT_LIMIT")
+}
+
+/// MCP 通道判定：TIME_LIMIT 为主，MCP_LIMIT 为别名
+fn is_mcp_entry(item: &Value) -> bool {
+    let t = entry_kind(item);
+    t.eq_ignore_ascii_case("TIME_LIMIT") || t.eq_ignore_ascii_case("MCP_LIMIT")
 }
 
 fn parse_reset_time(item: &Value) -> Option<DateTime<Utc>> {
@@ -255,7 +268,6 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
 
     if let Some(limits) = limits_of(data) {
         for item in limits {
-            let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
             if is_quota_entry(item) {
                 quota_count += 1;
                 has_credit |= is_credit_entry(item);
@@ -264,7 +276,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                     Some(minutes) => timed.push((bucket, minutes)),
                     None => unclassified.push(bucket),
                 }
-            } else if kind.eq_ignore_ascii_case("TIME_LIMIT") {
+            } else if is_mcp_entry(item) {
                 let bucket = parse_bucket(item);
                 mcp = Some(McpUsage {
                     used_percent: bucket.used_percent,
@@ -323,17 +335,22 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
     }
 }
 
-/// 信封内业务失败
+/// 信封内业务失败分类：401/403/1000/1001 与鉴权关键词归 `Auth`，
+/// 1309 与 "coding plan" 无套餐归 `EmptyLimits`，其余归 `Api`
 fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
     let m = msg.to_ascii_lowercase();
     if code == Some(401)
         || code == Some(403)
+        || code == Some(1000)
+        || code == Some(1001)
         || m.contains("unauthorized")
         || m.contains("token")
         || m.contains("api key")
         || m.contains("apikey")
     {
         FetchError::Auth
+    } else if code == Some(1309) || m.contains("coding plan") {
+        FetchError::EmptyLimits
     } else {
         FetchError::Api(msg.to_string())
     }
@@ -493,10 +510,46 @@ mod tests {
             r#"{ "code": 401, "msg": "Unauthorized", "data": null, "success": false }"#,
             r#"{ "success": false, "msg": "token invalid" }"#,
             r#"{ "success": true, "code": 403, "msg": "forbidden" }"#,
+            // 业务码族 1000/1001 也是鉴权失败
+            r#"{ "success": false, "code": 1001, "msg": "auth required" }"#,
+            r#"{ "success": false, "code": 1000, "msg": "" }"#,
         ] {
             let err = parse_response(body).unwrap_err();
             assert!(matches!(err, FetchError::Auth), "{body} → {err:?}");
         }
+    }
+
+    /// 1309 = 套餐过期；msg 含 "coding plan" = key 有效但无编码套餐
+    /// （该形态信封 code 为 500，不能按码判）
+    #[test]
+    fn in_band_plan_state_maps_to_empty_limits() {
+        for body in [
+            r#"{ "success": false, "code": 1309, "msg": "plan expired" }"#,
+            r#"{ "success": false, "code": 500, "msg": "No coding plan found for this key" }"#,
+        ] {
+            let err = parse_response(body).unwrap_err();
+            assert!(matches!(err, FetchError::EmptyLimits), "{body} → {err:?}");
+        }
+    }
+
+    /// MCP 通道接受 MCP_LIMIT 别名；类型字段可由 name 承载
+    #[test]
+    fn mcp_alias_and_name_field() {
+        let body = r#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "name": "MCP_LIMIT", "usage": 400, "currentValue": 40, "remaining": 360,
+                      "usageDetails": [ { "modelCode": "search-prime", "usage": 40 } ] },
+                    { "name": "TOKENS_LIMIT", "unit": 3, "number": 5, "percentage": 8.0 }
+                ]
+            }
+        }"#;
+        let snap = parse_response(body).unwrap();
+        let mcp = snap.mcp.unwrap();
+        assert_eq!(mcp.total, 400.0);
+        assert_eq!(mcp.current_value, 40.0);
+        assert!((snap.five_hour.unwrap().used_percent - 8.0).abs() < 1e-9);
     }
 
     #[test]
@@ -603,7 +656,7 @@ mod tests {
         }
     }
 
-    /// 2026-08-25 控制台实测样本（bigmodel.cn）：单 5h 桶 + MCP 明细，level 小写 "max"
+    /// 真实响应形态：单 5h 桶 + MCP 明细，level 小写 "max"
     #[test]
     fn real_console_sample_single_bucket_with_mcp_details() {
         let body = r#"{

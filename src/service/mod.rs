@@ -1,4 +1,4 @@
-//! 后台服务：用量轮询、检查更新。
+//! 后台服务
 
 pub mod poller;
 pub mod update;

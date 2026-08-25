@@ -1,4 +1,4 @@
-//! 检查更新：查询 GitHub Releases 最新版本，只提示不自动安装。
+//! 检查更新
 
 use serde::Deserialize;
 
@@ -14,16 +14,15 @@ struct GithubRelease {
     prerelease: bool,
 }
 
+/// 最新稳定 Release
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub tag: String,
-    /// Release 页面链接（「前往下载」跳转用）
     #[allow(dead_code)]
     pub url: String,
 }
 
-/// 查询最新 Release。阻塞调用，UI 侧应在后台线程触发。
-/// 复用 client 的长超时共享 Agent（连接池 + 仅 HTTPS）。
+/// 查询最新 Release
 pub fn check_latest() -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = agent_long()
@@ -31,7 +30,7 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
         // GitHub API 强制要求 User-Agent
         .header("User-Agent", format!("quotify/{}", env!("CARGO_PKG_VERSION")))
         .call()
-        .map_err(|e| format!("网络错误: {e}"))?;
+        .map_err(|e| format!("network error: {e}"))?;
 
     if !resp.status().is_success() {
         return Err(format!("HTTP {}", resp.status()));
@@ -39,17 +38,16 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     let rel: GithubRelease = resp
         .into_body()
         .into_with_config()
-        // 与用量查询同样的防御上限，防异常超大响应
         .limit(MAX_BODY_BYTES)
         .read_json()
-        .map_err(|e| format!("解析失败: {e}"))?;
+        .map_err(|e| format!("parse failed: {e}"))?;
     if rel.draft || rel.prerelease {
-        return Err("无正式版本".into());
+        return Err("no stable release".into());
     }
     Ok(ReleaseInfo { tag: rel.tag_name, url: rel.html_url })
 }
 
-/// 比较当前版本与远端 tag（均按 "v0.1.0" / "0.1.0" 宽松解析）。
+/// 比较当前版本与远端 tag
 pub fn is_newer(remote_tag: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
         s.trim_start_matches('v')

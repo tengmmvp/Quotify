@@ -1,7 +1,4 @@
-//! 系统托盘：Shell_NotifyIcon（v4 协议）封装。
-//!
-//! v4 协议下回调消息 lParam 的 LOWORD 是通知码（`NIN_POPUPOPEN` 等），
-//! HIWORD 是图标 id；这让我们能拿到「鼠标悬停/离开」事件驱动面板弹出。
+//! 系统托盘
 
 use crate::platform::msg::WM_APP_TRAY;
 use crate::platform::{log, wide};
@@ -14,11 +11,11 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
-/// v4 通知码（lParam LOWORD）。
+/// v4 通知码（lParam LOWORD）
 pub const NIN_POPUPOPEN: u32 = 0x0406;
 pub const NIN_POPUPCLOSE: u32 = 0x0407;
 
-/// 托盘图标封装：注册 / 更新 / 定位 / 移除。
+/// 托盘图标封装：注册 / 更新 / 定位 / 移除
 pub struct TrayIcon {
     hwnd: HWND,
     id: u32,
@@ -35,7 +32,7 @@ fn base_data(hwnd: HWND, id: u32) -> NOTIFYICONDATAW {
 }
 
 impl TrayIcon {
-    /// 注册托盘图标。`hwnd` 为接收回调消息的隐藏窗口。
+    /// 注册托盘图标：`hwnd` 为接收回调消息的隐藏窗口。
     pub fn new(hwnd: HWND, hicon: HICON) -> Option<Self> {
         unsafe {
             let mut nid = base_data(hwnd, 1);
@@ -50,7 +47,6 @@ impl TrayIcon {
                 ));
                 return None;
             }
-            // 升级 v4 协议以获得 NIN_POPUPOPEN/POPUPCLOSE 悬停通知
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool() {
                 Some(Self { hwnd, id: 1, registered: true })
@@ -61,7 +57,7 @@ impl TrayIcon {
         }
     }
 
-    /// 更新图标（环形进度变化时）。
+    /// 更新托盘图标
     pub fn update_icon(&self, hicon: HICON) {
         let mut nid = base_data(self.hwnd, self.id);
         nid.uFlags = NIF_ICON;
@@ -71,12 +67,12 @@ impl TrayIcon {
         }
     }
 
-    /// 托盘图标 id（通知等 API 需要）。
+    /// 托盘图标 id，通知等 API 需要。
     pub fn tray_id(&self) -> u32 {
         self.id
     }
 
-    /// 托盘图标在屏幕上的矩形（面板弹出定位锚点）。
+    /// 托盘图标在屏幕上的矩形，面板弹出的定位锚点
     pub fn rect(&self) -> Option<RECT> {
         let ident = NOTIFYICONIDENTIFIER {
             cbSize: std::mem::size_of::<NOTIFYICONIDENTIFIER>() as u32,
@@ -87,7 +83,7 @@ impl TrayIcon {
         unsafe { Shell_NotifyIconGetRect(&ident).ok() }
     }
 
-    /// 移除托盘图标（退出时必须调用，否则任务栏残留幽灵图标）。
+    /// 移除托盘图标：退出时必须调用，否则任务栏残留幽灵图标。
     pub fn remove(&mut self) {
         if self.registered {
             let nid = base_data(self.hwnd, self.id);
@@ -120,7 +116,7 @@ pub fn parse_callback(lparam: LPARAM) -> (u32, u32) {
     (lo, hi)
 }
 
-/// v4 下 WM_CONTEXTMENU 的坐标在 wParam（屏幕坐标）。
+/// v4 下 WM_CONTEXTMENU 的坐标在 wParam，为屏幕坐标。
 pub fn context_menu_pos(wparam: WPARAM) -> POINT {
     POINT {
         x: (wparam.0 & 0xFFFF) as u16 as i16 as i32,

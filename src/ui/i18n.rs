@@ -1,21 +1,21 @@
-//! 界面文案：中英双语，默认跟随系统语言，可在设置页手动切换。
+//! 界面文案
 
-/// 生效语言。
+/// 生效语言
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
     Zh,
     En,
 }
 
-/// 系统语言检测（Win32 `GetUserDefaultUILanguage`）。
+/// 系统语言检测
 pub fn detect_system_lang() -> Lang {
     use windows::Win32::Globalization::GetUserDefaultUILanguage;
     let lang_id = unsafe { GetUserDefaultUILanguage() };
-    // 0x0804 = 简体中文（中国），0x0404 = 繁体中文（台湾），0x0C04 = 香港
+    // 0x0804 = 简体中文（中国），0x0404 = 繁体中文（中国台湾），0x0C04 = 繁体中文（中国香港）
     matches!(lang_id, 0x0804 | 0x0404 | 0x0C04).then_some(Lang::Zh).unwrap_or(Lang::En)
 }
 
-/// 解析配置里的语言设置；空/None 跟随系统。
+/// 解析配置里的语言设置
 pub fn resolve_lang(setting: Option<&str>) -> Lang {
     match setting.map(str::trim) {
         Some(s) if s.eq_ignore_ascii_case("zh") => Lang::Zh,
@@ -24,21 +24,17 @@ pub fn resolve_lang(setting: Option<&str>) -> Lang {
     }
 }
 
-/// 全部界面文案。字段即文案 key，双语各一份常量表；新增字段须两表
-/// 同步补齐，占位符名称集合的一致性由本文件 tests 逐字段核对。
+/// 全部界面文案
 pub struct Strings {
     // ── 主视图 ──
     pub five_hour: &'static str,
     pub weekly: &'static str,
     pub mcp_tools: &'static str,
-    /// 指标行脚注：`{t}` 倒计时
     pub resets_line: &'static str,
-    /// 绝对值脚注：`{cur}` 当前用量、`{tot}` 总量
     pub used_of: &'static str,
     pub usage_section: &'static str,
     pub balance_label: &'static str,
     pub updated_just_now: &'static str,
-    /// 底部更新时间：`{t}` 时长（如「2 分钟」/「2m」）
     pub updated_ago: &'static str,
     pub data_as_of: &'static str,
     pub fetch_failed: &'static str,
@@ -49,6 +45,18 @@ pub struct Strings {
     pub not_configured_hint: &'static str,
     pub loading: &'static str,
     pub key_invalid: &'static str,
+
+    // ── 错误提示 ──
+    /// 凭据失效（`FetchError::Auth`）：错误卡主文案
+    pub err_auth: &'static str,
+    /// 空 limits（`FetchError::EmptyLimits`）：key 无套餐权限 / 团队版缺选择头
+    pub err_empty: &'static str,
+    /// 业务错误前缀（`FetchError::Api`）：与 detail 拼成「前缀: 细节」
+    pub err_api: &'static str,
+    /// 网络错误前缀（`FetchError::Network`）：拼接方式同上
+    pub err_network: &'static str,
+    /// 检查更新失败，对应 `service::update` 的 Err
+    pub err_update: &'static str,
 
     // ── 通用 ──
     pub cancel: &'static str,
@@ -66,7 +74,6 @@ pub struct Strings {
     pub apply: &'static str,
     pub language: &'static str,
     pub follow_system: &'static str,
-    /// 外观（主题模式）分段：跟随系统 / 浅色 / 深色
     pub appearance_section: &'static str,
     pub theme_light: &'static str,
     pub theme_dark: &'static str,
@@ -79,26 +86,21 @@ pub struct Strings {
     pub notify_reset_weekly_desc: &'static str,
     pub autostart: &'static str,
     pub accounts_section: &'static str,
-    /// 添加账号页的区块标题（平台 + 个人版/团队版 + 凭据）
     pub platform_section: &'static str,
     pub add_account: &'static str,
     pub account_name: &'static str,
     pub account_platform: &'static str,
     pub platform_cn: &'static str,
     pub platform_intl: &'static str,
-    /// 账号类型分段标签
     pub account_type_label: &'static str,
     pub type_personal: &'static str,
     pub type_team: &'static str,
-    /// 团队版账号卡上的短名牌
     pub team_badge: &'static str,
-    /// 团队版选择头输入（组织 / 项目 ID）
     pub org_id_label: &'static str,
     pub project_id_label: &'static str,
     pub api_key_label: &'static str,
     pub check_update: &'static str,
     pub up_to_date: &'static str,
-    pub update_check_failed: &'static str,
     pub version_label: &'static str,
 
     // ── 通知 ──
@@ -132,6 +134,12 @@ const ZH: Strings = Strings {
     not_configured_hint: "进入设置，添加 GLM Coding Plan 账号即可开始使用",
     loading: "加载中…",
     key_invalid: "[提示] API key 无效，请在设置中检查",
+
+    err_auth: "API key 无效或已失效",
+    err_empty: "未返回额度数据：请确认 API key 属于编码套餐（团队版需填写组织/项目 ID）",
+    err_api: "接口错误",
+    err_network: "网络错误",
+    err_update: "检查更新失败",
 
     cancel: "取消",
     save: "保存",
@@ -174,7 +182,6 @@ const ZH: Strings = Strings {
     api_key_label: "API Key",
     check_update: "检查更新",
     up_to_date: "已是最新版本",
-    update_check_failed: "检查更新失败",
     version_label: "当前版本：{v}",
 
     notify_threshold_title: "额度预警",
@@ -188,7 +195,6 @@ const ZH: Strings = Strings {
 };
 
 const EN: Strings = Strings {
-    // 英文措辞对齐 ai-usagebar（Session (5h) / Weekly / MCP tools）
     five_hour: "Session (5h)",
     weekly: "Weekly",
     mcp_tools: "MCP tools",
@@ -207,6 +213,12 @@ const EN: Strings = Strings {
     not_configured_hint: "Open Settings and add a GLM Coding Plan account to get started",
     loading: "Loading…",
     key_invalid: "[Note] Invalid API key. Check it in Settings",
+
+    err_auth: "Invalid or expired API key",
+    err_empty: "No quota data: make sure the API key belongs to a Coding Plan (team accounts need Organization/Project IDs)",
+    err_api: "API error",
+    err_network: "Network error",
+    err_update: "Update check failed",
 
     cancel: "Cancel",
     save: "Save",
@@ -249,7 +261,6 @@ const EN: Strings = Strings {
     api_key_label: "API Key",
     check_update: "Check for updates",
     up_to_date: "Up to date",
-    update_check_failed: "Update check failed",
     version_label: "Version: {v}",
 
     notify_threshold_title: "Quota alert",
@@ -275,8 +286,7 @@ impl Lang {
 mod tests {
     use super::*;
 
-    /// 手写扫描提取文案中 `{name}` 占位符名，返回排序去重集合。
-    /// 不引 regex 依赖：逐字节找 `{`，取到最近的 `}` 为止。
+    /// 提取 `{name}` 占位符名并排序去重；不引 regex 依赖
     fn placeholder_set(s: &str) -> Vec<&str> {
         let mut names = Vec::new();
         let bytes = s.as_bytes();
@@ -285,7 +295,7 @@ mod tests {
             if bytes[i] == b'{'
                 && let Some(end) = s[i + 1..].find('}') {
                     names.push(&s[i + 1..i + 1 + end]);
-                    i += end + 2; // 跳过 `{name}` 整段
+                    i += end + 2;
                     continue;
                 }
             i += 1;
@@ -295,9 +305,8 @@ mod tests {
         names
     }
 
-    /// 双语表逐字段核对占位符名集合一致：渲染层按名字做 `{t}`.replace，
-    /// 一头改了占位符另一头漏改就会在运行时留下未替换的原文。
-    /// 新增字段时须在 check! 列表同步补一行，漏补则该字段不参与核对。
+    /// 双语占位符名集合须一致——渲染层按名 replace，漏改留原文；
+    /// 新增字段须同步补进 check! 列表。
     #[test]
     fn zh_en_placeholders_match() {
         let (zh, en) = (&ZH, &EN);
@@ -325,8 +334,9 @@ mod tests {
             accounts_section, platform_section, add_account, account_name,
             account_platform, platform_cn, platform_intl, account_type_label,
             type_personal, type_team, team_badge, org_id_label, project_id_label,
-            api_key_label, check_update, up_to_date, update_check_failed,
-            version_label, notify_threshold_title, notify_reset_5h,
+            api_key_label, check_update, up_to_date, err_auth, err_empty,
+            err_api, err_network, err_update, version_label,
+            notify_threshold_title, notify_reset_5h,
             notify_reset_weekly, unit_day, unit_hour, unit_minute, unit_second,
         );
     }

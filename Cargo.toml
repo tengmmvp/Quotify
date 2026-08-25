@@ -5,7 +5,6 @@ edition = "2024"
 description = "GLM Coding Plan usage widget for the Windows taskbar tray"
 license = "GPL-3.0-only"
 
-# 品牌统一首字母大写：产物为 Quotify.exe（任务管理器/进程名）
 [[bin]]
 name = "Quotify"
 path = "src/main.rs"

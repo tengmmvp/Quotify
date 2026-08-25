@@ -1,11 +1,11 @@
-//! 开机自启：HKCU\...\Run 注册表键（仅当前用户，无需管理员权限）。
+//! 开机自启
 
 use windows_registry::CURRENT_USER;
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const VALUE_NAME: &str = "Quotify";
 
-/// 当前自启是否开启。
+/// 当前自启是否开启
 pub fn is_enabled() -> bool {
     CURRENT_USER
         .open(RUN_KEY)
@@ -13,7 +13,7 @@ pub fn is_enabled() -> bool {
         .is_ok_and(|v| !v.trim().is_empty())
 }
 
-/// 开启/关闭自启。值为带引号的 exe 完整路径（路径含空格时必需）。
+/// 开启/关闭自启
 pub fn set_enabled(on: bool) -> Result<(), String> {
     let key = CURRENT_USER
         .create(RUN_KEY)
@@ -25,7 +25,7 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         key.set_string(VALUE_NAME, &quoted)
             .map_err(|e| format!("写入自启注册表失败: {e}"))
     } else {
-        // 值不存在时删除也视为成功（幂等）
+        // 值不存在时删除也视为成功，幂等
         match key.remove_value(VALUE_NAME) {
             Ok(()) => Ok(()),
             // ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND

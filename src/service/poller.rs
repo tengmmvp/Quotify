@@ -1,9 +1,4 @@
-//! 后台轮询线程：按可变间隔拉取用量，结果 PostMessage 回主线程。
-//!
-//! 唤醒语义：`wake` 事件被设置时——手动刷新（refresh_now）立即拉取并
-//! 重置计时；间隔/账号变更（reschedule）不立即拉取，但按当前间隔重排
-//! 下一轮，保证新间隔即刻生效；自然到期同样拉取。线程只在等待与请求时
-//! 占用，无轮询空转。
+//! 后台轮询线程
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,21 +9,19 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleO
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::api::client::AccountSpec;
-// 消息号统一由 platform::msg 分配；对 app 层保持 `poller::WM_APP_POLL_RESULT`
-// 旧路径可用（pub(crate) 再导出）
+use crate::app::config::MIN_POLL_SECS;
 pub(crate) use crate::platform::msg::WM_APP_POLL_RESULT;
 
-/// 一次轮询的结果（跨线程传递给主线程）。
+/// 一次轮询的结果，跨线程传递给主线程。
 pub enum PollOutcome {
     Success(Box<crate::api::UsageSnapshot>),
     Failure(Box<crate::api::FetchError>),
 }
 
-/// poller 眼中的「当前要查什么」。主线程在配置/选中账号变更时更新。
 pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
-/// 当前轮询间隔（秒）。主线程在设置变更时更新。
 pub type PollInterval = Arc<Mutex<u64>>;
 
+/// 后台轮询线程的所有者：发唤醒/停止信号，drop 时 join 回收。
 pub struct Poller {
     wake: HANDLE,
     stop: HANDLE,
@@ -37,8 +30,7 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// 启动轮询线程。`hwnd` 接收 `WM_APP_POLL_RESULT`（wparam 为
-    /// `Box::into_raw(Box<PollOutcome>)`，主线程负责取回并释放）。
+    /// 启动轮询线程
     pub fn spawn(hwnd: windows::Win32::Foundation::HWND, target: PollTarget, interval: PollInterval) -> Option<Self> {
         unsafe {
             let wake = CreateEventW(None, false, false, None).ok()?;
@@ -46,8 +38,7 @@ impl Poller {
             let refresh_requested = Arc::new(AtomicBool::new(false));
             let flag = refresh_requested.clone();
 
-            // Win32 句柄是内核对象引用，跨线程移动安全；HANDLE 裸指针
-            // 包装不实现 Send，这里显式声明。
+            // Win32 句柄是内核对象引用、跨线程移动安全，但 HANDLE 未实现 Send
             struct SendHandle<T>(T);
             unsafe impl<T> Send for SendHandle<T> {}
 
@@ -55,8 +46,7 @@ impl Poller {
             let thread = std::thread::Builder::new()
                 .name("quotify-poller".into())
                 .spawn(move || {
-                    // 先移动整个 SendHandle 到闭包局部，避免 2021 精准捕获
-                    // 直接捕获内部的裸 HWND/HANDLE 导致闭包不满足 Send
+                    // 先把 SendHandle 移入闭包局部，防 2021 精准捕获绕过包装破坏 Send
                     let (h, w, s) = (hwnd_s, wake_s, stop_s);
                     poll_loop(h.0, target, interval, w.0, s.0, flag)
                 })
@@ -113,13 +103,11 @@ fn poll_loop(
         if wait == WAIT_OBJECT_0 {
             return; // stop
         }
-        // wake 或超时：判断是否需要拉取
         let manual = refresh_flag.swap(false, Ordering::AcqRel);
         let due = Instant::now() >= next_due;
         if !manual && !due {
-            // 变更类唤醒（间隔/账号）：不立即拉取，但必须按当前间隔重排，
-            // 否则 next_due 沿用旧值、新间隔要到旧周期走完才生效
-            let secs = interval.lock().unwrap().max(10);
+            // 变更类唤醒不拉取，但按新间隔重排，否则新间隔要等旧周期走完才生效
+            let secs = interval.lock().unwrap().max(MIN_POLL_SECS);
             next_due = Instant::now() + Duration::from_secs(secs);
             continue;
         }
@@ -154,7 +142,7 @@ fn poll_loop(
             drop(unsafe { Box::from_raw(boxed) });
         }
 
-        let secs = interval.lock().unwrap().max(10);
+        let secs = interval.lock().unwrap().max(MIN_POLL_SECS);
         next_due = Instant::now() + Duration::from_secs(secs);
     }
 }

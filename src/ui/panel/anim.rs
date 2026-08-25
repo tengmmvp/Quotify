@@ -1,13 +1,12 @@
-//! 动画系统：时间线、缓动、插值（随渲染接入逐步启用）。
+//! 动画系统
 
-/// 三次缓出（ease-out cubic），苹果风格的默认曲线。
+/// 三次缓出
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
 }
 
-/// 缓入缓出（ease-in-out cubic)，进度条数值过渡用。
-/// 预留：进度条平滑插值接入渲染时启用（同 api 层数据字段的待接策略）。
+/// 缓入缓出
 #[allow(dead_code)]
 pub fn ease_in_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
@@ -18,7 +17,7 @@ pub fn ease_in_out_cubic(t: f32) -> f32 {
     }
 }
 
-/// 单条动画的时间状态。
+/// 单条动画的时间状态
 #[derive(Debug, Clone, Copy)]
 pub struct Tween {
     pub start: std::time::Instant,
@@ -30,7 +29,6 @@ impl Tween {
         Self { start: std::time::Instant::now(), duration_ms }
     }
 
-    /// 归一化进度（0–1）。
     pub fn progress(&self) -> f32 {
         let elapsed = self.start.elapsed().as_millis() as f32;
         (elapsed / self.duration_ms as f32).clamp(0.0, 1.0)
@@ -41,7 +39,7 @@ impl Tween {
     }
 }
 
-/// 是否尊重系统「减少动态效果」（SPI_GETCLIENTAREAANIMATION）。
+/// 是否尊重系统「减少动态效果」
 pub fn animations_allowed() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,

@@ -1,49 +1,40 @@
-//! 面板主题：Cursor 式「暖羊皮纸编辑风」token（颜色 / 圆角 / 字号 / 间距）。
-//!
-//! 奶油画布 + 暖墨文本 + 单一 Ember 强调色；平面纸感、hairline 分层、
-//! 4px 锐利圆角；标题轻字重（weight 400）靠克制而非加粗建立层级。
+//! 面板主题
 
-/// 外观模式。
+/// 外观模式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
     Light,
     Dark,
 }
 
-/// 深浅色自适应的主题 token 集合。
+/// 深浅色自适应的主题 token 集合
 pub struct Theme {
-    /// 面板背景（Parchment 奶油画布，接近不透明的纸面）
+    /// 面板背景
     pub bg: [f32; 4],
-    /// 主文本（Ink 暖墨，非纯黑）
+    /// 主文本
     pub text_primary: [f32; 4],
-    /// 次要文本（Driftwood，配 400 字重、控件标签）。注意：浅色模式下
-    /// 比 tertiary 更浅——这是刻意设计（见 text_tertiary），勿按明度
-    /// 顺序取用
+    /// 次要文本
     pub text_secondary: [f32; 4],
-    /// 弱文本 / 标签（Ash，配 600 字重、区块标题）。注意：浅色模式下
-    /// 比 secondary 更深——区块标题用 600 字重的小字，配深一档的色
-    /// 才立得住，是刻意反转，勿按明度顺序取用
+    /// 弱文本 / 标签
     pub text_tertiary: [f32; 4],
-    /// hairline 边框与分隔线（Stone）
+    /// hairline 边框与分隔线
     pub border: [f32; 4],
-    /// 进度轨道 / 次级按钮填充（Linen）
+    /// 进度轨道 / 次级按钮填充
     pub track: [f32; 4],
-    /// 文字强调色（Ember——仅用于短文本与链接，不做大面积填充）
+    /// 文字强调色 Ember
     pub accent: [f32; 4],
-    /// 主按钮填充（浅色模式 Ink / 深色模式反转暖白）
+    /// 主按钮填充
     pub action: [f32; 4],
     /// 主按钮文字
     pub action_text: [f32; 4],
-    /// 档位色：正常 Forest / 危险 Crimson（暖色系）
+    /// 档位色：正常 Forest / 危险 Crimson
     pub ok: [f32; 4],
     pub danger: [f32; 4],
-    /// logo 磁贴底色（与主按钮同源）
+    /// logo 磁贴底色，与主按钮同源
     pub logo_tile: [f32; 4],
 }
 
-/// 面板宽度（逻辑像素）。
 pub const PANEL_WIDTH: i32 = 340;
-/// 组件统一圆角（Cursor 的锐利纸感签名）。
 pub const RADIUS: f32 = 4.0;
 
 fn rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
@@ -67,7 +58,6 @@ impl Theme {
                 danger: rgba(0xCF, 0x2D, 0x56, 1.0),
                 logo_tile: rgba(0x26, 0x25, 0x1E, 1.0),
             },
-            // 暖深色：同色相的深纸墨反转（参考仅给出 light，dark 为对应创作）
             Appearance::Dark => Self {
                 bg: rgba(0x20, 0x1F, 0x1B, 0.97),
                 text_primary: rgba(0xEC, 0xEA, 0xE4, 0.94),
@@ -85,7 +75,7 @@ impl Theme {
         }
     }
 
-    /// 检测系统外观（注册表 AppsUseLightTheme）。
+    /// 检测系统外观
     pub fn system_appearance() -> Appearance {
         let val = windows_registry::CURRENT_USER
             .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")

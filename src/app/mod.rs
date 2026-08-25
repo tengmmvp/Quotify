@@ -16,7 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::api::{FetchError, QuotaBucket, UsageSnapshot};
-use crate::app::config::Config;
+use crate::app::config::{Config, DEFAULT_INTERVAL_SECS, MIN_POLL_SECS};
 use crate::platform::instance::TRAY_WND_CLASS;
 use crate::platform::msg::{
     WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
@@ -25,44 +25,38 @@ use crate::platform::wide;
 use crate::service::poller::{PollInterval, PollOutcome, Poller, PollTarget};
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
+use crate::ui::panel::layout::INTERVAL_PRESETS;
 use crate::ui::panel::Panel;
 use crate::ui::tray::{self, TrayIcon};
 
-/// 右键菜单命令 ID。
 const IDM_SETTINGS: u16 = 1001;
 const IDM_EXIT: u16 = 1002;
 
-/// 气泡通知的固定标题（应用名）。
 const NOTIFY_TITLE: &str = "Quotify";
 
-/// 当前账号的展示状态（旧数据 + 最近错误并存，失败时面板保留旧值）。
+/// 失败时保留旧快照供面板显示。
 pub struct AccountData {
-    pub snapshot: Option<UsageSnapshot>,
-    pub last_error: Option<FetchError>,
+    pub(crate) snapshot: Option<UsageSnapshot>,
+    pub(crate) last_error: Option<FetchError>,
 }
 
+/// 装配层状态机
 pub struct App {
-    pub config: Config,
-    pub lang: Lang,
-    pub strings: &'static Strings,
-    pub data: AccountData,
-    pub tray: Option<TrayIcon>,
-    pub poller: Option<Poller>,
-    pub poll_target: PollTarget,
-    pub poll_interval: PollInterval,
+    pub(crate) config: Config,
+    pub(crate) lang: Lang,
+    pub(crate) strings: &'static Strings,
+    pub(crate) data: AccountData,
+    tray: Option<TrayIcon>,
+    poller: Option<Poller>,
+    poll_target: PollTarget,
+    poll_interval: PollInterval,
     tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
-    pub panel: Panel,
+    pub(crate) panel: Panel,
     hwnd: Option<HWND>,
-    /// 检查更新结果（设置页显示）
-    pub update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
-    /// 检查更新在飞（连点去重，结果回传时清除）
+    pub(crate) update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
     update_checking: bool,
-    /// 开机自启当前状态（启动时读注册表一次，切换时同步；设置页渲染读）
-    pub autostart_enabled: bool,
-    /// 托盘图标去重键：(取整百分比, 有无快照, 失败灰环)。未变则跳过
-    /// 逐像素光栅 + HICON 重建 + NIM_MODIFY 整条开销
+    pub(crate) autostart_enabled: bool,
     last_icon_key: Option<(i64, bool, bool)>,
-    // 通知去重状态
     threshold_armed_5h: bool,
     threshold_armed_weekly: bool,
     last_reset_5h: Option<DateTime<Utc>>,
@@ -80,7 +74,7 @@ impl App {
             tray: None,
             poller: None,
             poll_target: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            poll_interval: std::sync::Arc::new(std::sync::Mutex::new(300)),
+            poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
             tray_icon: None,
             panel: Panel::new(),
             hwnd: None,
@@ -99,7 +93,6 @@ impl App {
         self.hwnd.unwrap_or_default()
     }
 
-    /// 同步轮询目标与间隔（配置变更 / 账号切换后调用）。
     fn sync_poll_context(&self) {
         let target = self
             .config
@@ -112,13 +105,10 @@ impl App {
                 project_id: a.project_id.clone(),
             });
         *self.poll_target.lock().unwrap() = target;
-        *self.poll_interval.lock().unwrap() = self.config.general.poll_interval_secs.max(10);
+        *self.poll_interval.lock().unwrap() = self.config.general.poll_interval_secs.max(MIN_POLL_SECS);
     }
 
-    /// 按最新状态重建托盘图标：无数据 → 默认 logo；有数据 → 环形进度；
-    /// 拉取失败且无旧数据 → 灰环（有旧数据仍显示旧进度）。
     fn update_tray_icon(&mut self) {
-        // 失败且无旧数据才画灰环；有旧数据保留旧进度
         let failed = self.data.last_error.is_some() && self.data.snapshot.is_none();
         let used = self
             .data
@@ -133,9 +123,7 @@ impl App {
         }
         let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
         let new = match &self.data.snapshot {
-            // 有快照时 failed 恒为 false（其定义含 snapshot.is_none()）
             Some(_) => icon::ring_icon(px, used, failed),
-            // 失败且无旧数据：灰环（区别于「尚未拉取」的 logo）
             None if failed => icon::ring_icon(px, 0.0, true),
             None => icon::logo_icon(px),
         };
@@ -151,7 +139,6 @@ impl App {
         }
     }
 
-    /// 处理一次轮询结果：更新数据、刷新图标、触发通知。
     fn handle_poll_result(&mut self, outcome: PollOutcome) {
         match outcome {
             PollOutcome::Success(snap) => {
@@ -164,26 +151,20 @@ impl App {
             }
         }
         self.update_tray_icon();
-        // 数据/错误状态变化要立即反映到打开的面板（设置页修复提示、
-        // 主页动态高度与错误卡都依赖这次重算 + 重绘）
         if let Some(p) = self.panel.hwnd {
             relayout_panel(self, p);
         }
-        // 面板未展示时归还 TLS 等运行时页面；面板展示中不归（避免换页抖动）
         if self.panel.mode == crate::ui::panel::PanelMode::Hidden {
             crate::platform::trim_working_set();
         }
     }
 
-    /// 阈值预警与重置通知（开关均默认关闭）。5h / 周两窗走同一套
-    /// 检测逻辑（check_reset / check_threshold），差异只在状态位与文案。
     fn check_notifications(&mut self, snap: &UsageSnapshot) {
         let g = &self.config.general;
         let hwnd = self.hwnd();
         let tray_id = self.tray.as_ref().map(|t| t.tray_id()).unwrap_or(1);
         let notify = |body: &str| crate::platform::notify::show(hwnd, tray_id, NOTIFY_TITLE, body);
 
-        // 重置检测：重置时刻变化即认为进入新窗口（两类提醒独立开关）
         check_reset(
             snap.five_hour.as_ref(),
             &mut self.last_reset_5h,
@@ -201,7 +182,6 @@ impl App {
             &notify,
         );
 
-        // 阈值预警：越线提醒一次，回落重新武装
         if g.notify_threshold_enabled {
             let th = g.notify_threshold_percent as f64;
             check_threshold(
@@ -223,13 +203,7 @@ impl App {
         }
     }
 
-    /// 托盘右键菜单（设置 / 退出）。
-    ///
-    /// 重入不变量：TrackPopupMenu 会进入模态循环，期间持续派发消息
-    /// （WM_COMMAND 等）重入 wndproc 取得 `&mut App`。单线程消息循环下
-    /// 无真并发，但本方法持有的 `&self` 不得活到循环内——所有借自
-    /// self 的值（owner 窗口、两段文案的宽字符）在进入循环前取齐，
-    /// 循环期间不再触 self 任何字段，消除别名点。
+    /// 托盘右键菜单
     fn show_context_menu(&self, pos: windows::Win32::Foundation::POINT) {
         unsafe {
             let owner = self.hwnd();
@@ -255,8 +229,7 @@ impl App {
     }
 }
 
-/// 单个窗口的重置检测：重置时刻变化即视为进入新窗口，按开关提醒并
-/// 重新武装阈值。
+/// 重置时刻变化即新窗口
 fn check_reset(
     bucket: Option<&QuotaBucket>,
     last: &mut Option<DateTime<Utc>>,
@@ -270,13 +243,13 @@ fn check_reset(
             if enabled {
                 notify(msg);
             }
-            *armed = true; // 新窗口重新武装阈值
+            *armed = true;
         }
         *last = b.resets_at;
     }
 }
 
-/// 单个窗口的阈值预警：越线提醒一次，回落重新武装。
+/// 越线提醒一次，回落重新武装
 fn check_threshold(
     bucket: Option<&QuotaBucket>,
     armed: &mut bool,
@@ -296,7 +269,7 @@ fn check_threshold(
     }
 }
 
-/// 托盘隐藏窗口过程。
+/// 托盘隐藏窗口过程
 extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
         WM_APP_TRAY => {
@@ -309,8 +282,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                             let n = app.config.accounts.len();
                             sync_main_height(app);
                             app.panel.show_preview(hwnd, rect, n);
-                            // 渲染器在 show_at 内才创建：显示后再应用一次，
-                            // 保证显式选择的外观从首帧生效
                             apply_appearance(app);
                         }
                 }
@@ -351,7 +322,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_APP_UPDATE_RESULT => {
             let app = app_from(hwnd);
             if let Some(app) = app {
-                // 结果已回：清除在飞标记（成功失败都清）
                 app.update_checking = false;
                 let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
                 if !boxed.is_null() {
@@ -412,14 +382,16 @@ fn tray_rect(app: &App) -> Option<RECT> {
     app.tray.as_ref().and_then(|t| t.rect())
 }
 
+/// App 装箱后存活到进程退出，GWLP_USERDATA 指针全程有效，可转写为
+/// `&'static mut`；别名安全依赖单线程消息循环。
 fn app_from(hwnd: HWND) -> Option<&'static mut App> {
     let p = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) };
     (p != 0).then(|| unsafe { &mut *(p as *mut App) })
 }
 
-/// 面板命中处理：渲染层 `Hit` → 应用动作。
+/// 面板命中处理
 pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
-    use crate::ui::panel::render::Hit;
+    use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
     match hit {
         Hit::Refresh | Hit::Retry => {
             if let Some(p) = &app.poller {
@@ -430,7 +402,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
         }
         Hit::Settings => {
-            // 进入设置是明确的交互意图：锁定面板，不再因鼠标离开收起
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.view = crate::ui::panel::PanelView::Settings;
             sync_customizing(app);
@@ -441,7 +412,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.adding_account = false;
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
-            // 添加账号页的「取消」回设置页；设置页的「返回」才回主界面
             if !was_adding {
                 app.panel.view = crate::ui::panel::PanelView::Main;
             }
@@ -454,19 +424,26 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             if let Some(p) = &app.poller {
                 p.reschedule();
             }
-            // 预设生效：收起自定义输入行
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
             relayout_panel(app, panel_hwnd);
         }
-        Hit::Language(tag) => {
-            app.config.general.language = if tag.is_empty() { None } else { Some(tag.to_string()) };
+        Hit::Language(choice) => {
+            app.config.general.language = match choice {
+                LanguageChoice::System => None,
+                LanguageChoice::Zh => Some("zh".to_string()),
+                LanguageChoice::En => Some("en".to_string()),
+            };
             app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
         }
-        Hit::Appearance(tag) => {
-            app.config.general.appearance = if tag.is_empty() { None } else { Some(tag.to_string()) };
+        Hit::Appearance(choice) => {
+            app.config.general.appearance = match choice {
+                AppearanceChoice::System => None,
+                AppearanceChoice::Light => Some("light".to_string()),
+                AppearanceChoice::Dark => Some("dark".to_string()),
+            };
             crate::app::config::save(&app.config);
             apply_appearance(app);
             if let Some(p) = app.panel.hwnd {
@@ -475,26 +452,22 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 }
             }
         }
-        Hit::Platform(tag) => {
-            app.panel.pending_platform = if tag == "intl" {
+        Hit::Platform(platform) => {
+            app.panel.pending_platform = platform;
+            if platform == crate::api::client::Platform::Intl {
                 // 团队版仅国内站：切到国际版时类型同步回个人版
                 app.panel.pending_team = false;
-                crate::api::client::Platform::Intl
-            } else {
-                crate::api::client::Platform::Cn
-            };
+            }
             collapse_team_focus(app, panel_hwnd);
             relayout_panel(app, panel_hwnd);
         }
-        Hit::AccountType(tag) => {
-            app.panel.pending_team = tag == "team";
+        Hit::AccountType(scope) => {
+            app.panel.pending_team = matches!(scope, ScopeChoice::Team);
             if app.panel.pending_team {
                 // 团队版仅国内站：类型切团队时平台同步回国内
                 app.panel.pending_platform = crate::api::client::Platform::Cn;
             }
-            // 团队输入行收起时清掉残留的输入焦点
             collapse_team_focus(app, panel_hwnd);
-            // 团队输入行的显隐影响添加页高度
             relayout_panel(app, panel_hwnd);
         }
         Hit::SaveAccount => save_pending_account(app, panel_hwnd),
@@ -524,8 +497,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 if app.config.selected.as_deref() == Some(removed_id.as_str()) {
                     app.config.selected = app.config.accounts.first().map(|a| a.id.clone());
                 }
-                // 旧命中区携带列表索引：列表已变立即作废，防止 WM_PAINT
-                // 低优先级派发下的第二次点击用旧矩形删掉下一个账号（双击连删）
                 if let Some(r) = app.panel.renderer.as_mut() {
                     r.hits.clear();
                     r.hover = None;
@@ -537,8 +508,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 if let Some(p) = &app.poller {
                     p.refresh_now();
                 }
-                // 数据已清：立即重算 account_error 与动态高度（提示行、
-                // 账号块的伸缩不能等下一轮轮询回来才生效）
                 relayout_panel(app, panel_hwnd);
             }
         }
@@ -593,16 +562,13 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
         }
         Hit::CheckUpdate => {
-            // 在飞去重：上一轮结果未回不重复发起（连点只查一次）
             if !app.update_checking {
                 app.update_checking = true;
                 app.update_status = None;
-                // HWND 跨线程移动安全（内核对象引用），显式声明 Send
                 struct SendHwnd(HWND);
                 unsafe impl Send for SendHwnd {}
                 let tray = SendHwnd(app.hwnd());
                 std::thread::spawn(move || {
-                    // 先整体移动 SendHwnd（2021 精准捕获会绕过包装直接捕获裸 HWND）
                     let tray = tray;
                     let r = crate::service::update::check_latest();
                     let boxed = Box::into_raw(Box::new(r));
@@ -614,7 +580,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                             Default::default(),
                         )
                     };
-                    // 投递失败（窗口已销毁）：取回 boxed 防泄漏
                     if posted.is_err() {
                         drop(unsafe { Box::from_raw(boxed) });
                     }
@@ -627,9 +592,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     }
 }
 
-/// 选中账号 i 并立即刷新。
 fn select_account(app: &mut App, i: usize) {
-    // 只克隆 id：账号结构含 api_key，无需整体复制
     if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
         app.config.selected = Some(id);
         crate::app::config::save(&app.config);
@@ -642,8 +605,7 @@ fn select_account(app: &mut App, i: usize) {
     }
 }
 
-/// 团队输入行收起（切回个人版）时，若焦点还在组织/项目框里则清除，
-/// 避免光标残留在已消失的控件位置、键盘输入写入隐藏缓冲。
+/// 团队输入行收起时清除残留焦点，避免键盘输入写入已隐藏的缓冲。
 fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
     use crate::ui::panel::InputField;
     if !app.panel.pending_team
@@ -653,14 +615,14 @@ fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
     }
 }
 
-/// 保存添加账号表单（读取自绘输入缓冲）。
+/// 保存添加账号表单
 fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     let name = app.panel.input.name.trim().to_string();
     let key = app.panel.input.key.trim().to_string();
     if key.is_empty() {
         return;
     }
-    // 名称留空时默认「Default」，避免空用户名出现在顶栏/账号卡
+    // 名称留空默认 Default
     let name = if name.is_empty() { "Default".to_string() } else { name };
 
     let acc = crate::app::config::Account {
@@ -668,7 +630,6 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         name,
         api_key: key,
         platform: app.panel.pending_platform,
-        // 团队版标记与选择头；两 ID 留空时查询自动按个人版降级
         team: app.panel.pending_team,
         org_id: app.panel.input.org.trim().to_string(),
         project_id: app.panel.input.project.trim().to_string(),
@@ -678,7 +639,6 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     if is_first || app.config.selected.is_none() {
         app.config.selected = Some(acc.id);
     }
-    // 旧命中区携带列表索引：列表已变立即作废（防旧矩形误触）
     if let Some(r) = app.panel.renderer.as_mut() {
         r.hits.clear();
         r.hover = None;
@@ -695,13 +655,11 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 应用自定义轮询间隔（分钟）。结果仍为非预设值时保持输入行展开
-/// （预填新值，当前值始终可见）；恰好落在预设上则收起。
+/// 应用自定义轮询间隔（分钟）
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0) {
-        // 大数乘 60 可能回绕出超小间隔：溢出时保持原值
         if let Some(secs) = mins.checked_mul(60) {
-            app.config.general.poll_interval_secs = secs.max(10);
+            app.config.general.poll_interval_secs = secs.max(MIN_POLL_SECS);
             crate::app::config::save(&app.config);
             app.sync_poll_context();
             if let Some(p) = &app.poller {
@@ -714,24 +672,24 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 当前间隔非预设值时展开自定义输入行并预填；预设则收起。
+/// 非预设间隔展开自定义行并预填；预设则收起
 fn sync_customizing(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
-    let is_preset = [60u64, 300, 900, 1800].contains(&cur);
+    let is_preset = INTERVAL_PRESETS.contains(&cur);
     app.panel.customizing_interval = !is_preset;
     if !is_preset {
         prefill_interval(app);
     }
 }
 
-/// 用当前配置预填自定义间隔（分钟，向上取整）。
+/// 预填自定义间隔（分钟），向上取整
 fn prefill_interval(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
     let mins = cur.div_ceil(60);
     app.panel.input.interval = mins.to_string();
 }
 
-/// 面板内按 Enter 的确认行为：名称 → 切到 key；key → 保存；间隔 → 应用。
+/// 面板内按 Enter 的确认行为：名称 → 切到 key；key → 保存；间隔 → 应用
 pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
     use crate::ui::panel::InputField;
     match app.panel.input.field {
@@ -741,7 +699,7 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
             }
         }
         Some(InputField::Key) => {
-            // 名称可留空（保存时默认 Default），key 必填
+            // key 必填，名称可留空
             if !app.panel.input.key.trim().is_empty() {
                 if app.panel.pending_team {
                     app.panel.focus_input(panel_hwnd, InputField::Org);
@@ -765,7 +723,6 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
     }
 }
 
-/// 解析生效外观：配置显式指定则用之，否则跟随系统。
 fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appearance {
     match setting {
         Some(s) if s.eq_ignore_ascii_case("light") => crate::ui::panel::theme::Appearance::Light,
@@ -774,7 +731,7 @@ fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appear
     }
 }
 
-/// 把生效外观应用到渲染器（即时换肤；渲染器尚未创建时由创建路径兜底）。
+/// 应用生效外观；渲染器未创建时由创建路径兜底
 fn apply_appearance(app: &mut App) {
     let appearance = resolved_appearance(app.config.general.appearance.as_deref());
     if let Some(r) = app.panel.renderer.as_mut() {
@@ -782,7 +739,6 @@ fn apply_appearance(app: &mut App) {
     }
 }
 
-/// 按数据内容重算主视图高度（指标行数 / 余额 / 副标题都会伸缩面板）。
 fn sync_main_height(app: &mut App) {
     app.panel.main_h = match app.data.snapshot.as_ref() {
         None => 300,
@@ -798,16 +754,12 @@ fn sync_main_height(app: &mut App) {
     };
 }
 
-/// 视图切换后面板重定位重设尺寸。编排：高度重算 → 鉴权错误状态 →
-/// 光标上下文 → 外观 → 定位。定位统一走 `Panel::place`（监视器 + DPI +
-/// 夹取 + SetWindowPos + 动画基准一行完成）。
+/// 同步状态并重定位面板
 fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
     sync_main_height(app);
-    app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth(_)));
-    // 自绘输入的光标上下文（设置页间隔输入框 y 随账号区 / 错误行伸缩）
+    app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth));
     app.panel.caret_ctx = (!app.config.accounts.is_empty(), app.panel.account_error);
     apply_appearance(app);
-    // 面板已收起：只同步状态，不做窗口几何操作（不 SetWindowPos 不 Invalidate）
     if app.panel.mode == crate::ui::panel::PanelMode::Hidden {
         return;
     }
@@ -821,11 +773,9 @@ fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
 }
 
 
-/// 应用入口：初始化、装配、消息循环。
+/// 应用入口
 pub fn run() -> i32 {
     unsafe {
-        // Per-Monitor V2：所有坐标/尺寸统一物理像素体系（缺失会导致
-        // 非 DPI-aware 虚拟化，各 API 混用逻辑/物理坐标、面板定位出屏）
         let _ = windows::Win32::UI::HiDpi::SetProcessDpiAwarenessContext(
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
@@ -866,7 +816,6 @@ pub fn run() -> i32 {
         app.hwnd = Some(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *app as *mut App as isize);
 
-        // 初始图标（默认 logo，无数据态）+ 托盘注册
         let px = GetSystemMetrics(SM_CXSMICON).max(16);
         let initial = icon::logo_icon(px);
         if initial.is_none() {
@@ -876,14 +825,13 @@ pub fn run() -> i32 {
         app.tray_icon = Some(initial);
         app.tray = TrayIcon::new(hwnd, initial);
 
-        // 轮询线程
         app.sync_poll_context();
         app.poller = Poller::spawn(hwnd, app.poll_target.clone(), app.poll_interval.clone());
         if let Some(p) = &app.poller {
-            p.refresh_now(); // 启动即拉取一次
+            p.refresh_now();
         }
 
-        // 诊断后门（仅 debug）：QUOTIFY_DIAG=adding 自动弹设置-添加账号页
+        // 诊断后门，仅 debug 生效：QUOTIFY_DIAG=adding 自动弹设置-添加账号页
         #[cfg(debug_assertions)]
         if std::env::var("QUOTIFY_DIAG").as_deref() == Ok("adding") {
             let rect = tray_rect(&app).unwrap_or(RECT { left: 1300, top: 880, right: 1340, bottom: 920 });
@@ -901,14 +849,12 @@ pub fn run() -> i32 {
             }
         }
 
-        // 消息循环
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        // 清理
         if let Some(t) = app.tray.take() {
             drop(t);
         }

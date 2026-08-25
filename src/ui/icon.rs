@@ -10,19 +10,20 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, ICONINFO, CreateIconIndirect, HICON};
 
-/// GDI+ 生命周期令牌（保留初始化兼容；光栅已纯软件实现）。
-pub struct GdiPlus(#[allow(dead_code)] usize);
-
-pub fn init() -> Option<GdiPlus> {
-    Some(GdiPlus(0))
-}
+/// 图标最小边长（px）：防御调用侧传 0/负值导致像素缓冲区退化。
+const MIN_PX: i32 = 16;
 
 /// 加载嵌入资源中的应用图标（资源 id 1，logo 同源）。
 pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
+    // MAKEINTRESOURCEW(1)：整数资源 id 直接编码进指针值，须精确为 1；
+    // clippy 建议的 dangling() 按对齐取地址（u16 → 2），会错读资源 id 2，
+    // 故此处保留整型转指针并豁免该 lint
+    #[allow(clippy::manual_dangling_ptr)]
+    let resid = 1usize as *const u16;
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::LoadImageW(
             Some(hinst),
-            windows::core::PCWSTR(1usize as *const u16), // MAKEINTRESOURCEW(1)
+            windows::core::PCWSTR(resid),
             windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
             0,
             0,
@@ -32,10 +33,6 @@ pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
         .ok()
         .map(|h| HICON(h.0))
     }
-}
-
-impl Drop for GdiPlus {
-    fn drop(&mut self) {}
 }
 
 /// 用量档位颜色（苹果系统色）。
@@ -51,7 +48,7 @@ fn tier_color(used_percent: f64) -> (u8, u8, u8) {
 
 /// 默认图标（无数据时）：深灰圆角方块 + 白色 Z 字形（与 assets/logo.svg 同源）。
 pub fn logo_icon(px: i32) -> Option<HICON> {
-    let px = px.max(16);
+    let px = px.max(MIN_PX);
     let mut buf = vec![0u8; (px * px * 4) as usize];
     let s = px as f32;
     let ins = s * 0.01;
@@ -94,9 +91,9 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
     pixels_to_hicon(&buf, px)
 }
 
-/// 环形余量图标。`failed` 时仅画灰色轨道环。
+/// 环形余量图标。`failed` 时仅画灰色轨道环（`used_percent` 不参与着色）。
 pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
-    let px = px.max(16);
+    let px = px.max(MIN_PX);
     let mut buf = vec![0u8; (px * px * 4) as usize];
     let s = px as f32;
     let stroke = (s * 0.22).clamp(2.5, 7.0);
@@ -153,7 +150,6 @@ fn in_rounded_rect(x: f32, y: f32, rx: f32, ry: f32, side: f32, r: f32) -> bool 
             (a, b) if a < x && b > y => (x > right - r) && (y < ry + r),
             _ => (x < rx + r) && (y < ry + r),
         };
-        let _ = (ccx, ccy);
         if in_corner_zone && dx * dx + dy * dy > r * r {
             return false;
         }
@@ -212,7 +208,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         )
         .ok()?;
         if !mask_bits.is_null() {
-            std::ptr::write_bytes(mask_bits as *mut u8, 0, (px as usize * px as usize + 7) / 8);
+            std::ptr::write_bytes(mask_bits as *mut u8, 0, (px as usize * px as usize).div_ceil(8));
         }
 
         let info = ICONINFO {

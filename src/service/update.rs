@@ -1,8 +1,8 @@
 //! 检查更新：查询 GitHub Releases 最新版本，只提示不自动安装。
 
-use std::time::Duration;
-
 use serde::Deserialize;
+
+use crate::api::client::{MAX_BODY_BYTES, agent_long};
 
 pub const REPO: &str = "TengMMVP/quotify";
 
@@ -23,13 +23,10 @@ pub struct ReleaseInfo {
 }
 
 /// 查询最新 Release。阻塞调用，UI 侧应在后台线程触发。
+/// 复用 client 的长超时共享 Agent（连接池 + 仅 HTTPS）。
 pub fn check_latest() -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(10)))
-        .build()
-        .into();
-    let resp = agent
+    let resp = agent_long()
         .get(&url)
         // GitHub API 强制要求 User-Agent
         .header("User-Agent", format!("quotify/{}", env!("CARGO_PKG_VERSION")))
@@ -41,6 +38,9 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     }
     let rel: GithubRelease = resp
         .into_body()
+        .into_with_config()
+        // 与用量查询同样的防御上限，防异常超大响应
+        .limit(MAX_BODY_BYTES)
         .read_json()
         .map_err(|e| format!("解析失败: {e}"))?;
     if rel.draft || rel.prerelease {

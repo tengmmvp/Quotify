@@ -3,6 +3,9 @@
 //! v4 协议下回调消息 lParam 的 LOWORD 是通知码（`NIN_POPUPOPEN` 等），
 //! HIWORD 是图标 id；这让我们能拿到「鼠标悬停/离开」事件驱动面板弹出。
 
+use crate::platform::msg::WM_APP_TRAY;
+use crate::platform::{log, wide};
+
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
@@ -10,9 +13,6 @@ use windows::Win32::UI::Shell::{
     Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
-
-/// 托盘回调消息。
-pub const WM_APP_TRAY: u32 = 0x8000 + 1;
 
 /// v4 通知码（lParam LOWORD）。
 pub const NIN_POPUPOPEN: u32 = 0x0406;
@@ -43,17 +43,19 @@ impl TrayIcon {
             nid.uCallbackMessage = WM_APP_TRAY;
             nid.hIcon = hicon;
             copy_tip(&mut nid, "Quotify");
-            if !Shell_NotifyIconW(NIM_ADD, &mut nid).as_bool() {
-                eprintln!("[Quotify] 托盘 NIM_ADD 失败: {}", windows::core::HRESULT::from_thread());
+            if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+                log(&format!(
+                    "[Quotify] 托盘 NIM_ADD 失败: {}",
+                    windows::core::HRESULT::from_thread()
+                ));
                 return None;
             }
             // 升级 v4 协议以获得 NIN_POPUPOPEN/POPUPCLOSE 悬停通知
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            if Shell_NotifyIconW(NIM_SETVERSION, &mut nid).as_bool() {
-                eprintln!("[Quotify] 托盘图标注册成功");
+            if Shell_NotifyIconW(NIM_SETVERSION, &nid).as_bool() {
                 Some(Self { hwnd, id: 1, registered: true })
             } else {
-                eprintln!("[Quotify] 托盘 SETVERSION 失败");
+                log("[Quotify] 托盘 SETVERSION 失败");
                 None
             }
         }
@@ -65,7 +67,7 @@ impl TrayIcon {
         nid.uFlags = NIF_ICON;
         nid.hIcon = hicon;
         unsafe {
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &mut nid);
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
         }
     }
 
@@ -88,9 +90,9 @@ impl TrayIcon {
     /// 移除托盘图标（退出时必须调用，否则任务栏残留幽灵图标）。
     pub fn remove(&mut self) {
         if self.registered {
-            let mut nid = base_data(self.hwnd, self.id);
+            let nid = base_data(self.hwnd, self.id);
             unsafe {
-                let _ = Shell_NotifyIconW(NIM_DELETE, &mut nid);
+                let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
             }
             self.registered = false;
         }
@@ -104,11 +106,11 @@ impl Drop for TrayIcon {
 }
 
 fn copy_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {
-    let chars: Vec<u16> = tip.encode_utf16().take(127).collect();
+    // szTip 容量 128（含 NUL）：截到 127 个 UTF-16 单元后补终止符
+    let mut chars = wide(tip);
+    chars.truncate(127);
     nid.szTip[..chars.len()].copy_from_slice(&chars);
-    if chars.len() < 128 {
-        nid.szTip[chars.len()] = 0;
-    }
+    nid.szTip[chars.len()] = 0;
 }
 
 /// 解析 v4 回调：返回 (通知码, 图标id)。

@@ -3,15 +3,16 @@
 //! 二次启动时向已运行实例的托盘窗口投递「弹出面板」消息后静默退出，
 //! 用户感知是「点了一下，面板出来了」。
 
+use crate::platform::msg::WM_APP_WAKE_INSTANCE;
+use crate::platform::wide;
+
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError, HANDLE};
 use windows::Win32::System::Threading::CreateMutexW;
-use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, PostMessageW};
 
 /// 托盘隐藏窗口类名（FindWindow 唤醒用，全局唯一）。
 pub const TRAY_WND_CLASS: &str = "QuotifyTrayWnd";
-/// 「唤醒已有实例」消息。
-pub const WM_APP_WAKEUP: u32 = WM_APP + 3;
 
 enum GuardState {
     First(HANDLE),
@@ -35,10 +36,7 @@ pub fn acquire() -> InstanceGuard {
     unsafe {
         // 优先 Global 命名空间（跨会话）；无权限时回退 Local
         for scope in ["Global", "Local"] {
-            let name: Vec<u16> = format!("{scope}\\{TRAY_WND_CLASS}.SingleInstance")
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
+            let name = wide(&format!("{scope}\\{TRAY_WND_CLASS}.SingleInstance"));
             if let Ok(h) = CreateMutexW(None, false, PCWSTR(name.as_ptr())) {
                 // CreateMutex 成功时 GetLastError 可能是 ERROR_ALREADY_EXISTS
                 let already = GetLastError() == ERROR_ALREADY_EXISTS;
@@ -60,13 +58,10 @@ impl InstanceGuard {
 
     /// 找到已运行实例的托盘窗口，请它弹出面板。
     pub fn wake_existing(&self) {
-        let class: Vec<u16> = TRAY_WND_CLASS.encode_utf16().chain(std::iter::once(0)).collect();
+        let class = wide(TRAY_WND_CLASS);
         unsafe {
-            match FindWindowW(PCWSTR(class.as_ptr()), None) {
-                Ok(hwnd) => {
-                    let _ = PostMessageW(Some(hwnd), WM_APP_WAKEUP, Default::default(), Default::default());
-                }
-                Err(_) => {}
+            if let Ok(hwnd) = FindWindowW(PCWSTR(class.as_ptr()), None) {
+                let _ = PostMessageW(Some(hwnd), WM_APP_WAKE_INSTANCE, Default::default(), Default::default());
             }
         }
     }

@@ -24,16 +24,14 @@ pub fn resolve_lang(setting: Option<&str>) -> Lang {
     }
 }
 
-/// 全部界面文案。字段即文案 key，双语各一份常量表；
-/// 为保证两语言表结构一致，暂未被渲染消费的字段一并保留。
-#[allow(dead_code)]
+/// 全部界面文案。字段即文案 key，双语各一份常量表；新增字段须两表
+/// 同步补齐，占位符名称集合的一致性由本文件 tests 逐字段核对。
 pub struct Strings {
     // ── 主视图 ──
     pub five_hour: &'static str,
     pub weekly: &'static str,
     pub mcp_tools: &'static str,
-    pub resets_in: &'static str,
-    /// 指标行脚注：`{t}` 倒计时、`{clock}` 重置钟点（跨天带日期）
+    /// 指标行脚注：`{t}` 倒计时
     pub resets_line: &'static str,
     /// 绝对值脚注：`{cur}` 当前用量、`{tot}` 总量
     pub used_of: &'static str,
@@ -45,20 +43,15 @@ pub struct Strings {
     pub data_as_of: &'static str,
     pub fetch_failed: &'static str,
     pub retry: &'static str,
-    pub refresh: &'static str,
     pub settings: &'static str,
     pub exit: &'static str,
     pub not_configured_title: &'static str,
     pub not_configured_hint: &'static str,
-    pub no_data: &'static str,
     pub loading: &'static str,
     pub key_invalid: &'static str,
 
     // ── 通用 ──
-    pub back: &'static str,
     pub cancel: &'static str,
-    pub confirm: &'static str,
-    pub delete: &'static str,
     pub save: &'static str,
 
     // ── 设置视图 ──
@@ -104,10 +97,7 @@ pub struct Strings {
     pub project_id_label: &'static str,
     pub api_key_label: &'static str,
     pub check_update: &'static str,
-    pub checking_update: &'static str,
     pub up_to_date: &'static str,
-    pub update_available: &'static str,
-    pub get_update: &'static str,
     pub update_check_failed: &'static str,
     pub version_label: &'static str,
 
@@ -127,7 +117,6 @@ const ZH: Strings = Strings {
     five_hour: "5 小时窗口",
     weekly: "周额度",
     mcp_tools: "MCP 工具",
-    resets_in: "后重置",
     resets_line: "{t}后重置",
     used_of: "已用 {cur} / {tot}",
     usage_section: "额度用量",
@@ -137,19 +126,14 @@ const ZH: Strings = Strings {
     data_as_of: "数据截至 {t}",
     fetch_failed: "获取失败",
     retry: "重试",
-    refresh: "刷新",
     settings: "设置",
     exit: "退出",
     not_configured_title: "未配置账号",
     not_configured_hint: "进入设置，添加 GLM Coding Plan 账号即可开始使用",
-    no_data: "暂无数据",
     loading: "加载中…",
     key_invalid: "[提示] API key 无效，请在设置中检查",
 
-    back: "返回",
     cancel: "取消",
-    confirm: "确定",
-    delete: "删除",
     save: "保存",
 
     settings_general: "通用设置",
@@ -189,10 +173,7 @@ const ZH: Strings = Strings {
     project_id_label: "项目 ID",
     api_key_label: "API Key",
     check_update: "检查更新",
-    checking_update: "正在检查…",
     up_to_date: "已是最新版本",
-    update_available: "发现新版本 {v}",
-    get_update: "前往下载",
     update_check_failed: "检查更新失败",
     version_label: "当前版本：{v}",
 
@@ -211,7 +192,6 @@ const EN: Strings = Strings {
     five_hour: "Session (5h)",
     weekly: "Weekly",
     mcp_tools: "MCP tools",
-    resets_in: "until reset",
     resets_line: "Resets in {t}",
     used_of: "{cur} of {tot} used",
     usage_section: "USAGE",
@@ -221,19 +201,14 @@ const EN: Strings = Strings {
     data_as_of: "Data as of {t}",
     fetch_failed: "Fetch failed",
     retry: "Retry",
-    refresh: "Refresh",
     settings: "Settings",
     exit: "Exit",
     not_configured_title: "No account configured",
-    not_configured_hint: "Open Settings and add a Z.AI Coding Plan account to get started",
-    no_data: "No data yet",
+    not_configured_hint: "Open Settings and add a GLM Coding Plan account to get started",
     loading: "Loading…",
     key_invalid: "[Note] Invalid API key. Check it in Settings",
 
-    back: "Back",
     cancel: "Cancel",
-    confirm: "OK",
-    delete: "Delete",
     save: "Save",
 
     settings_general: "General",
@@ -273,10 +248,7 @@ const EN: Strings = Strings {
     project_id_label: "Project ID",
     api_key_label: "API Key",
     check_update: "Check for updates",
-    checking_update: "Checking…",
     up_to_date: "Up to date",
-    update_available: "New version {v} available",
-    get_update: "Download",
     update_check_failed: "Update check failed",
     version_label: "Version: {v}",
 
@@ -296,5 +268,66 @@ impl Lang {
             Lang::Zh => &ZH,
             Lang::En => &EN,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手写扫描提取文案中 `{name}` 占位符名，返回排序去重集合。
+    /// 不引 regex 依赖：逐字节找 `{`，取到最近的 `}` 为止。
+    fn placeholder_set(s: &str) -> Vec<&str> {
+        let mut names = Vec::new();
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'{'
+                && let Some(end) = s[i + 1..].find('}') {
+                    names.push(&s[i + 1..i + 1 + end]);
+                    i += end + 2; // 跳过 `{name}` 整段
+                    continue;
+                }
+            i += 1;
+        }
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// 双语表逐字段核对占位符名集合一致：渲染层按名字做 `{t}`.replace，
+    /// 一头改了占位符另一头漏改就会在运行时留下未替换的原文。
+    /// 新增字段时须在 check! 列表同步补一行，漏补则该字段不参与核对。
+    #[test]
+    fn zh_en_placeholders_match() {
+        let (zh, en) = (&ZH, &EN);
+        macro_rules! check {
+            ($($field:ident),* $(,)?) => {
+                $(
+                    assert_eq!(
+                        placeholder_set(zh.$field),
+                        placeholder_set(en.$field),
+                        concat!("占位符集合不一致: ", stringify!($field)),
+                    );
+                )*
+            };
+        }
+        check!(
+            five_hour, weekly, mcp_tools, resets_line, used_of, usage_section,
+            balance_label, updated_just_now, updated_ago, data_as_of, fetch_failed,
+            retry, settings, exit, not_configured_title, not_configured_hint,
+            loading, key_invalid, cancel, save, settings_general, poll_interval,
+            interval_1m, interval_5m, interval_15m, interval_30m, interval_custom,
+            interval_custom_unit, apply, language, follow_system, appearance_section,
+            theme_light, theme_dark, notifications, notify_threshold,
+            notify_threshold_desc, notify_reset_5h_opt, notify_reset_5h_desc,
+            notify_reset_weekly_opt, notify_reset_weekly_desc, autostart,
+            accounts_section, platform_section, add_account, account_name,
+            account_platform, platform_cn, platform_intl, account_type_label,
+            type_personal, type_team, team_badge, org_id_label, project_id_label,
+            api_key_label, check_update, up_to_date, update_check_failed,
+            version_label, notify_threshold_title, notify_reset_5h,
+            notify_reset_weekly, unit_day, unit_hour, unit_minute, unit_second,
+        );
     }
 }

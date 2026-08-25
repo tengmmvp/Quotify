@@ -1,10 +1,12 @@
 //! 弹出面板：悬停预览 / 点击锁定 / 移开收起的任务栏 flyout。
 //!
-//! 窗口为无边框 WS_POPUP + DWM 大圆角 + 整窗 alpha 淡入淡出；
+//! 窗口为无边框 WS_POPUP + DWM 大圆角 + 内容级上浮+渐入（不再用
+//! WS_EX_LAYERED 整窗 alpha）；
 //! 内容由 `render.rs` 的 D2D 渲染器逐帧绘制，动画由 WM_TIMER 驱动
 //! （静止时无定时器，零 CPU 占用）。
 
 pub mod anim;
+pub mod layout;
 pub mod render;
 pub mod theme;
 
@@ -21,6 +23,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{TME_LEAVE, TRACKMOUSEEVENT, Tr
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::platform::wide;
 use crate::ui::panel::render::Renderer;
 use crate::ui::panel::theme::PANEL_WIDTH;
 
@@ -29,6 +32,9 @@ const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE_DEBOUNCE: usize = 2;
 const TIMER_OUTSIDE_CHECK: usize = 3;
+
+/// DPI 探测失败时的兜底值（150%——常见笔记本缩放）
+pub(crate) const FALLBACK_DPI: f32 = 1.5;
 
 /// 面板的展示模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +67,7 @@ pub enum InputField {
 }
 
 /// 自绘输入状态（缓冲；光标由系统 caret 呈现）。
+#[derive(Default)]
 pub struct PanelInput {
     pub field: Option<InputField>,
     pub name: String,
@@ -68,19 +75,6 @@ pub struct PanelInput {
     pub interval: String,
     pub org: String,
     pub project: String,
-}
-
-impl Default for PanelInput {
-    fn default() -> Self {
-        Self {
-            field: None,
-            name: String::new(),
-            key: String::new(),
-            interval: String::new(),
-            org: String::new(),
-            project: String::new(),
-        }
-    }
 }
 
 pub struct Panel {
@@ -105,8 +99,11 @@ pub struct Panel {
     pub(crate) anim_w: i32,
     pub(crate) anim_full_h: i32,
     pub(crate) anim_bottom: i32,
-    #[allow(dead_code)]
-    hide_anim: bool,
+    /// 光标/IME 定位上下文（has_account, auth_error）：设置页「自定义间隔」
+    /// 输入框的 y 随账号块与鉴权错误行伸缩，而 Panel 不持有 config，
+    /// 由 app 层在 relayout_panel 时回写
+    /// `panel.caret_ctx = (accounts > 0, panel.account_error)`。
+    pub(crate) caret_ctx: (bool, bool),
     class_registered: bool,
     /// 主视图动态高度（逻辑像素；按指标行数/余额/副标题由 app 侧计算）
     pub(crate) main_h: i32,
@@ -138,32 +135,48 @@ impl Panel {
             anim_bottom: 0,
             main_h: 300,
             account_error: false,
+            caret_ctx: (false, false),
             class_registered: false,
-            hide_anim: false,
             outside_since: None,
-            dpi: 1.5,
+            dpi: FALLBACK_DPI,
         }
     }
 
     /// 逻辑像素 → 物理像素。
-    fn px(&self, logical: i32) -> i32 {
+    pub(crate) fn px(&self, logical: i32) -> i32 {
         (logical as f32 * self.dpi).round() as i32
     }
 
-    /// 面板逻辑高度（含单账号卡片 60；自定义输入行展开时 +40）。
-    fn view_height(&self, accounts: usize) -> i32 {
+    /// 面板逻辑高度（含单账号卡片 48；自定义输入行展开时 +40）。
+    pub(crate) fn view_height(&self, accounts: usize) -> i32 {
         match self.view {
             // 动态：随指标行数 / 余额 / 副标题伸缩（sync_main_height 维护）
             PanelView::Main => self.main_h,
             // 添加页：账号类型双分段（平台/个人团队）+ 名称/key；
-            // 团队版追加组织/项目两行输入（106px）
-            PanelView::Settings if self.adding_account => 338 + if self.pending_team { 106 } else { 0 },
-            // 设置页随内容伸缩：账号卡(48) vs 添加按钮(38)、自定义间隔行(+30)、
-            // key 失效提示行(+18)；底部留 30px 余量（按钮边框需完整呈现）
+            // 团队版追加组织/项目两行输入（高度由 layout 统一给出）
+            PanelView::Settings if self.adding_account => layout::add_page_height(self.pending_team),
+            // 设置页随内容伸缩：账号卡(48) vs 添加按钮(38)、key 失效提示行(18)、
+            // 自定义间隔输入行展开时 +40（收起时 +10）。各项逐段对照
+            // draw_settings 的 y 累加链（dy=0 静止态）：
             PanelView::Settings => {
+                // 有账号：卡片 40 + 卡后间距 8；无账号：添加按钮行 36（+2 余量）
                 let account_block = if accounts > 0 { 48 } else { 38 };
+                // key 失效提示行（卡片下方 danger 弱字一行）
                 let error_line = if self.account_error { 18 } else { 0 };
-                let base = 42 + 33 + account_block + error_line + 33 + 40 + 63 + 63 + 28 + 33 + 126 + 18 + 29 + 30;
+                let base = 42 // 顶部留白 12 + 导航行 30（返回箭头 + 居中标题）
+                    + 33 // 账号区标题 21 + 12 余量（该区实绘不带分隔线）
+                    + account_block
+                    + error_line
+                    + 33 // 轮询区标题（分隔线上隙 12 + 标题 21）
+                    + 40 // 间隔分段控件（段体 30 + 段后间距 10）
+                    + 63 // 语言行（sub_label 21 + segmented 40 + 行后 2）
+                    + 63 // 外观行（同语言行）
+                    + 28 // 开机自启开关行（标题 19 + 行后 9，无描述行）
+                    + 33 // 通知区标题（分隔线上隙 12 + 标题 21）
+                    + 126 // 三个通知开关行（标题 19 + 描述 14 + 行后 9 = 42 × 3）
+                    + 18 // 关于区纯分隔（无标题：上隙 12 + 下隙 6）
+                    + 29 // 版本行（描边按钮顶偏移 1 + 高 28）
+                    + 30; // 底部余量（按钮边框需完整呈现）
                 base + if self.customizing_interval { 40 } else { 10 }
             }
         }
@@ -225,11 +238,12 @@ impl Panel {
         }
     }
 
-    /// 定位并显示（淡入起点 alpha=0，动画由 TIMER_ANIM 推进）。
-    /// `accounts` 为账号数（设置页高度随账号列表伸缩）。
-    pub fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
-        let Some(hwnd) = self.ensure_window(parent) else { return };
-        self.anchor = Some(anchor);
+    /// 计算并应用面板几何：监视器工作区探测 + DPI 同步 + 锚点上方
+    /// 水平居中 + 三向夹取 + SetWindowPos + 回写动画基准。
+    /// 首次弹出（show=true，带 SWP_SHOWWINDOW）与尺寸变化重排
+    /// （app 层 relayout_panel，show=false）共用，消除两份定位代码。
+    /// `logical_h` 为期望逻辑高度，内部做工作区高度夹取。
+    pub(crate) fn place(&mut self, hwnd: HWND, logical_h: i32, show: bool) {
         unsafe {
             let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
             let mut mi = MONITORINFO {
@@ -237,39 +251,51 @@ impl Panel {
                 ..Default::default()
             };
             let _ = GetMonitorInfoW(monitor, &mut mi);
-            self.dpi = dpi_of(monitor).unwrap_or(1.5);
+            self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
             let w = self.px(PANEL_WIDTH);
             // 高度不超过工作区（小屏 / 多账号时截断显示）
             let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
-            let h = self.px(self.view_height(accounts)).min(max_h);
-            let ax = (anchor.left + anchor.right) / 2;
-            let mut x = ax - w / 2;
-            let mut y = anchor.top - h - self.px(8);
-            if x < mi.rcWork.left + 8 {
-                x = mi.rcWork.left + 8;
-            }
-            if x + w > mi.rcWork.right - 8 {
-                x = mi.rcWork.right - 8 - w;
-            }
-            if y < mi.rcWork.top + 8 {
-                y = mi.rcWork.top + 8;
-            }
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                x, y, w, h,
-                SWP_SHOWWINDOW | SWP_NOCOPYBITS,
-            );
+            let h = self.px(logical_h).min(max_h);
+            let (x, y) = match self.anchor {
+                Some(anchor) => {
+                    let ax = (anchor.left + anchor.right) / 2;
+                    let mut x = ax - w / 2;
+                    let mut y = anchor.top - h - self.px(8);
+                    if x < mi.rcWork.left + 8 {
+                        x = mi.rcWork.left + 8;
+                    }
+                    if x + w > mi.rcWork.right - 8 {
+                        x = mi.rcWork.right - 8 - w;
+                    }
+                    if y < mi.rcWork.top + 8 {
+                        y = mi.rcWork.top + 8;
+                    }
+                    (x, y)
+                }
+                None => (0, 0),
+            };
+            let flags = if show { SWP_SHOWWINDOW | SWP_NOCOPYBITS } else { SWP_NOCOPYBITS };
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
             // 记录布局供展开动画使用（锚定底边）
             self.anim_x = x;
             self.anim_w = w;
             self.anim_full_h = h;
             self.anim_bottom = y + h;
+        }
+    }
+
+    /// 定位并显示（淡入起点 alpha=0，动画由 TIMER_ANIM 推进）。
+    /// `accounts` 为账号数（设置页高度随账号列表伸缩）。
+    pub fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
+        let Some(hwnd) = self.ensure_window(parent) else { return };
+        self.anchor = Some(anchor);
+        let logical_h = self.view_height(accounts);
+        self.place(hwnd, logical_h, true);
+        unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
             // 注意：不再使用 WS_EX_LAYERED 整窗 alpha——layered 与交换链
             // 呈现（HwndRenderTarget）不兼容，且其子控件更新代价高昂。
-            self.hide_anim = false;
             if let Some(r) = self.renderer.as_mut() {
                 r.anim.appear = Some(anim::Tween::now(180));
             }
@@ -313,14 +339,14 @@ impl Panel {
         self.hovered = false;
         self.adding_account = false;
         self.clear_input(hwnd);
-        self.hide_anim = true;
         // 直接隐藏（收起不做自绘动画——收缩/淡出都会与系统 DWM 过渡
-        // 叠加产生闪烁；消失的顺滑交给系统）
+        // 叠加产生闪烁；消失的顺滑交给系统）。注意此处不再 trim 工作集：
+        // 高频悬停会反复 trim/软缺页换回；静止内存由轮询路径的 trim 保证
+        // （最迟一个轮询周期内必触发）。
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-            crate::platform::trim_working_set();
         }
     }
 
@@ -360,7 +386,7 @@ impl Panel {
     }
 
     /// 结束输入状态（销毁光标与 IME 上下文）。
-    fn clear_input(&mut self, hwnd: HWND) {
+    pub(crate) fn clear_input(&mut self, hwnd: HWND) {
         self.input.field = None;
         unsafe {
             let _ = DestroyCaret();
@@ -376,10 +402,6 @@ impl Panel {
         }
     }
 
-    pub fn clear_input_pub(&mut self, hwnd: HWND) {
-        self.clear_input(hwnd);
-    }
-
     /// 聚焦某个输入字段：系统 caret + IME 上下文（组合窗跟随光标，
     /// 拼音在 IME 内组合而不是字母透传进缓冲）。
     pub fn focus_input(&mut self, hwnd: HWND, field: InputField) {
@@ -390,7 +412,7 @@ impl Panel {
             let caret_h = self.px(16);
             let _ = CreateCaret(hwnd, None, 1, caret_h);
             let _ = ShowCaret(Some(hwnd));
-            self.update_caret(hwnd);
+            self.update_caret();
             self.attach_ime(hwnd);
         }
     }
@@ -404,44 +426,57 @@ impl Panel {
         };
         let _ = ImmAssociateContext(hwnd, ImmCreateContext());
         let Some(field) = self.input.field else { return };
-        let (buf, bx, by) = match field {
-            InputField::Name => (&self.input.name, 20.0f32, 203.0f32),
-            InputField::Key => (&self.input.key, 20.0, 256.0),
-            InputField::Interval => (&self.input.interval, 20.0, 168.0),
-            InputField::Org => (&self.input.org, 20.0, 309.0),
-            InputField::Project => (&self.input.project, 20.0, 362.0),
-        };
-        let x = bx + 6.0 + text_width(buf);
+        let (buf, by) = self.caret_anchor(field);
+        let x = layout::INPUT_X + 6.0 + text_width(buf);
+        // 组合窗锚点保持在框底附近（框顶 +17，与历史行为一致）
         let pt = POINT {
             x: (x * self.dpi).round() as i32,
-            y: ((by + 20.0) * self.dpi).round() as i32,
+            y: ((by + 12.0) * self.dpi).round() as i32,
         };
         let ctx = ImmGetContext(hwnd);
         if !ctx.is_invalid() {
-            let mut cf = COMPOSITIONFORM {
+            let cf = COMPOSITIONFORM {
                 dwStyle: CFS_POINT,
                 ptCurrentPos: pt,
                 rcArea: windows::Win32::Foundation::RECT::default(),
             };
-            let _ = ImmSetCompositionWindow(ctx, &mut cf);
+            let _ = ImmSetCompositionWindow(ctx, &cf);
             let _ = ImmReleaseContext(hwnd, ctx);
         }
     }}
 
-    /// 按当前字段内容计算光标位置（按字符实际宽度：ASCII 7.3 / 全角 12.5）。
-    /// 坐标与 draw_settings 的 input_field 布局对齐。
-    pub fn update_caret(&self, _hwnd: HWND) {
-        let Some(field) = self.input.field else { return };
-        // (框 x, 框 y)；间隔框左起 96 宽（与 draw_settings 对齐）
-        let (buf, bx, by) = match field {
-            InputField::Name => (&self.input.name, 20.0f32, 203.0f32),
-            InputField::Key => (&self.input.key, 20.0, 256.0),
-            InputField::Interval => (&self.input.interval, 20.0, 168.0),
-            InputField::Org => (&self.input.org, 20.0, 309.0),
-            InputField::Project => (&self.input.project, 20.0, 362.0),
+    /// 光标/IME 共用锚点：(字段缓冲, 输入框顶 y + CARET_Y_OFFSET)。
+    /// y 统一取 layout——添加页四个输入框是固定常量；设置页的自定义
+    /// 间隔框随账号块/鉴权错误行伸缩（上下文 caret_ctx 由 app 层回写）。
+    fn caret_anchor(&self, field: InputField) -> (&str, f32) {
+        let y = match field {
+            InputField::Name => layout::ADD_NAME_Y,
+            InputField::Key => layout::ADD_KEY_Y,
+            InputField::Interval => {
+                let (has_account, auth_error) = self.caret_ctx;
+                layout::interval_input_y(has_account, auth_error)
+            }
+            InputField::Org => layout::ADD_ORG_Y,
+            InputField::Project => layout::ADD_PROJECT_Y,
+        } + layout::CARET_Y_OFFSET;
+        let buf = match field {
+            InputField::Name => self.input.name.as_str(),
+            InputField::Key => self.input.key.as_str(),
+            InputField::Interval => self.input.interval.as_str(),
+            InputField::Org => self.input.org.as_str(),
+            InputField::Project => self.input.project.as_str(),
         };
-        let x = bx + 6.0 + text_width(buf);
-        let y = by + 5.0;
+        (buf, y)
+    }
+
+    /// 按当前字段内容计算光标位置（按字符实际宽度：ASCII 7.3 / 全角 12.5）。
+    /// 坐标与 draw_settings 的 input_field 布局对齐（见 caret_anchor）。
+    pub fn update_caret(&self) {
+        let Some(field) = self.input.field else { return };
+        let (buf, by) = self.caret_anchor(field);
+        let x = layout::INPUT_X + 6.0 + text_width(buf);
+        // by 已含 CARET_Y_OFFSET（框内垂直居中）
+        let y = by;
         unsafe {
             let _ = SetCaretPos(
                 (x * self.dpi).round() as i32,
@@ -450,20 +485,6 @@ impl Panel {
         }
     }
 
-    // ── 供 app 层使用的访问器 ──
-
-    pub fn px_of(&self, logical: i32) -> i32 {
-        self.px(logical)
-    }
-
-    pub fn view_height_pub(&self, accounts: usize) -> i32 {
-        self.view_height(accounts)
-    }
-
-    #[allow(dead_code)]
-    pub fn dpi_pub(&self) -> f32 {
-        self.dpi
-    }
 }
 
 /// 取显示器有效 DPI（百分比 / 96）。
@@ -502,7 +523,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         .panel
                         .renderer
                         .take()
-                        .or_else(|| Renderer::new());
+                        .or_else(Renderer::new);
                     if let Some(r) = renderer.as_mut() {
                         let view = app.panel.view;
                         let dpi = app.panel.dpi;
@@ -520,7 +541,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 LRESULT(0)
             }
             WM_TIMER => {
-                let id = wparam.0 as usize;
+                let id = wparam.0;
                 match id {
                     TIMER_ANIM => on_anim_tick(hwnd),
                     TIMER_CLOSE_DEBOUNCE => {
@@ -597,11 +618,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                     // 时 target 设了 DPI），匹配前先归一到逻辑
                     let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
                     if let Some(r) = app.panel.renderer.as_mut() {
-                        let hit = r
-                            .hits
-                            .iter()
-                            .find(|(_, rc)| x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom)
-                            .map(|(h, _)| *h);
+                        let hit = r.hit_at(x, y);
                         if r.hover != hit {
                             r.hover = hit;
                             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -647,12 +664,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                         .panel
                         .renderer
                         .as_ref()
-                        .and_then(|r| {
-                            r.hits
-                                .iter()
-                                .find(|(_, rc)| x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom)
-                                .map(|(h, _)| *h)
-                        });
+                        .and_then(|r| r.hit_at(x, y));
                     if let Some(hit) = hit {
                         crate::app::handle_panel_hit(app, hit, hwnd);
                     }
@@ -663,50 +675,46 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 // 自绘输入：键盘直达面板（无 EDIT 子窗口，绕开输入法
                 // 钩子与前台锁定的全部兼容问题）
                 let app = app_from_tray(hwnd);
-                if let Some(app) = app {
-                    if app.panel.input.field.is_some() {
-                        let ch = (wparam.0 & 0xFFFF) as u16;
-                        let mut confirm = false;
-                        {
-                            let input = &mut app.panel.input;
-                            let field = input.field;
-                            let buf = match field {
-                                Some(InputField::Name) => &mut input.name,
-                                Some(InputField::Key) => &mut input.key,
-                                Some(InputField::Org) => &mut input.org,
-                                Some(InputField::Project) => &mut input.project,
-                                _ => &mut input.interval,
-                            };
-                            match char::from_u32(ch as u32) {
-                                Some('\r') | Some('\n') => confirm = true,
-                                Some('\u{8}') => {
-                                    buf.pop();
-                                }
-                                Some('\u{16}') => {
-                                    // Ctrl+V：粘贴剪贴板文本（中文输入的补充路径）
-                                    if let Some(text) = read_clipboard_text() {
-                                        for c in text.chars() {
-                                            if !c.is_control() && buf.len() < 128 {
-                                                buf.push(c);
-                                            }
+                if let Some(app) = app && app.panel.input.field.is_some() {
+                    let ch = (wparam.0 & 0xFFFF) as u16;
+                    let mut confirm = false;
+                    {
+                        let input = &mut app.panel.input;
+                        let field = input.field;
+                        let buf = match field {
+                            Some(InputField::Name) => &mut input.name,
+                            Some(InputField::Key) => &mut input.key,
+                            Some(InputField::Org) => &mut input.org,
+                            Some(InputField::Project) => &mut input.project,
+                            _ => &mut input.interval,
+                        };
+                        match char::from_u32(ch as u32) {
+                            Some('\r') | Some('\n') => confirm = true,
+                            Some('\u{8}') => {
+                                buf.pop();
+                            }
+                            Some('\u{16}') => {
+                                // Ctrl+V：粘贴剪贴板文本（中文输入的补充路径）
+                                if let Some(text) = read_clipboard_text() {
+                                    for c in text.chars() {
+                                        if !c.is_control() && buf.len() < 128 {
+                                            buf.push(c);
                                         }
                                     }
                                 }
-                                Some(c) if !c.is_control() && (c as u32) != 127 => {
-                                    // Unicode 直收：IME 上屏的中文经 WM_CHAR 到达
-                                    if buf.len() < 128 {
-                                        buf.push(c);
-                                    }
-                                }
-                                _ => {}
                             }
+                            // Unicode 直收：IME 上屏的中文经 WM_CHAR 到达
+                            Some(c) if !c.is_control() && (c as u32) != 127 && buf.len() < 128 => {
+                                buf.push(c);
+                            }
+                            _ => {}
                         }
-                        if confirm {
-                            crate::app::confirm_panel_input(app, hwnd);
-                        }
-                        app.panel.update_caret(hwnd);
-                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
+                    if confirm {
+                        crate::app::confirm_panel_input(app, hwnd);
+                    }
+                    app.panel.update_caret();
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -784,15 +792,6 @@ fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
     }
 }
 
-/// 线性 [0..1] 颜色 → COLORREF（0x00BBGGRR）。
-#[allow(dead_code)]
-fn rgb_of(c: [f32; 4]) -> u32 {
-    let r = (c[0].clamp(0.0, 1.0) * 255.0).round() as u32;
-    let g = (c[1].clamp(0.0, 1.0) * 255.0).round() as u32;
-    let b = (c[2].clamp(0.0, 1.0) * 255.0).round() as u32;
-    r | (g << 8) | (b << 16)
-}
-
 /// 等宽 12px 字号下的文本像素宽（ASCII 7.3 / 全角 CJK 12.5）。
 fn text_width(s: &str) -> f32 {
     s.chars().map(|c| if c.is_ascii() { 7.3 } else { 12.5 }).sum()
@@ -804,7 +803,7 @@ fn read_clipboard_text() -> Option<String> {
         use windows::Win32::System::DataExchange::{
             CloseClipboard, GetClipboardData, OpenClipboard,
         };
-        use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
         use windows::Win32::Foundation::HGLOBAL;
 
         const CF_UNICODETEXT: u32 = 13;
@@ -815,8 +814,11 @@ fn read_clipboard_text() -> Option<String> {
             if ptr.is_null() {
                 return None;
             }
+            // NUL 结尾扫描加分配上界（GlobalSize / 2 个 u16）——剪贴板
+            // 数据由外部进程写入，防无终止符的脏数据导致越界读
+            let max_units = GlobalSize(hg) / 2;
             let mut len = 0usize;
-            while *ptr.add(len) != 0 {
+            while len < max_units && *ptr.add(len) != 0 {
                 len += 1;
             }
             let s = String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len));
@@ -835,8 +837,4 @@ fn x_of(l: LPARAM) -> f32 {
 
 fn y_of(l: LPARAM) -> f32 {
     ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }

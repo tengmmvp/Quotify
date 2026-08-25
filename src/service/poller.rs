@@ -1,17 +1,22 @@
 //! 后台轮询线程：按可变间隔拉取用量，结果 PostMessage 回主线程。
 //!
-//! 唤醒语义：`wake` 事件被设置时立即拉取一次并重置计时（手动刷新 /
-//! 间隔变更共用）；自然到期也拉取。线程只在等待与请求时占用，无轮询空转。
+//! 唤醒语义：`wake` 事件被设置时——手动刷新（refresh_now）立即拉取并
+//! 重置计时；间隔/账号变更（reschedule）不立即拉取，但按当前间隔重排
+//! 下一轮，保证新间隔即刻生效；自然到期同样拉取。线程只在等待与请求时
+//! 占用，无轮询空转。
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT, WPARAM};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
+use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::api::client::AccountSpec;
+// 消息号统一由 platform::msg 分配；对 app 层保持 `poller::WM_APP_POLL_RESULT`
+// 旧路径可用（pub(crate) 再导出）
+pub(crate) use crate::platform::msg::WM_APP_POLL_RESULT;
 
 /// 一次轮询的结果（跨线程传递给主线程）。
 pub enum PollOutcome {
@@ -23,9 +28,6 @@ pub enum PollOutcome {
 pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
 /// 当前轮询间隔（秒）。主线程在设置变更时更新。
 pub type PollInterval = Arc<Mutex<u64>>;
-
-/// 回传结果用的自定义消息。
-pub const WM_APP_POLL_RESULT: u32 = WM_APP + 2;
 
 pub struct Poller {
     wake: HANDLE,
@@ -69,7 +71,7 @@ impl Poller {
         unsafe { let _ = SetEvent(self.wake); };
     }
 
-    /// 间隔或账号变更：不立即拉取，仅重置计时。
+    /// 间隔或账号变更：不立即拉取，仅按当前间隔重排计时。
     pub fn reschedule(&self) {
         unsafe { let _ = SetEvent(self.wake); };
     }
@@ -98,7 +100,6 @@ fn poll_loop(
 ) {
     let handles = [stop, wake];
     let mut next_due = Instant::now();
-    let mut had_target = false;
 
     loop {
         let now = Instant::now();
@@ -112,11 +113,14 @@ fn poll_loop(
         if wait == WAIT_OBJECT_0 {
             return; // stop
         }
-        let _ = WAIT_TIMEOUT;
         // wake 或超时：判断是否需要拉取
         let manual = refresh_flag.swap(false, Ordering::AcqRel);
         let due = Instant::now() >= next_due;
         if !manual && !due {
+            // 变更类唤醒（间隔/账号）：不立即拉取，但必须按当前间隔重排，
+            // 否则 next_due 沿用旧值、新间隔要到旧周期走完才生效
+            let secs = interval.lock().unwrap().max(10);
+            next_due = Instant::now() + Duration::from_secs(secs);
             continue;
         }
 
@@ -126,31 +130,31 @@ fn poll_loop(
                 Some(v) => v,
                 None => {
                     // 无账号：挂起等下一次唤醒，不空转
-                    if had_target {
-                        had_target = false;
-                    }
                     next_due = Instant::now() + Duration::from_secs(60);
                     continue;
                 }
             }
         };
-        had_target = true;
 
         let outcome = match crate::api::client::fetch_usage(&spec) {
             Ok(s) => PollOutcome::Success(Box::new(s)),
             Err(e) => PollOutcome::Failure(Box::new(e)),
         };
         let boxed = Box::into_raw(Box::new(outcome));
-        unsafe {
-            let _ = PostMessageW(
+        let posted = unsafe {
+            PostMessageW(
                 Some(hwnd),
                 WM_APP_POLL_RESULT,
                 WPARAM(boxed as usize),
                 Default::default(),
-            );
+            )
+        };
+        if posted.is_err() {
+            // 投递失败（窗口已销毁等）：主线程不会取回指针，立即释放防泄漏
+            drop(unsafe { Box::from_raw(boxed) });
         }
 
-        let secs = interval.lock().unwrap().clone().max(10);
+        let secs = interval.lock().unwrap().max(10);
         next_due = Instant::now() + Duration::from_secs(secs);
     }
 }

@@ -76,7 +76,7 @@ pub fn as_of_time(at: DateTime<Local>) -> String {
 /// 距今时长的短表述（更新时间脚注用）：分钟 / 小时 / 天粒度。
 /// 「刚刚」由调用方判 <60s 后走 `updated_just_now`，不进这里。
 pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
-    let secs = (Local::now() - at).num_seconds().clamp(0, i64::MAX as i64);
+    let secs = (Local::now() - at).num_seconds().clamp(0, i64::MAX);
     match lang {
         Lang::Zh => {
             if secs < 3600 {
@@ -95,22 +95,6 @@ pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
             } else {
                 format!("{}d", secs / 86400)
             }
-        }
-    }
-}
-
-/// 重置钟点：当天只给 HH:MM；跨天前缀日期（参考 ai-usagebar——18 小时
-/// 后的裸「03:00」会被读成已过去的时刻，日期正是为消除这个歧义）。
-#[allow(dead_code)]
-pub fn reset_clock(at: DateTime<Utc>, lang: Lang) -> String {
-    let local: DateTime<Local> = at.into();
-    let today = Local::now().date_naive();
-    if local.date_naive() == today {
-        local.format("%H:%M").to_string()
-    } else {
-        match lang {
-            Lang::Zh => local.format("%m月%d日 %H:%M").to_string(),
-            Lang::En => local.format("%b %d %H:%M").to_string(),
         }
     }
 }

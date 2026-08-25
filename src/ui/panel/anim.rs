@@ -6,7 +6,9 @@ pub fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
-/// 缓入缓出（ease-in-out cubic），进度条数值过渡用。
+/// 缓入缓出（ease-in-out cubic)，进度条数值过渡用。
+/// 预留：进度条平滑插值接入渲染时启用（同 api 层数据字段的待接策略）。
+#[allow(dead_code)]
 pub fn ease_in_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     if t < 0.5 {

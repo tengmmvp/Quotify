@@ -30,6 +30,6 @@ pub fn show(hwnd: HWND, tray_id: u32, title: &str, body: &str) {
     }
     nid.dwInfoFlags = NIIF_LARGE_ICON;
     unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &mut nid);
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
     }
 }

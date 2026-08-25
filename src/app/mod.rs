@@ -3,11 +3,10 @@
 pub mod config;
 
 use chrono::{DateTime, Utc};
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
-use windows::Win32::Graphics::Gdi::{
-    InvalidateRect, MonitorFromWindow, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
-};
+use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU, MF_STRING,
@@ -16,20 +15,25 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WM_COMMAND, WM_DESTROY,
 };
 
-use crate::api::{FetchError, UsageSnapshot};
-use crate::platform::instance::{TRAY_WND_CLASS, WM_APP_WAKEUP};
-use crate::service::poller::{
-    PollOutcome, Poller, PollInterval, PollTarget, WM_APP_POLL_RESULT,
+use crate::api::{FetchError, QuotaBucket, UsageSnapshot};
+use crate::app::config::Config;
+use crate::platform::instance::TRAY_WND_CLASS;
+use crate::platform::msg::{
+    WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
 };
+use crate::platform::wide;
+use crate::service::poller::{PollInterval, PollOutcome, Poller, PollTarget};
 use crate::ui::i18n::{Lang, Strings};
+use crate::ui::icon;
 use crate::ui::panel::Panel;
 use crate::ui::tray::{self, TrayIcon};
-use crate::ui::icon;
-use crate::app::config::Config;
 
 /// 右键菜单命令 ID。
 const IDM_SETTINGS: u16 = 1001;
 const IDM_EXIT: u16 = 1002;
+
+/// 气泡通知的固定标题（应用名）。
+const NOTIFY_TITLE: &str = "Quotify";
 
 /// 当前账号的展示状态（旧数据 + 最近错误并存，失败时面板保留旧值）。
 pub struct AccountData {
@@ -51,6 +55,13 @@ pub struct App {
     hwnd: Option<HWND>,
     /// 检查更新结果（设置页显示）
     pub update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
+    /// 检查更新在飞（连点去重，结果回传时清除）
+    update_checking: bool,
+    /// 开机自启当前状态（启动时读注册表一次，切换时同步；设置页渲染读）
+    pub autostart_enabled: bool,
+    /// 托盘图标去重键：(取整百分比, 有无快照, 失败灰环)。未变则跳过
+    /// 逐像素光栅 + HICON 重建 + NIM_MODIFY 整条开销
+    last_icon_key: Option<(i64, bool, bool)>,
     // 通知去重状态
     threshold_armed_5h: bool,
     threshold_armed_weekly: bool,
@@ -74,6 +85,9 @@ impl App {
             panel: Panel::new(),
             hwnd: None,
             update_status: None,
+            update_checking: false,
+            autostart_enabled: crate::platform::autostart::is_enabled(),
+            last_icon_key: None,
             threshold_armed_5h: true,
             threshold_armed_weekly: true,
             last_reset_5h: None,
@@ -101,14 +115,28 @@ impl App {
         *self.poll_interval.lock().unwrap() = self.config.general.poll_interval_secs.max(10);
     }
 
-    /// 按最新状态重建托盘图标：无数据 → 默认 logo；有数据 → 环形进度。
+    /// 按最新状态重建托盘图标：无数据 → 默认 logo；有数据 → 环形进度；
+    /// 拉取失败且无旧数据 → 灰环（有旧数据仍显示旧进度）。
     fn update_tray_icon(&mut self) {
+        // 失败且无旧数据才画灰环；有旧数据保留旧进度
+        let failed = self.data.last_error.is_some() && self.data.snapshot.is_none();
+        let used = self
+            .data
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.five_hour.as_ref())
+            .map(|b| b.used_percent)
+            .unwrap_or(0.0);
+        let key = (used.round() as i64, self.data.snapshot.is_some(), failed);
+        if self.last_icon_key == Some(key) {
+            return;
+        }
         let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
         let new = match &self.data.snapshot {
-            Some(s) => {
-                let used = s.five_hour.as_ref().map(|b| b.used_percent).unwrap_or(0.0);
-                icon::ring_icon(px, used, false)
-            }
+            // 有快照时 failed 恒为 false（其定义含 snapshot.is_none()）
+            Some(_) => icon::ring_icon(px, used, failed),
+            // 失败且无旧数据：灰环（区别于「尚未拉取」的 logo）
+            None if failed => icon::ring_icon(px, 0.0, true),
             None => icon::logo_icon(px),
         };
         if let Some(new) = new {
@@ -119,6 +147,7 @@ impl App {
                 tray.update_icon(new);
             }
             self.tray_icon = Some(new);
+            self.last_icon_key = Some(key);
         }
     }
 
@@ -146,84 +175,79 @@ impl App {
         }
     }
 
-    /// 阈值预警与重置通知（开关均默认关闭）。
+    /// 阈值预警与重置通知（开关均默认关闭）。5h / 周两窗走同一套
+    /// 检测逻辑（check_reset / check_threshold），差异只在状态位与文案。
     fn check_notifications(&mut self, snap: &UsageSnapshot) {
         let g = &self.config.general;
         let hwnd = self.hwnd();
         let tray_id = self.tray.as_ref().map(|t| t.tray_id()).unwrap_or(1);
+        let notify = |body: &str| crate::platform::notify::show(hwnd, tray_id, NOTIFY_TITLE, body);
 
         // 重置检测：重置时刻变化即认为进入新窗口（两类提醒独立开关）
-        if let Some(fh) = &snap.five_hour {
-            if self.last_reset_5h.is_some_and(|old| old != fh.resets_at.unwrap_or(old)) {
-                if g.notify_reset_5h_enabled {
-                    crate::platform::notify::show(hwnd, tray_id, "Quotify", self.strings.notify_reset_5h);
-                }
-                self.threshold_armed_5h = true; // 新窗口重新武装阈值
-            }
-            self.last_reset_5h = fh.resets_at;
-        }
-        if let Some(w) = &snap.weekly {
-            if self.last_reset_weekly.is_some_and(|old| old != w.resets_at.unwrap_or(old)) {
-                if g.notify_reset_weekly_enabled {
-                    crate::platform::notify::show(hwnd, tray_id, "Quotify", self.strings.notify_reset_weekly);
-                }
-                self.threshold_armed_weekly = true;
-            }
-            self.last_reset_weekly = w.resets_at;
-        }
+        check_reset(
+            snap.five_hour.as_ref(),
+            &mut self.last_reset_5h,
+            &mut self.threshold_armed_5h,
+            g.notify_reset_5h_enabled,
+            self.strings.notify_reset_5h,
+            &notify,
+        );
+        check_reset(
+            snap.weekly.as_ref(),
+            &mut self.last_reset_weekly,
+            &mut self.threshold_armed_weekly,
+            g.notify_reset_weekly_enabled,
+            self.strings.notify_reset_weekly,
+            &notify,
+        );
 
         // 阈值预警：越线提醒一次，回落重新武装
         if g.notify_threshold_enabled {
             let th = g.notify_threshold_percent as f64;
-            if let Some(fh) = &snap.five_hour {
-                if fh.used_percent >= th && self.threshold_armed_5h {
-                    self.threshold_armed_5h = false;
-                    let body = format!(
-                        "{} {} {}%",
-                        self.strings.five_hour,
-                        self.strings.notify_threshold_title,
-                        fh.used_percent.round() as i64
-                    );
-                    crate::platform::notify::show(hwnd, tray_id, "Quotify", &body);
-                } else if fh.used_percent < th {
-                    self.threshold_armed_5h = true;
-                }
-            }
-            if let Some(w) = &snap.weekly {
-                if w.used_percent >= th && self.threshold_armed_weekly {
-                    self.threshold_armed_weekly = false;
-                    let body = format!(
-                        "{} {} {}%",
-                        self.strings.weekly,
-                        self.strings.notify_threshold_title,
-                        w.used_percent.round() as i64
-                    );
-                    crate::platform::notify::show(hwnd, tray_id, "Quotify", &body);
-                } else if w.used_percent < th {
-                    self.threshold_armed_weekly = true;
-                }
-            }
+            check_threshold(
+                snap.five_hour.as_ref(),
+                &mut self.threshold_armed_5h,
+                th,
+                self.strings.five_hour,
+                self.strings.notify_threshold_title,
+                &notify,
+            );
+            check_threshold(
+                snap.weekly.as_ref(),
+                &mut self.threshold_armed_weekly,
+                th,
+                self.strings.weekly,
+                self.strings.notify_threshold_title,
+                &notify,
+            );
         }
     }
 
     /// 托盘右键菜单（设置 / 退出）。
+    ///
+    /// 重入不变量：TrackPopupMenu 会进入模态循环，期间持续派发消息
+    /// （WM_COMMAND 等）重入 wndproc 取得 `&mut App`。单线程消息循环下
+    /// 无真并发，但本方法持有的 `&self` 不得活到循环内——所有借自
+    /// self 的值（owner 窗口、两段文案的宽字符）在进入循环前取齐，
+    /// 循环期间不再触 self 任何字段，消除别名点。
     fn show_context_menu(&self, pos: windows::Win32::Foundation::POINT) {
         unsafe {
+            let owner = self.hwnd();
+            let settings = wide(self.strings.settings);
+            let exit = wide(self.strings.exit);
             let menu: HMENU = CreatePopupMenu().unwrap_or_default();
             if menu.is_invalid() {
                 return;
             }
-            let mut buf = wide(self.strings.settings);
-            let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, PCWSTR(buf.as_ptr()));
-            buf = wide(self.strings.exit);
-            let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(buf.as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_SETTINGS as usize, PCWSTR(settings.as_ptr()));
+            let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit.as_ptr()));
             let _ = TrackPopupMenu(
                 menu,
                 TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
                 pos.x,
                 pos.y,
                 None,
-                self.hwnd(),
+                owner,
                 None,
             );
             let _ = DestroyMenu(menu);
@@ -231,32 +255,64 @@ impl App {
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
+/// 单个窗口的重置检测：重置时刻变化即视为进入新窗口，按开关提醒并
+/// 重新武装阈值。
+fn check_reset(
+    bucket: Option<&QuotaBucket>,
+    last: &mut Option<DateTime<Utc>>,
+    armed: &mut bool,
+    enabled: bool,
+    msg: &'static str,
+    notify: &dyn Fn(&str),
+) {
+    if let Some(b) = bucket {
+        if last.is_some_and(|old| old != b.resets_at.unwrap_or(old)) {
+            if enabled {
+                notify(msg);
+            }
+            *armed = true; // 新窗口重新武装阈值
+        }
+        *last = b.resets_at;
+    }
 }
 
-// 编译期把 PCWSTR 引入作用域（windows::core）
-use windows::core::PCWSTR;
+/// 单个窗口的阈值预警：越线提醒一次，回落重新武装。
+fn check_threshold(
+    bucket: Option<&QuotaBucket>,
+    armed: &mut bool,
+    th: f64,
+    label: &'static str,
+    title: &'static str,
+    notify: &dyn Fn(&str),
+) {
+    if let Some(b) = bucket {
+        if b.used_percent >= th && *armed {
+            *armed = false;
+            let body = format!("{label} {title} {}%", b.used_percent.round() as i64);
+            notify(&body);
+        } else if b.used_percent < th {
+            *armed = true;
+        }
+    }
+}
 
 /// 托盘隐藏窗口过程。
 extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
-        crate::ui::tray::WM_APP_TRAY => {
+        WM_APP_TRAY => {
             let app = app_from(hwnd);
             let (code, _) = tray::parse_callback(lparam);
             match code {
                 tray::NIN_POPUPOPEN => {
-                    if let Some(app) = app {
-                        if let Some(rect) = tray_rect(app) {
+                    if let Some(app) = app
+                        && let Some(rect) = tray_rect(app) {
                             let n = app.config.accounts.len();
                             sync_main_height(app);
-                            apply_appearance(app);
                             app.panel.show_preview(hwnd, rect, n);
                             // 渲染器在 show_at 内才创建：显示后再应用一次，
                             // 保证显式选择的外观从首帧生效
                             apply_appearance(app);
                         }
-                    }
                 }
                 tray::NIN_POPUPCLOSE => {
                     if let Some(app) = app {
@@ -264,15 +320,13 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     }
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
-                    if let Some(app) = app {
-                        if let Some(rect) = tray_rect(app) {
+                    if let Some(app) = app
+                        && let Some(rect) = tray_rect(app) {
                             let n = app.config.accounts.len();
                             sync_main_height(app);
-                            apply_appearance(app);
                             app.panel.toggle_pin(hwnd, rect, n);
                             apply_appearance(app);
                         }
-                    }
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                     if let Some(app) = app {
@@ -297,6 +351,8 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_APP_UPDATE_RESULT => {
             let app = app_from(hwnd);
             if let Some(app) = app {
+                // 结果已回：清除在飞标记（成功失败都清）
+                app.update_checking = false;
                 let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
                 if !boxed.is_null() {
                     let r = unsafe { Box::from_raw(boxed) };
@@ -314,13 +370,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
             LRESULT(0)
         }
-        WM_APP_WAKEUP => {
-            if let Some(app) = app_from(hwnd) {
-                if let Some(rect) = tray_rect(app) {
+        WM_APP_WAKE_INSTANCE => {
+            if let Some(app) = app_from(hwnd)
+                && let Some(rect) = tray_rect(app) {
                     let n = app.config.accounts.len();
                     app.panel.toggle_pin(hwnd, rect, n);
                 }
-            }
             LRESULT(0)
         }
         WM_COMMAND => {
@@ -330,8 +385,8 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     let _ = DestroyWindow(hwnd);
                 },
                 IDM_SETTINGS => {
-                    if let Some(app) = app_from(hwnd) {
-                        if let Some(rect) = tray_rect(app) {
+                    if let Some(app) = app_from(hwnd)
+                        && let Some(rect) = tray_rect(app) {
                             let n = app.config.accounts.len();
                             app.panel.show_preview(hwnd, rect, n);
                             app.panel.view = crate::ui::panel::PanelView::Settings;
@@ -340,7 +395,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                                 relayout_panel(app, p);
                             }
                         }
-                    }
                 }
                 _ => {}
             }
@@ -366,7 +420,6 @@ fn app_from(hwnd: HWND) -> Option<&'static mut App> {
 /// 面板命中处理：渲染层 `Hit` → 应用动作。
 pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
     use crate::ui::panel::render::Hit;
-    let s = app.strings;
     match hit {
         Hit::Refresh | Hit::Retry => {
             if let Some(p) = &app.poller {
@@ -387,7 +440,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             let was_adding = app.panel.adding_account;
             app.panel.adding_account = false;
             app.panel.customizing_interval = false;
-            app.panel.clear_input_pub(panel_hwnd);
+            app.panel.clear_input(panel_hwnd);
             // 添加账号页的「取消」回设置页；设置页的「返回」才回主界面
             if !was_adding {
                 app.panel.view = crate::ui::panel::PanelView::Main;
@@ -403,7 +456,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
             // 预设生效：收起自定义输入行
             app.panel.customizing_interval = false;
-            app.panel.clear_input_pub(panel_hwnd);
+            app.panel.clear_input(panel_hwnd);
             relayout_panel(app, panel_hwnd);
         }
         Hit::Language(tag) => {
@@ -459,8 +512,9 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::ToggleAutostart => {
             let next = !crate::platform::autostart::is_enabled();
-            if let Err(e) = crate::platform::autostart::set_enabled(next) {
-                eprintln!("{e}");
+            match crate::platform::autostart::set_enabled(next) {
+                Ok(()) => app.autostart_enabled = next,
+                Err(e) => crate::platform::log(&format!("[Quotify] 开机自启设置失败: {e}")),
             }
         }
         Hit::RemoveAccount(i) => {
@@ -469,6 +523,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 app.config.accounts.remove(i);
                 if app.config.selected.as_deref() == Some(removed_id.as_str()) {
                     app.config.selected = app.config.accounts.first().map(|a| a.id.clone());
+                }
+                // 旧命中区携带列表索引：列表已变立即作废，防止 WM_PAINT
+                // 低优先级派发下的第二次点击用旧矩形删掉下一个账号（双击连删）
+                if let Some(r) = app.panel.renderer.as_mut() {
+                    r.hits.clear();
+                    r.hover = None;
                 }
                 crate::app::config::save(&app.config);
                 app.data = AccountData { snapshot: None, last_error: None };
@@ -529,44 +589,49 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                     .unwrap_or_default();
                 let idx = app.config.accounts.iter().position(|a| a.id == cur).unwrap_or(0);
                 let next = (idx + 1) % n;
-                select_account(app, panel_hwnd, next);
+                select_account(app, next);
             }
         }
         Hit::CheckUpdate => {
-            app.update_status = None;
-            // HWND 跨线程移动安全（内核对象引用），显式声明 Send
-            struct SendHwnd(HWND);
-            unsafe impl Send for SendHwnd {}
-            let tray = SendHwnd(app.hwnd());
-            std::thread::spawn(move || {
-                // 先整体移动 SendHwnd（2021 精准捕获会绕过包装直接捕获裸 HWND）
-                let tray = tray;
-                let r = crate::service::update::check_latest();
-                let boxed = Box::into_raw(Box::new(r));
-                unsafe {
-                    let _ = windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                        Some(tray.0),
-                        WM_APP_UPDATE_RESULT,
-                        WPARAM(boxed as usize),
-                        Default::default(),
-                    );
-                }
-            });
+            // 在飞去重：上一轮结果未回不重复发起（连点只查一次）
+            if !app.update_checking {
+                app.update_checking = true;
+                app.update_status = None;
+                // HWND 跨线程移动安全（内核对象引用），显式声明 Send
+                struct SendHwnd(HWND);
+                unsafe impl Send for SendHwnd {}
+                let tray = SendHwnd(app.hwnd());
+                std::thread::spawn(move || {
+                    // 先整体移动 SendHwnd（2021 精准捕获会绕过包装直接捕获裸 HWND）
+                    let tray = tray;
+                    let r = crate::service::update::check_latest();
+                    let boxed = Box::into_raw(Box::new(r));
+                    let posted = unsafe {
+                        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                            Some(tray.0),
+                            WM_APP_UPDATE_RESULT,
+                            WPARAM(boxed as usize),
+                            Default::default(),
+                        )
+                    };
+                    // 投递失败（窗口已销毁）：取回 boxed 防泄漏
+                    if posted.is_err() {
+                        drop(unsafe { Box::from_raw(boxed) });
+                    }
+                });
+            }
         }
     }
-    let _ = s;
     unsafe {
         let _ = InvalidateRect(Some(panel_hwnd), None, true);
     }
 }
 
-/// 更新结果回传消息（与轮询结果分开）。
-pub const WM_APP_UPDATE_RESULT: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
-
 /// 选中账号 i 并立即刷新。
-fn select_account(app: &mut App, panel_hwnd: HWND, i: usize) {
-    if let Some(acc) = app.config.accounts.get(i).cloned() {
-        app.config.selected = Some(acc.id);
+fn select_account(app: &mut App, i: usize) {
+    // 只克隆 id：账号结构含 api_key，无需整体复制
+    if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
+        app.config.selected = Some(id);
         crate::app::config::save(&app.config);
         app.data = AccountData { snapshot: None, last_error: None };
         app.sync_poll_context();
@@ -575,7 +640,6 @@ fn select_account(app: &mut App, panel_hwnd: HWND, i: usize) {
             p.refresh_now();
         }
     }
-    let _ = panel_hwnd;
 }
 
 /// 团队输入行收起（切回个人版）时，若焦点还在组织/项目框里则清除，
@@ -585,7 +649,7 @@ fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
     if !app.panel.pending_team
         && matches!(app.panel.input.field, Some(InputField::Org) | Some(InputField::Project))
     {
-        app.panel.clear_input_pub(panel_hwnd);
+        app.panel.clear_input(panel_hwnd);
     }
 }
 
@@ -614,9 +678,14 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     if is_first || app.config.selected.is_none() {
         app.config.selected = Some(acc.id);
     }
+    // 旧命中区携带列表索引：列表已变立即作废（防旧矩形误触）
+    if let Some(r) = app.panel.renderer.as_mut() {
+        r.hits.clear();
+        r.hover = None;
+    }
     crate::app::config::save(&app.config);
     app.panel.adding_account = false;
-    app.panel.clear_input_pub(panel_hwnd);
+    app.panel.clear_input(panel_hwnd);
     app.data = AccountData { snapshot: None, last_error: None };
     app.sync_poll_context();
     app.update_tray_icon();
@@ -630,15 +699,18 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
 /// （预填新值，当前值始终可见）；恰好落在预设上则收起。
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     if let Some(mins) = app.panel.input.interval.trim().parse::<u64>().ok().filter(|m| *m > 0) {
-        app.config.general.poll_interval_secs = (mins * 60).max(10);
-        crate::app::config::save(&app.config);
-        app.sync_poll_context();
-        if let Some(p) = &app.poller {
-            p.reschedule();
+        // 大数乘 60 可能回绕出超小间隔：溢出时保持原值
+        if let Some(secs) = mins.checked_mul(60) {
+            app.config.general.poll_interval_secs = secs.max(10);
+            crate::app::config::save(&app.config);
+            app.sync_poll_context();
+            if let Some(p) = &app.poller {
+                p.reschedule();
+            }
         }
     }
     sync_customizing(app);
-    app.panel.clear_input_pub(panel_hwnd);
+    app.panel.clear_input(panel_hwnd);
     relayout_panel(app, panel_hwnd);
 }
 
@@ -655,7 +727,7 @@ fn sync_customizing(app: &mut App) {
 /// 用当前配置预填自定义间隔（分钟，向上取整）。
 fn prefill_interval(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
-    let mins = (cur + 59) / 60;
+    let mins = cur.div_ceil(60);
     app.panel.input.interval = mins.to_string();
 }
 
@@ -715,54 +787,35 @@ fn sync_main_height(app: &mut App) {
     app.panel.main_h = match app.data.snapshot.as_ref() {
         None => 300,
         Some(snap) => {
-            let has_meta = !snap.plan_version.label().is_empty()
-                || !snap.tier.label().is_empty()
-                || snap.plan_label.as_deref().is_some_and(|s| !s.is_empty());
             let rows = [snap.five_hour.is_some(), snap.weekly.is_some(), snap.mcp.is_some()]
                 .iter()
                 .filter(|b| **b)
                 .count() as i32;
             let bal = snap.balance.is_some() as i32;
             // 顶栏 + 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
-            16 + if has_meta { 52 } else { 38 } + 42 + rows * 52 + bal * 40 + 40
+            16 + if snap.has_meta() { 52 } else { 38 } + 42 + rows * 52 + bal * 40 + 40
         }
     };
 }
 
-/// 视图切换后面板重定位重设尺寸。
+/// 视图切换后面板重定位重设尺寸。编排：高度重算 → 鉴权错误状态 →
+/// 光标上下文 → 外观 → 定位。定位统一走 `Panel::place`（监视器 + DPI +
+/// 夹取 + SetWindowPos + 动画基准一行完成）。
 fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
     sync_main_height(app);
     app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth(_)));
+    // 自绘输入的光标上下文（设置页间隔输入框 y 随账号区 / 错误行伸缩）
+    app.panel.caret_ctx = (!app.config.accounts.is_empty(), app.panel.account_error);
     apply_appearance(app);
-    let Some(anchor) = app.panel.anchor else { return };
+    // 面板已收起：只同步状态，不做窗口几何操作（不 SetWindowPos 不 Invalidate）
+    if app.panel.mode == crate::ui::panel::PanelMode::Hidden {
+        return;
+    }
+    if app.panel.anchor.is_none() {
+        return;
+    }
+    app.panel.place(panel_hwnd, app.panel.view_height(app.config.accounts.len()), false);
     unsafe {
-        use windows::Win32::UI::WindowsAndMessaging::*;
-        let monitor = MonitorFromWindow(panel_hwnd, MONITOR_DEFAULTTONEAREST);
-        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
-            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = GetMonitorInfoW(monitor, &mut mi);
-        let w = app.panel.px_of(crate::ui::panel::theme::PANEL_WIDTH);
-        let h = app.panel.px_of(app.panel.view_height_pub(app.config.accounts.len()));
-        let ax = (anchor.left + anchor.right) / 2;
-        let mut x = ax - w / 2;
-        let mut y = anchor.top - h - app.panel.px_of(8);
-        if x < mi.rcWork.left + 8 {
-            x = mi.rcWork.left + 8;
-        }
-        if x + w > mi.rcWork.right - 8 {
-            x = mi.rcWork.right - 8 - w;
-        }
-        if y < mi.rcWork.top + 8 {
-            y = mi.rcWork.top + 8;
-        }
-        let _ = SetWindowPos(panel_hwnd, Some(HWND_TOPMOST), x, y, w, h, SWP_NOCOPYBITS);
-        // 同步展开动画的布局基准
-        app.panel.anim_x = x;
-        app.panel.anim_w = w;
-        app.panel.anim_full_h = h;
-        app.panel.anim_bottom = y + h;
         let _ = InvalidateRect(Some(panel_hwnd), None, true);
     }
 }
@@ -777,7 +830,6 @@ pub fn run() -> i32 {
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
         let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-        let _gdiplus = icon::init();
 
         let config = config::load();
         let app = Box::new(App::new(config));
@@ -818,7 +870,7 @@ pub fn run() -> i32 {
         let px = GetSystemMetrics(SM_CXSMICON).max(16);
         let initial = icon::logo_icon(px);
         if initial.is_none() {
-            eprintln!("[Quotify] 初始 logo 图标生成失败 (px={px}, gdiplus={})", _gdiplus.is_some());
+            crate::platform::log(&format!("[Quotify] 初始 logo 图标生成失败 (px={px})"));
         }
         let initial = initial.unwrap_or_default();
         app.tray_icon = Some(initial);

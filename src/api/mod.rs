@@ -136,6 +136,18 @@ pub struct UsageSnapshot {
     pub queried_at: DateTime<Local>,
 }
 
+impl UsageSnapshot {
+    /// 是否携带套餐元信息（代际/档位/原始标签任一存在）。
+    /// 主视图顶栏高度（渲染层）与 sync_main_height（高度公式）共用此
+    /// 谓词——此前两处分别用 `snap.is_some()` 与字段判空，判定漂移导致
+    /// 无标签快照（仅 MCP 桶）时内容与 footer 重叠。
+    pub fn has_meta(&self) -> bool {
+        !self.plan_version.label().is_empty()
+            || !self.tier.label().is_empty()
+            || self.plan_label.as_deref().is_some_and(|s| !s.is_empty())
+    }
+}
+
 /// 账户余额（国内版 `query-customer-account-report` 端点）。
 #[derive(Debug, Clone, Default)]
 pub struct Balance {
@@ -178,7 +190,12 @@ fn window_minutes(item: &Value) -> Option<i64> {
     const MULTIPLIERS: &[(i64, i64)] = &[(1, 1440), (3, 60), (4, 1440), (5, 1), (6, 10080)];
     let unit = item.get("unit").and_then(Value::as_i64)?;
     let number = item.get("number").and_then(Value::as_i64).filter(|&n| n > 0)?;
-    MULTIPLIERS.iter().find(|(u, _)| *u == unit).map(|(_, m)| number * m)
+    // number 来自不可信 JSON，可达 i64::MAX：溢出时返回 None 走
+    // unclassified 兜底，而不是 debug 下 panic / release 下回绕错值
+    MULTIPLIERS
+        .iter()
+        .find(|(u, _)| *u == unit)
+        .and_then(|(_, m)| number.checked_mul(*m))
 }
 
 /// 取 `limits` 数组。兼容三种位置：`data.limits`、`data` 本身即数组、
@@ -392,11 +409,11 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
             return Err(inband_error(code, msg));
         }
         // 信封里的 `code` 与 `success` 并存（CodexBar 实测），非 200 视为业务错误
-        if let Some(code) = v.get("code").and_then(Value::as_i64) {
-            if code != 200 {
-                let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
-                return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
-            }
+        if let Some(code) = v.get("code").and_then(Value::as_i64)
+            && code != 200
+        {
+            let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
+            return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
         }
         v.get("data")
             .ok_or_else(|| FetchError::Api("响应缺少 data 字段".into()))?
@@ -405,12 +422,12 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
     // 空额度检测：团队版缺组织/项目选择头时接口仍返回 success，但 limits
     // 为空（cc-switch #4222/#6402 根因）；个人版 key 无 Coding Plan 权限时
     // 同形态。给出可行动的错误而不是静默空面板。
-    if limits_of(&data).is_none_or(|limits| limits.is_empty()) {
+    if limits_of(data).is_none_or(|limits| limits.is_empty()) {
         return Err(FetchError::Api(
             "未返回额度数据：请确认 API key 属于编码套餐（团队版需填写组织/项目 ID）".into(),
         ));
     }
-    Ok(parse_usage(&data))
+    Ok(parse_usage(data))
 }
 
 #[cfg(test)]
@@ -583,6 +600,23 @@ mod tests {
         let snap = parse_response(body).unwrap();
         assert!((snap.five_hour.unwrap().used_percent - 10.0).abs() < 1e-9);
         assert!((snap.weekly.unwrap().used_percent - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn window_minutes_overflow_falls_back() {
+        // number 来自不可信 JSON、可达 i64::MAX：时长溢出不能 panic，
+        // 要走 unclassified 兜底（无 reset 优先归 5h 槽）
+        let body = r#"{
+            "success": true,
+            "data": {
+                "limits": [
+                    { "type": "TOKENS_LIMIT", "unit": 6, "number": 9223372036854775807, "percentage": 7.0 }
+                ]
+            }
+        }"#;
+        let snap = parse_response(body).unwrap();
+        assert!(snap.weekly.is_none());
+        assert!((snap.five_hour.unwrap().used_percent - 7.0).abs() < 1e-9);
     }
 
     #[test]

@@ -1,10 +1,44 @@
 //! 用量查询 HTTP 客户端。国内 / 国际版共用同一实现，仅 base 域名不同。
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::Value;
 
 use super::{Balance, FetchError, UsageSnapshot, parse_response};
+
+/// 响应体读取硬上限：用量 / 余额 / Release 均为 KB 级 JSON，1 MiB 绰绰
+/// 有余；封顶防御异常超大响应（错误页 / 恶意服务端）耗尽内存。
+/// `service::update` 的 read_json 同样套用此上限。
+pub(crate) const MAX_BODY_BYTES: u64 = 1024 * 1024;
+/// 非 2xx 错误消息携带的 body 前缀长度（字符数）上限，防超长错误页刷屏。
+const ERR_BODY_CHARS: usize = 160;
+
+/// 5s 短超时 Agent（余额等辅助请求）。静态复用连接池：TLS 会话跨轮询
+/// 保持，避免每轮询 2-3 次完整握手；`https_only` 固化仅 HTTPS 约束。
+static AGENT_SHORT: OnceLock<ureq::Agent> = OnceLock::new();
+/// 15s 长超时 Agent（主用量请求；`service::update` 检查更新复用）。
+static AGENT_LONG: OnceLock<ureq::Agent> = OnceLock::new();
+
+fn agent_short() -> &'static ureq::Agent {
+    AGENT_SHORT.get_or_init(|| build_agent(5))
+}
+
+/// 长超时共享 Agent（检查更新复用）。
+pub(crate) fn agent_long() -> &'static ureq::Agent {
+    AGENT_LONG.get_or_init(|| build_agent(15))
+}
+
+/// 统一 Agent 配置：全局超时 + 仅 HTTPS；状态码不转错误，统一在
+/// `http_get_text` 里集中分类。
+fn build_agent(timeout_secs: u64) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_secs)))
+        .https_only(true)
+        .http_status_as_error(false)
+        .build()
+        .into()
+}
 
 /// API 平台。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -52,7 +86,7 @@ impl AccountSpec {
     fn team_scope(&self) -> Option<(&str, &str)> {
         let org = self.org_id.trim();
         let project = self.project_id.trim();
-        (!org.is_empty() && !project.is_empty()).then(|| (org, project))
+        (!org.is_empty() && !project.is_empty()).then_some((org, project))
     }
 }
 
@@ -80,7 +114,7 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
 /// 账户余额（仅国内版；`www.bigmodel.cn` 控制台端点）。
 fn fetch_balance(api_key: &str) -> Result<Balance, FetchError> {
     let url = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report";
-    let body = http_get(url, api_key, 5)?;
+    let body = http_get(url, api_key)?;
     let data = body
         .get("data")
         .ok_or_else(|| FetchError::Api("余额响应缺少 data".into()))?;
@@ -99,30 +133,50 @@ fn fetch_balance(api_key: &str) -> Result<Balance, FetchError> {
     })
 }
 
-/// GET + JSON 解析（共用小工具）。
-fn http_get(url: &str, api_key: &str, timeout_secs: u64) -> Result<Value, FetchError> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_global(Some(Duration::from_secs(timeout_secs)))
-        .http_status_as_error(false)
-        .build()
-        .into();
-    let resp = agent
+/// GET + JSON 解析（余额等辅助请求的薄封装，走 5s 短超时 Agent）。
+fn http_get(url: &str, api_key: &str) -> Result<Value, FetchError> {
+    let body = http_get_text(agent_short(), url, api_key, &[])?;
+    serde_json::from_str(&body).map_err(|e| FetchError::Api(format!("响应解析失败: {e}")))
+}
+
+/// 共用请求底层：GET → 状态码分类 → 返回 body 文本。
+/// 401/403 归 `Auth`（触发 Bearer 重试与设置页修复提示），其余非 2xx
+/// 归 `Api`（错误消息携带截断到 `ERR_BODY_CHARS` 的 body 前缀）。
+fn http_get_text(
+    agent: &ureq::Agent,
+    url: &str,
+    auth: &str,
+    extra_headers: &[(&str, &str)],
+) -> Result<String, FetchError> {
+    let mut req = agent
         .get(url)
-        .header("Authorization", api_key)
+        .header("Authorization", auth)
         .header("Accept-Language", "en-US,en")
-        .header("Content-Type", "application/json")
-        .call()
-        .map_err(|e| FetchError::Network(format!("网络错误: {e}")))?;
+        .header("Content-Type", "application/json");
+    for &(name, value) in extra_headers {
+        req = req.header(name, value);
+    }
+    let resp = req.call().map_err(|e| FetchError::Network(format!("网络错误: {e}")))?;
     let status = resp.status().as_u16();
     if status == 401 || status == 403 {
         return Err(FetchError::Auth("API key 无效或已失效".into()));
     }
     if !(200..=299).contains(&status) {
-        return Err(FetchError::Api(format!("HTTP {status}")));
+        // 错误路径 body 只进消息前缀，读取失败按空串处理
+        let body = read_body_capped(resp.into_body()).unwrap_or_default();
+        let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
+        return Err(FetchError::Api(format!("HTTP {status}: {prefix}")));
     }
-    resp.into_body()
-        .read_json()
-        .map_err(|e| FetchError::Api(format!("响应解析失败: {e}")))
+    read_body_capped(resp.into_body()).map_err(|e| FetchError::Network(format!("读取响应失败: {e}")))
+}
+
+/// 按全局上限读取 body 文本；无效 UTF-8 以 `?` 替换（与 ureq 默认
+/// `read_to_string` 行为一致）。
+fn read_body_capped(body: ureq::Body) -> Result<String, ureq::Error> {
+    body.into_with_config()
+        .limit(MAX_BODY_BYTES)
+        .lossy_utf8(true)
+        .read_to_string()
 }
 
 fn fetch_quota(
@@ -134,37 +188,12 @@ fn fetch_quota(
     if team.is_some() {
         url.push_str("?type=2");
     }
-    // 主请求 15s 超时；信封/limits 解析在 parse_response
-    let body_text = {
-        let agent: ureq::Agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(15)))
-            .http_status_as_error(false)
-            .build()
-            .into();
-        let mut req = agent
-            .get(&url)
-            .header("Authorization", auth)
-            .header("Accept-Language", "en-US,en")
-            .header("Content-Type", "application/json");
-        if let Some((org, project)) = team {
-            req = req
-                .header("Bigmodel-Organization", org)
-                .header("Bigmodel-Project", project);
-        }
-        let resp = req
-            .call()
-            .map_err(|e| FetchError::Network(format!("网络错误: {e}")))?;
-        let status = resp.status().as_u16();
-        if status == 401 || status == 403 {
-            return Err(FetchError::Auth("API key 无效或已失效".into()));
-        }
-        if !(200..=299).contains(&status) {
-            let body = resp.into_body().read_to_string().unwrap_or_default();
-            return Err(FetchError::Api(format!("HTTP {status}: {body}")));
-        }
-        resp.into_body()
-            .read_to_string()
-            .map_err(|e| FetchError::Network(format!("读取响应失败: {e}")))?
-    };
+    let mut extra = Vec::new();
+    if let Some((org, project)) = team {
+        extra.push(("Bigmodel-Organization", org));
+        extra.push(("Bigmodel-Project", project));
+    }
+    // 主请求 15s 长超时 Agent；信封/limits 解析在 parse_response
+    let body_text = http_get_text(agent_long(), &url, auth, &extra)?;
     parse_response(&body_text)
 }

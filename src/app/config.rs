@@ -74,8 +74,6 @@ impl Config {
     /// 生成新账号 id（时间戳 + 随机后缀防同毫秒碰撞）。
     pub fn new_account_id(&self) -> String {
         let ms = chrono::Utc::now().timestamp_subsec_millis() as i64;
-        let seed = std::collections::hash_map::DefaultHasher::new();
-        let _ = seed;
         // 用账号数 + 当前秒拼一个足够防撞的后缀即可，无需随机源
         let sec = chrono::Utc::now().timestamp();
         format!("acc_{sec:x}{ms:x}{}", self.accounts.len())
@@ -106,7 +104,7 @@ const TEMPLATE: &str = r#"# Quotify 配置文件
 poll_interval_secs = 300
 # 界面语言：留空跟随系统，可设 "zh" 或 "en"
 language = ""
-# 外观：留空跟随系统，可设 "light" 或 "dark"
+# 外观：留空跟随系统，可设 "light" / "dark"
 appearance = ""
 # 用量阈值预警（默认关闭）
 notify_threshold_enabled = false
@@ -129,14 +127,35 @@ notify_reset_weekly_enabled = false
 selected = ""
 "#;
 
+/// 解析配置文本；损坏时回退默认配置。
+/// 错误日志只报位置、不回显源行——toml 错误的 Display 会带出整行源码，
+/// 源行可能含 API key（凭据不得进日志）。
+fn parse_or_default(text: &str) -> Config {
+    toml::from_str(text).unwrap_or_else(|e| {
+        // span 为字节偏移，换算成 1 起始的行列号（源可含中文，按字符计列）
+        let pos = e
+            .span()
+            .map(|s| {
+                let before = text.get(..s.start.min(text.len())).unwrap_or("");
+                let line = before.matches('\n').count() + 1;
+                let col = before
+                    .rsplit('\n')
+                    .next()
+                    .map(|l| l.chars().count() + 1)
+                    .unwrap_or(1);
+                format!("（第 {line} 行第 {col} 列）")
+            })
+            .unwrap_or_default();
+        crate::platform::log(&format!("config.toml 解析失败，使用默认配置{pos}"));
+        Config::default()
+    })
+}
+
 /// 读取配置；文件不存在时生成模板并返回默认配置。
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => toml::from_str(&text).unwrap_or_else(|e| {
-            eprintln!("config.toml 解析失败，使用默认配置: {e}");
-            Config::default()
-        }),
+        Ok(text) => parse_or_default(&text),
         Err(_) => {
             let _ = std::fs::write(&path, TEMPLATE);
             Config::default()
@@ -147,10 +166,52 @@ pub fn load() -> Config {
 /// 写回配置文件。
 pub fn save(config: &Config) {
     let path = config_path();
-    // language 的空字符串与 None 归一（模板里是 ""）
-    if let Ok(text) = toml::to_string_pretty(config) {
-        if let Err(e) = std::fs::write(&path, text) {
-            eprintln!("config.toml 写入失败: {e}");
+    if let Ok(text) = toml::to_string_pretty(config)
+        && let Err(e) = std::fs::write(&path, text) {
+            crate::platform::log(&format!("config.toml 写入失败: {e}"));
         }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模板文本必须能解析回 Config：示例账号全在注释里，不产生账号；
+    /// selected 的 "" 不指向任何账号。
+    #[test]
+    fn template_parses_back() {
+        let cfg = parse_or_default(TEMPLATE);
+        assert_eq!(cfg.general.poll_interval_secs, 300);
+        assert!(!cfg.general.notify_threshold_enabled);
+        assert!(!cfg.general.notify_reset_5h_enabled);
+        assert!(cfg.accounts.is_empty());
+        assert!(cfg.selected.as_deref().unwrap_or("").is_empty());
+    }
+
+    /// 损坏文本回退默认配置（不 panic、不部分采用）。
+    #[test]
+    fn corrupted_text_falls_back_to_default() {
+        let cfg = parse_or_default("this is not valid toml ]][");
+        assert_eq!(cfg.general.poll_interval_secs, General::default().poll_interval_secs);
+        assert!(cfg.accounts.is_empty());
+        assert!(cfg.selected.is_none());
+    }
+
+    /// 旧版配置缺 team / org_id / project_id 字段时按默认值反序列化。
+    #[test]
+    fn account_team_fields_default_when_missing() {
+        let text = r#"
+[[accounts]]
+id = "acc_demo"
+name = "demo"
+api_key = "sk-demo"
+platform = "cn"
+"#;
+        let cfg: Config = toml::from_str(text).expect("缺省字段应可反序列化");
+        assert_eq!(cfg.accounts.len(), 1);
+        let a = &cfg.accounts[0];
+        assert!(!a.team);
+        assert_eq!(a.org_id, "");
+        assert_eq!(a.project_id, "");
     }
 }

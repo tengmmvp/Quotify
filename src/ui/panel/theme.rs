@@ -16,9 +16,13 @@ pub struct Theme {
     pub bg: [f32; 4],
     /// 主文本（Ink 暖墨，非纯黑）
     pub text_primary: [f32; 4],
-    /// 次要文本（Driftwood）
+    /// 次要文本（Driftwood，配 400 字重、控件标签）。注意：浅色模式下
+    /// 比 tertiary 更浅——这是刻意设计（见 text_tertiary），勿按明度
+    /// 顺序取用
     pub text_secondary: [f32; 4],
-    /// 弱文本 / 标签（Ash）
+    /// 弱文本 / 标签（Ash，配 600 字重、区块标题）。注意：浅色模式下
+    /// 比 secondary 更深——区块标题用 600 字重的小字，配深一档的色
+    /// 才立得住，是刻意反转，勿按明度顺序取用
     pub text_tertiary: [f32; 4],
     /// hairline 边框与分隔线（Stone）
     pub border: [f32; 4],

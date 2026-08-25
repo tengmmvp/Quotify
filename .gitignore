@@ -11,6 +11,7 @@ config.toml
 
 # 本地开发文件
 CLAUDE.md
+docs/glm-quota-api.md
 
 # 系统杂项
 Thumbs.db

@@ -230,7 +230,7 @@ impl Renderer {
                         self.target_dpi = dpi;
                     }
                     Err(e) => {
-                        eprintln!("[quotify] CreateHwndRenderTarget 失败: {e}");
+                        eprintln!("[Quotify] CreateHwndRenderTarget 失败: {e}");
                         return;
                     }
                 }
@@ -252,7 +252,7 @@ impl Renderer {
             self.draw(&target, app, view, &rect_logical);
             match target.EndDraw(None, None) {
                 Ok(()) => {}
-                Err(e) => eprintln!("[quotify] EndDraw 失败: {e}"),
+                Err(e) => eprintln!("[Quotify] EndDraw 失败: {e}"),
             }
         }
     }
@@ -334,7 +334,9 @@ impl Renderer {
         self.logo(target, pad, logo_y, logo_size, alpha);
         let tx = pad + logo_size + 10.0;
         let tw = w - tx - 88.0;
-        self.text(target, title, tx, y + 2.0, tw, 22.0, 16.0, 500, self.theme.text_primary, alpha);
+        // 过长用户名保头截断（省略号收尾），不换行不溢出
+        let title_disp = ellipsize_px(title, 16.0, tw);
+        self.text(target, &title_disp, tx, y + 2.0, tw, 22.0, 16.0, 500, self.theme.text_primary, alpha);
         if let Some(m) = &meta {
             self.text(target, m, tx + 1.0, y + 24.0, tw, 17.0, 12.0, 400, self.theme.text_secondary, alpha);
         }
@@ -968,10 +970,11 @@ impl Renderer {
         target.FillRoundedRectangle(&card, &fill);
         let edge = self.brush(target, self.theme.border, alpha * 0.8);
         target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-        // 账号名（15/500，卡片内垂直居中——与名牌同一垂直基准）
+        // 账号名（15/500，卡片内垂直居中；预算内保头截断，名牌永不被挤掉）
+        let name_disp = ellipsize_px(name, 15.0, 104.0);
         self.text_aligned_vc(
             target,
-            name,
+            &name_disp,
             &D2D_RECT_F { left: x + 12.0, top: y, right: x + w - 60.0, bottom: y + h },
             15.0,
             500,
@@ -980,7 +983,7 @@ impl Renderer {
             0,
             false,
         );
-        let name_w = est_width(name, 15.0);
+        let name_w = est_width(&name_disp, 15.0);
         // 名牌行：紧随名称之后，6px 间隔，垂直居中。三枚统一为第一枚的
         // 描边样式（透明底 + hairline 边），仅等级牌的边/字按档位取墨阶色
         let mut bx = x + 12.0 + name_w + 10.0;
@@ -1472,6 +1475,25 @@ fn wide(s: &str) -> Vec<u16> {
 /// 全角 CJK ≈ 1.0×字号。
 fn est_width(s: &str, size: f32) -> f32 {
     s.chars().map(|c| if c.is_ascii() { size * 0.58 } else { size }).sum()
+}
+
+/// 按像素预算截断文本：保留开头、尾部以省略号收尾（用户名过长时
+/// 保证单行，且给后续名牌留出空间）。
+fn ellipsize_px(s: &str, size: f32, max_w: f32) -> String {
+    let ellipsis_w = size * 0.7;
+    let budget = (max_w - ellipsis_w).max(0.0);
+    let mut w = 0.0;
+    let mut out = String::new();
+    for c in s.chars() {
+        let cw = if c.is_ascii() { size * 0.58 } else { size };
+        if w + cw > budget {
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out
 }
 
 impl Default for AnimState {

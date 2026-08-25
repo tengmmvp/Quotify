@@ -44,16 +44,16 @@ impl TrayIcon {
             nid.hIcon = hicon;
             copy_tip(&mut nid, "Quotify");
             if !Shell_NotifyIconW(NIM_ADD, &mut nid).as_bool() {
-                eprintln!("[quotify] 托盘 NIM_ADD 失败: {}", windows::core::HRESULT::from_thread());
+                eprintln!("[Quotify] 托盘 NIM_ADD 失败: {}", windows::core::HRESULT::from_thread());
                 return None;
             }
             // 升级 v4 协议以获得 NIN_POPUPOPEN/POPUPCLOSE 悬停通知
             nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if Shell_NotifyIconW(NIM_SETVERSION, &mut nid).as_bool() {
-                eprintln!("[quotify] 托盘图标注册成功");
+                eprintln!("[Quotify] 托盘图标注册成功");
                 Some(Self { hwnd, id: 1, registered: true })
             } else {
-                eprintln!("[quotify] 托盘 SETVERSION 失败");
+                eprintln!("[Quotify] 托盘 SETVERSION 失败");
                 None
             }
         }

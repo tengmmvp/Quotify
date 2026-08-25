@@ -195,7 +195,7 @@ impl Panel {
             ) {
                 Ok(hwnd) => hwnd,
                 Err(e) => {
-                    eprintln!("[quotify] 面板窗口创建失败: {e}");
+                    eprintln!("[Quotify] 面板窗口创建失败: {e}");
                     return None;
                 }
             };
@@ -497,7 +497,7 @@ pub extern "system" fn panel_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
                 {
                     let dt = t0.elapsed();
                     if dt.as_millis() > 30 {
-                        eprintln!("[quotify] WM_PAINT 耗时 {}ms", dt.as_millis());
+                        eprintln!("[Quotify] WM_PAINT 耗时 {}ms", dt.as_millis());
                     }
                 }
                 LRESULT(0)

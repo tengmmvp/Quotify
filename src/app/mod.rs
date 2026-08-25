@@ -760,7 +760,7 @@ pub fn run() -> i32 {
         let px = GetSystemMetrics(SM_CXSMICON).max(16);
         let initial = icon::logo_icon(px);
         if initial.is_none() {
-            eprintln!("[quotify] 初始 logo 图标生成失败 (px={px}, gdiplus={})", _gdiplus.is_some());
+            eprintln!("[Quotify] 初始 logo 图标生成失败 (px={px}, gdiplus={})", _gdiplus.is_some());
         }
         let initial = initial.unwrap_or_default();
         app.tray_icon = Some(initial);

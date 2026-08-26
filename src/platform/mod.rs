@@ -34,6 +34,10 @@ pub mod msg {
 
 /// 用默认浏览器打开链接
 pub fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        log(&format!("[Quotify] 拒绝非 http(s) 链接: {url}"));
+        return;
+    }
     use windows::Win32::UI::Shell::ShellExecuteW;
     use windows::Win32::UI::WindowsAndMessaging::SW_SHOW;
     let verb = wide("open");
@@ -67,8 +71,8 @@ pub fn open_dialog() -> Option<std::path::PathBuf> {
 /// 传统文件对话框共用实现
 fn file_dialog(default_name: &str, save: bool) -> Option<std::path::PathBuf> {
     use windows::Win32::UI::Controls::Dialogs::{
-        GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_OVERWRITEPROMPT,
-        OFN_PATHMUSTEXIST, OPENFILENAMEW,
+        GetOpenFileNameW, GetSaveFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR,
+        OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::core::PWSTR;
     // 过滤串以双 nul 收尾
@@ -85,6 +89,7 @@ fn file_dialog(default_name: &str, save: bool) -> Option<std::path::PathBuf> {
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
         Flags: OFN_PATHMUSTEXIST
+            | OFN_NOCHANGEDIR
             | if save {
                 OFN_OVERWRITEPROMPT
             } else {

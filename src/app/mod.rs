@@ -22,7 +22,7 @@ use crate::platform::msg::{
     WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
 };
 use crate::platform::wide;
-use crate::service::poller::{PollInterval, PollOutcome, PollTarget, Poller};
+use crate::service::poller::{MAX_POLL_SECS, PollInterval, PollOutcome, PollTarget, Poller};
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
 use crate::ui::panel::Panel;
@@ -31,6 +31,9 @@ use crate::ui::tray::{self, TrayIcon};
 
 const IDM_SETTINGS: u16 = 1001;
 const IDM_EXIT: u16 = 1002;
+
+/// v4 回调的键盘激活通知码
+const NIN_KEYSELECT: u32 = 0x0401;
 
 const NOTIFY_TITLE: &str = "Quotify";
 
@@ -64,7 +67,9 @@ pub struct App {
 }
 
 impl App {
-    fn new(config: Config) -> Self {
+    fn new(mut config: Config) -> Self {
+        config.general.notify_threshold_percent =
+            config.general.notify_threshold_percent.clamp(1, 100);
         let lang = crate::ui::i18n::resolve_lang(config.general.language.as_deref());
         Self {
             config,
@@ -133,7 +138,7 @@ impl App {
         };
         if let Some(new) = new {
             if let Some(old) = self.tray_icon.take() {
-                icon::destroy_icon(old);
+                icon::destroy_owned(old);
             }
             if let Some(tray) = &self.tray {
                 tray.update_icon(new);
@@ -313,7 +318,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         app.panel.request_close();
                     }
                 }
-                windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
+                NIN_KEYSELECT | windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
                     if let Some(app) = app
                         && let Some(rect) = tray_rect(app)
                     {
@@ -465,6 +470,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::Back => {
             let was_adding = app.panel.adding_account;
             app.panel.adding_account = false;
+            app.panel.key_revealed = false;
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
             if !was_adding {
@@ -598,6 +604,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                     snapshot: None,
                     last_error: None,
                 };
+                reset_notify_state(app);
                 app.sync_poll_context();
                 app.update_tray_icon();
                 if let Some(p) = &app.poller {
@@ -629,6 +636,15 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::InputKey => {
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
+        }
+        // key 明暗切换；点击不夺输入焦点，输入态保持
+        Hit::RevealKey => {
+            app.panel.key_revealed = !app.panel.key_revealed;
+            if let Some(p) = app.panel.hwnd {
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(p), None, false);
+                }
+            }
         }
         Hit::InputOrg => {
             app.panel
@@ -689,10 +705,19 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     }
 }
 
+/// 换账号后旧快照的重置基线作废，重置提醒状态防新账号首个快照误报
+fn reset_notify_state(app: &mut App) {
+    app.threshold_armed_5h = true;
+    app.last_reset_5h = None;
+    app.threshold_armed_weekly = true;
+    app.last_reset_weekly = None;
+}
+
 pub(crate) fn select_account(app: &mut App, i: usize) {
     if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
         app.config.selected = Some(id);
         crate::app::config::save(&app.config);
+        reset_notify_state(app);
         app.data = AccountData {
             snapshot: None,
             last_error: None,
@@ -752,11 +777,13 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     }
     crate::app::config::save(&app.config);
     app.panel.adding_account = false;
+    app.panel.key_revealed = false;
     app.panel.clear_input(panel_hwnd);
     app.data = AccountData {
         snapshot: None,
         last_error: None,
     };
+    reset_notify_state(app);
     app.sync_poll_context();
     app.update_tray_icon();
     if let Some(p) = &app.poller {
@@ -767,7 +794,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
 
 /// 应用自定义轮询间隔（分钟）
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
-    if let Some(mins) = app
+    let secs = app
         .panel
         .input
         .interval
@@ -775,14 +802,17 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
         .parse::<u64>()
         .ok()
         .filter(|m| *m > 0)
-        && let Some(secs) = mins.checked_mul(60)
-    {
-        app.config.general.poll_interval_secs = secs.max(MIN_POLL_SECS);
-        crate::app::config::save(&app.config);
-        app.sync_poll_context();
-        if let Some(p) = &app.poller {
-            p.reschedule();
-        }
+        .and_then(|m| m.checked_mul(60))
+        .map(|s| s.clamp(MIN_POLL_SECS, MAX_POLL_SECS));
+    let Some(secs) = secs else {
+        crate::platform::log("[Quotify] 自定义间隔无效");
+        return;
+    };
+    app.config.general.poll_interval_secs = secs;
+    crate::app::config::save(&app.config);
+    app.sync_poll_context();
+    if let Some(p) = &app.poller {
+        p.reschedule();
     }
     sync_customizing(app);
     app.panel.clear_input(panel_hwnd);
@@ -831,9 +861,28 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 导出配置为明文 JSON；文件内容含 API key，由用户自行保管
+/// 导出配置为明文 JSON
 fn export_config(app: &App) {
-    let Some(path) = crate::platform::save_dialog("quotify-config.json") else {
+    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
+
+    // 模态对话框期间冻结面板巡检，防止面板被误判收起
+    if let Some(panel) = app.panel.hwnd {
+        unsafe {
+            let _ = KillTimer(Some(panel), crate::ui::panel::TIMER_OUTSIDE_CHECK);
+        }
+    }
+    let picked = crate::platform::save_dialog("quotify-config.json");
+    if let Some(panel) = app.panel.hwnd {
+        unsafe {
+            let _ = SetTimer(
+                Some(panel),
+                crate::ui::panel::TIMER_OUTSIDE_CHECK,
+                200,
+                None,
+            );
+        }
+    }
+    let Some(path) = picked else {
         return;
     };
     let body = match serde_json::to_string_pretty(&app.config)
@@ -847,6 +896,22 @@ fn export_config(app: &App) {
         }
     };
     crate::platform::notify::show(NOTIFY_TITLE, &body);
+}
+
+/// 导入的文件不含账号时等于清空现有配置，弹框确认防误删
+fn confirm_import_wipe(app: &App) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW};
+    let title = wide(app.strings.import_confirm_title);
+    let body = wide(app.strings.import_confirm_body);
+    let r = unsafe {
+        MessageBoxW(
+            Some(app.hwnd()),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OKCANCEL | MB_ICONWARNING,
+        )
+    };
+    r == IDOK
 }
 
 /// 导入配置 JSON；模态期间冻结面板巡检防止误收起
@@ -865,13 +930,25 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
             None,
         );
     }
-    let parsed = picked
-        .and_then(|path| std::fs::read_to_string(path).ok())
+    let Some(path) = picked else {
+        // 用户取消选择文件，无事发生
+        return;
+    };
+    let parsed = std::fs::read_to_string(path)
+        .ok()
         .and_then(|text| serde_json::from_str::<Config>(&text).ok());
 
     let notify_body = match parsed {
         Some(cfg) => {
+            if cfg.accounts.is_empty()
+                && !app.config.accounts.is_empty()
+                && !confirm_import_wipe(app)
+            {
+                return;
+            }
             app.config = cfg;
+            app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
+            app.strings = app.lang.strings();
             if app.config.selected_account().is_none() {
                 app.config.selected = None;
             }
@@ -884,7 +961,12 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
             }
             crate::app::config::save(&app.config);
             app.panel.adding_account = false;
+            app.panel.key_revealed = false;
             app.panel.input.field = None;
+            app.update_status = None;
+            app.update_checking = false;
+            app.panel.update_available = false;
+            reset_notify_state(app);
             app.data = AccountData {
                 snapshot: None,
                 last_error: None,
@@ -894,6 +976,7 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
             if let Some(p) = &app.poller {
                 p.refresh_now();
             }
+            sync_customizing(app);
             relayout_panel(app, panel_hwnd);
             app.strings.import_done.to_string()
         }
@@ -961,7 +1044,7 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
     }
 }
 
-fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appearance {
+pub(crate) fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appearance {
     match setting {
         Some(s) if s.eq_ignore_ascii_case("light") => crate::ui::panel::theme::Appearance::Light,
         Some(s) if s.eq_ignore_ascii_case("dark") => crate::ui::panel::theme::Appearance::Dark,
@@ -1128,7 +1211,7 @@ pub fn run() -> i32 {
             drop(t);
         }
         if let Some(ic) = app.tray_icon.take() {
-            icon::destroy_icon(ic);
+            icon::destroy_owned(ic);
         }
         drop(app.poller.take());
         if com {

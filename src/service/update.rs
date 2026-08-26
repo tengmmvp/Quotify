@@ -6,6 +6,9 @@ use crate::api::client::{MAX_BODY_BYTES, agent_long};
 
 pub const REPO: &str = "TengMMVP/quotify";
 
+/// HTTP 错误消息携带的 body 前缀长度（字符数）上限
+const ERR_BODY_CHARS: usize = 120;
+
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -35,7 +38,25 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
         .map_err(|e| format!("network error: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("HTTP {}", resp.status()));
+        let status = resp.status();
+        if status.as_u16() == 404 {
+            // 仓库存疑或 Release 尚未发布，给可读文案而非裸状态码
+            return Err("release not found".into());
+        }
+        // 失败原因（如 403 限流的 Retry-After 提示）都在 body 里，带前缀进消息
+        let body = resp
+            .into_body()
+            .into_with_config()
+            .limit(MAX_BODY_BYTES)
+            .lossy_utf8(true)
+            .read_to_string()
+            .unwrap_or_default();
+        let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
+        return Err(if prefix.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {prefix}")
+        });
     }
     let rel: GithubRelease = resp
         .into_body()
@@ -52,10 +73,14 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     })
 }
 
-/// 比较当前版本与远端 tag
+/// 比较当前版本与远端 tag；预发布 tag 不自动提示
 pub fn is_newer(remote_tag: &str, current: &str) -> bool {
+    if remote_tag.contains('-') {
+        return false;
+    }
     let parse = |s: &str| -> Vec<u64> {
-        s.trim_start_matches('v')
+        s.to_ascii_lowercase()
+            .trim_start_matches('v')
             .split('.')
             .map(|p| p.trim().parse::<u64>().unwrap_or(0))
             .collect()
@@ -82,5 +107,14 @@ mod tests {
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("v0.0.9", "0.1.0"));
         assert!(is_newer("1.0", "0.9.9"));
+        assert!(is_newer("V2.0.0", "1.9"));
+        assert!(is_newer("2.0", "1.9.9"));
+    }
+
+    #[test]
+    fn prerelease_tag_never_prompts() {
+        assert!(!is_newer("v1.2.3-beta", "1.1.0"));
+        assert!(!is_newer("v2.0.0-rc.1", "1.9"));
+        assert!(!is_newer("1.2.3", "1.2.3"));
     }
 }

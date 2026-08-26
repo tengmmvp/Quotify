@@ -12,6 +12,14 @@ use crate::api::client::AccountSpec;
 use crate::app::config::MIN_POLL_SECS;
 pub(crate) use crate::platform::msg::WM_APP_POLL_RESULT;
 
+/// 轮询间隔上限（秒）= 1 天
+pub const MAX_POLL_SECS: u64 = 86400;
+
+/// 读取间隔并夹取到合法区间
+fn clamp_interval(secs: u64) -> u64 {
+    secs.clamp(MIN_POLL_SECS, MAX_POLL_SECS)
+}
+
 /// 一次轮询的结果，跨线程传递给主线程。
 pub enum PollOutcome {
     Success(Box<crate::api::UsageSnapshot>),
@@ -47,14 +55,21 @@ impl Poller {
             unsafe impl<T> Send for SendHandle<T> {}
 
             let (hwnd_s, wake_s, stop_s) = (SendHandle(hwnd), SendHandle(wake), SendHandle(stop));
-            let thread = std::thread::Builder::new()
+            let thread = match std::thread::Builder::new()
                 .name("quotify-poller".into())
                 .spawn(move || {
                     // 先把 SendHandle 移入闭包局部，防 2021 精准捕获绕过包装破坏 Send
                     let (h, w, s) = (hwnd_s, wake_s, stop_s);
                     poll_loop(h.0, target, interval, w.0, s.0, flag)
-                })
-                .ok()?;
+                }) {
+                Ok(t) => t,
+                Err(_) => {
+                    // 线程未起：Poller 不会诞生，Drop 不再兜底，须在此关闭两事件句柄防泄漏
+                    let _ = windows::Win32::Foundation::CloseHandle(wake);
+                    let _ = windows::Win32::Foundation::CloseHandle(stop);
+                    return None;
+                }
+            };
             Some(Self {
                 wake,
                 stop,
@@ -108,8 +123,10 @@ fn poll_loop(
 
     loop {
         let now = Instant::now();
+        // 饱和上限取 u32::MAX - 1：u32::MAX 恰是 Win32 的 INFINITE，
+        // 落在它上面会退化成永久等待；宁可提前醒来重算
         let wait_ms = if next_due > now {
-            (next_due - now).as_millis().min(u32::MAX as u128) as u32
+            (next_due - now).as_millis().min(u32::MAX as u128 - 1) as u32
         } else {
             0
         };
@@ -122,13 +139,13 @@ fn poll_loop(
         let due = Instant::now() >= next_due;
         if !manual && !due {
             // 变更类唤醒不拉取，但按新间隔重排，否则新间隔要等旧周期走完才生效
-            let secs = interval.lock().unwrap().max(MIN_POLL_SECS);
+            let secs = clamp_interval(*borrow(&interval));
             next_due = Instant::now() + Duration::from_secs(secs);
             continue;
         }
 
         let spec = {
-            let guard = target.lock().unwrap();
+            let guard = borrow(&target);
             match guard.clone() {
                 Some(v) => v,
                 None => {
@@ -157,7 +174,25 @@ fn poll_loop(
             drop(unsafe { Box::from_raw(boxed) });
         }
 
-        let secs = interval.lock().unwrap().max(MIN_POLL_SECS);
+        let secs = clamp_interval(*borrow(&interval));
         next_due = Instant::now() + Duration::from_secs(secs);
+    }
+}
+
+/// 毒化锁取回内部数据继续用
+fn borrow<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_clamped_to_min_max() {
+        assert_eq!(clamp_interval(0), MIN_POLL_SECS);
+        assert_eq!(clamp_interval(9), MIN_POLL_SECS);
+        assert_eq!(clamp_interval(300), 300);
+        assert_eq!(clamp_interval(u64::MAX), MAX_POLL_SECS);
     }
 }

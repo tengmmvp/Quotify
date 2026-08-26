@@ -144,28 +144,28 @@ fn in_rounded_rect(x: f32, y: f32, rx: f32, ry: f32, side: f32, r: f32) -> bool 
     if x < rx || x > right || y < ry || y > bottom {
         return false;
     }
-    let corners = [
-        (rx + r, ry + r),
-        (right - r, ry + r),
-        (rx + r, bottom - r),
-        (right - r, bottom - r),
-    ];
-    for &(ccx, ccy) in &corners {
-        let (dx, dy) = (x - ccx, y - ccy);
-        let in_corner_zone = match (ccx, ccy) {
-            (a, b) if a < x && b < y => (x > right - r) && (y > bottom - r),
-            (a, b) if a > x && b < y => (x < rx + r) && (y > bottom - r),
-            (a, b) if a < x && b > y => (x > right - r) && (y < ry + r),
-            _ => (x < rx + r) && (y < ry + r),
-        };
-        if in_corner_zone && dx * dx + dy * dy > r * r {
-            return false;
-        }
-    }
-    true
+    let cx = if x < rx + r {
+        rx + r
+    } else if x > right - r {
+        right - r
+    } else {
+        x
+    };
+    let cy = if y < ry + r {
+        ry + r
+    } else if y > bottom - r {
+        bottom - r
+    } else {
+        y
+    };
+    let (dx, dy) = (x - cx, y - cy);
+    dx * dx + dy * dy <= r * r
 }
 
 fn in_polygon(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
+    if pts.is_empty() {
+        return false;
+    }
     let mut inside = false;
     let n = pts.len();
     let mut j = n - 1;
@@ -208,7 +208,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         std::ptr::copy_nonoverlapping(pixels.as_ptr(), bits as *mut u8, pixels.len());
 
         let mut mask_bits: *mut c_void = std::ptr::null_mut();
-        let mask = windows::Win32::Graphics::Gdi::CreateDIBSection(
+        let mask = match windows::Win32::Graphics::Gdi::CreateDIBSection(
             None,
             &BITMAPINFO {
                 bmiHeader: hdr(1),
@@ -218,8 +218,14 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
             (&mut mask_bits) as *mut *mut c_void,
             None,
             0,
-        )
-        .ok()?;
+        ) {
+            Ok(m) => m,
+            Err(_) => {
+                // 掩码创建失败：回收已建的颜色位图再放弃
+                let _ = DeleteObject(color.into());
+                return None;
+            }
+        };
         if !mask_bits.is_null() {
             std::ptr::write_bytes(
                 mask_bits as *mut u8,
@@ -235,14 +241,81 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
             hbmMask: mask,
             hbmColor: color,
         };
-        let hicon = CreateIconIndirect(&info).ok()?;
+        let hicon = match CreateIconIndirect(&info) {
+            Ok(h) => h,
+            Err(_) => {
+                // 图标合成失败：两张位图所有权仍在自己手里，一并回收
+                let _ = DeleteObject(color.into());
+                let _ = DeleteObject(mask.into());
+                return None;
+            }
+        };
         let _ = DeleteObject(color.into());
         let _ = DeleteObject(mask.into());
         Some(hicon)
     }
 }
 
-/// 释放 HICON
-pub fn destroy_icon(icon: HICON) {
-    unsafe { DestroyIcon(icon) }.ok();
+/// 释放本进程自建（`CreateIconIndirect` 系）的 HICON
+pub fn destroy_owned(h: HICON) {
+    unsafe { DestroyIcon(h) }.ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn polygon_hit_test() {
+        let square = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        assert!(in_polygon(5.0, 5.0, &square));
+        assert!(!in_polygon(15.0, 5.0, &square));
+        assert!(!in_polygon(-1.0, -1.0, &square));
+        assert!(!in_polygon(0.0, 0.0, &[]));
+        let notch = [
+            (0.0, 0.0),
+            (10.0, 0.0),
+            (10.0, 10.0),
+            (6.0, 5.0),
+            (4.0, 5.0),
+            (0.0, 10.0),
+        ];
+        assert!(in_polygon(2.0, 3.0, &notch), "凹口左侧的主体内部");
+        assert!(!in_polygon(5.0, 6.0, &notch), "凹口内");
+    }
+
+    #[test]
+    fn rounded_rect_hit_test() {
+        assert!(in_rounded_rect(10.0, 10.0, 0.0, 0.0, 20.0, 5.0), "中心");
+        assert!(
+            in_rounded_rect(0.5, 10.0, 0.0, 0.0, 20.0, 5.0),
+            "边中段贴边仍算"
+        );
+        assert!(
+            !in_rounded_rect(-0.5, 10.0, 0.0, 0.0, 20.0, 5.0),
+            "左侧出界"
+        );
+        assert!(
+            !in_rounded_rect(20.5, 10.0, 0.0, 0.0, 20.0, 5.0),
+            "右侧出界"
+        );
+        assert!(
+            !in_rounded_rect(0.5, 0.5, 0.0, 0.0, 20.0, 5.0),
+            "圆弧外的角点"
+        );
+        assert!(
+            in_rounded_rect(1.5, 1.5, 0.0, 0.0, 20.0, 5.0),
+            "圆弧内近角点"
+        );
+    }
+
+    #[test]
+    fn tier_thresholds() {
+        assert_eq!(tier_color(0.0), (0x34, 0xC7, 0x59));
+        assert_eq!(tier_color(69.9), (0x34, 0xC7, 0x59));
+        assert_eq!(tier_color(70.0), (0xFF, 0x9F, 0x0A), "70 起进橙档");
+        assert_eq!(tier_color(89.9), (0xFF, 0x9F, 0x0A));
+        assert_eq!(tier_color(90.0), (0xFF, 0x45, 0x3A), "90 起进红档");
+        assert_eq!(tier_color(100.0), (0xFF, 0x45, 0x3A));
+    }
 }

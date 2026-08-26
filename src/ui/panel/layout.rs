@@ -78,3 +78,40 @@ pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> 
 pub fn add_page_height(team: bool) -> i32 {
     338 + if team { 106 } else { 0 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interval_input_y_pinned() {
+        assert_eq!(interval_input_y(false, false), 174.0);
+        assert_eq!(interval_input_y(false, true), 174.0);
+        assert_eq!(interval_input_y(true, false), 222.0);
+        assert_eq!(interval_input_y(true, true), 240.0);
+    }
+
+    #[test]
+    fn peak_input_y_pinned() {
+        assert_eq!(peak_input_y(false, false, false), 374.0);
+        assert_eq!(peak_input_y(true, false, false), 422.0);
+        assert_eq!(peak_input_y(true, true, false), 440.0);
+        assert_eq!(peak_input_y(true, true, true), 470.0);
+        assert_eq!(peak_input_y(false, false, true), 404.0);
+    }
+
+    #[test]
+    fn proxy_input_y_pinned() {
+        assert_eq!(proxy_input_y(false, false, false), 649.0);
+        assert_eq!(proxy_input_y(true, false, false), 697.0);
+        assert_eq!(proxy_input_y(true, true, false), 715.0);
+        assert_eq!(proxy_input_y(true, true, true), 745.0);
+        assert_eq!(proxy_input_y(false, false, true), 679.0);
+    }
+
+    #[test]
+    fn add_page_height_pinned() {
+        assert_eq!(add_page_height(false), 338);
+        assert_eq!(add_page_height(true), 444);
+    }
+}

@@ -5,6 +5,9 @@ use serde_json::Value;
 
 pub mod client;
 
+/// 错误详情携带的响应文本长度上限（字符数）
+pub(crate) const ERR_BODY_CHARS: usize = 160;
+
 /// 套餐代际
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanVersion {
@@ -343,24 +346,27 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
     }
 }
 
-/// 信封内业务失败分类：401/403/1000/1001 与鉴权关键词归 `Auth`，
-/// 1309 与 "coding plan" 无套餐归 `EmptyLimits`，其余归 `Api`
+/// 信封内业务失败分类：code 401/403/1000/1001 与鉴权文案归 `Auth`，
+/// 1309 与 "coding plan" 无套餐归 `EmptyLimits`，其余归 `Api`。
+/// 仅处理 HTTP 200 信封内错误（HTTP 401/403 由 client.rs 按状态码分类），
+/// 关键词判定须从严：凭据词与 invalid/expired/无效 同时出现才判 `Auth`，
+/// 避免 "token limit exceeded" 之类业务文案误触发换钥引导
 fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
     let m = msg.to_ascii_lowercase();
+    let mentions_credential = m.contains("token") || m.contains("api key") || m.contains("apikey");
+    let says_invalid = m.contains("invalid") || m.contains("expired") || msg.contains("无效");
     if code == Some(401)
         || code == Some(403)
         || code == Some(1000)
         || code == Some(1001)
         || m.contains("unauthorized")
-        || m.contains("token")
-        || m.contains("api key")
-        || m.contains("apikey")
+        || (mentions_credential && says_invalid)
     {
         FetchError::Auth
     } else if code == Some(1309) || m.contains("coding plan") {
         FetchError::EmptyLimits
     } else {
-        FetchError::Api(msg.to_string())
+        FetchError::Api(msg.chars().take(ERR_BODY_CHARS).collect())
     }
 }
 
@@ -530,8 +536,29 @@ mod tests {
         }
     }
 
-    /// 1309 = 套餐过期；msg 含 "coding plan" = key 有效但无编码套餐
-    /// （该形态信封 code 为 500，不能按码判）
+    #[test]
+    fn in_band_credential_word_alone_is_not_auth() {
+        for body in [
+            r#"{ "success": false, "msg": "token limit exceeded" }"#,
+            r#"{ "success": false, "msg": "api key quota exhausted" }"#,
+        ] {
+            let err = parse_response(body).unwrap_err();
+            assert!(matches!(err, FetchError::Api(_)), "{body} → {err:?}");
+        }
+    }
+
+    #[test]
+    fn in_band_long_message_truncated() {
+        let long = "x".repeat(500);
+        let body = format!(r#"{{ "success": false, "msg": "{long}" }}"#);
+        let FetchError::Api(detail) = parse_response(&body).unwrap_err() else {
+            panic!("长 msg 应归 Api");
+        };
+        assert_eq!(detail.chars().count(), ERR_BODY_CHARS);
+    }
+
+    /// 1309 = 套餐过期；msg 含 "coding plan" = key 有效但无编码套餐，
+    /// 该形态信封 code 为 500，不能按码判
     #[test]
     fn in_band_plan_state_maps_to_empty_limits() {
         for body in [
@@ -543,7 +570,6 @@ mod tests {
         }
     }
 
-    /// MCP 通道接受 MCP_LIMIT 别名；类型字段可由 name 承载
     #[test]
     fn mcp_alias_and_name_field() {
         let body = r#"{

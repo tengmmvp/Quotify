@@ -5,12 +5,10 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Balance, FetchError, UsageSnapshot, parse_response};
+use super::{Balance, ERR_BODY_CHARS, FetchError, UsageSnapshot, parse_response};
 
 /// body 读取硬上限
 pub(crate) const MAX_BODY_BYTES: u64 = 1024 * 1024;
-/// 非 2xx 错误消息携带的 body 前缀长度（字符数）上限
-const ERR_BODY_CHARS: usize = 160;
 
 /// 双超时 Agent 缓存
 struct AgentCache {
@@ -29,25 +27,33 @@ fn agents_write() -> RwLockWriteGuard<'static, Option<AgentCache>> {
     AGENTS.write().unwrap_or_else(|e| e.into_inner())
 }
 
-/// 缓存缺失时按无代理构建
+impl AgentCache {
+    /// Agent 内部是 Arc 句柄，clone 只复制引用
+    fn cloned(&self) -> AgentCache {
+        AgentCache {
+            proxy: self.proxy.clone(),
+            short: self.short.clone(),
+            long: self.long.clone(),
+        }
+    }
+}
+
+/// 缓存缺失时按无代理构建；读锁判空到取写锁之间可能被并发回填，须双检
 fn agents() -> AgentCache {
     if let Some(c) = agents_read().as_ref() {
-        return AgentCache {
-            proxy: c.proxy.clone(),
-            short: c.short.clone(),
-            long: c.long.clone(),
-        };
+        return c.cloned();
+    }
+    let mut guard = agents_write();
+    // 双检：等写锁期间别的线程可能已构建，直接复用避免重复建 Agent
+    if let Some(c) = guard.as_ref() {
+        return c.cloned();
     }
     let cache = AgentCache {
         proxy: None,
         short: build_agent(5, None),
         long: build_agent(15, None),
     };
-    *agents_write() = Some(AgentCache {
-        proxy: cache.proxy.clone(),
-        short: cache.short.clone(),
-        long: cache.long.clone(),
-    });
+    *guard = Some(cache.cloned());
     cache
 }
 
@@ -142,33 +148,34 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         other => other?,
     };
     if spec.platform == Platform::Cn {
-        snap.balance = fetch_balance(&spec.api_key).ok();
+        // 余额是附加信息：端点失败只缺余额行，不拖垮主用量展示
+        snap.balance = fetch_balance(&spec.api_key).ok().flatten();
     }
     Ok(snap)
 }
 
-/// 账户余额，仅国内版
-fn fetch_balance(api_key: &str) -> Result<Balance, FetchError> {
+/// 账户余额[仅国内版]
+fn fetch_balance(api_key: &str) -> Result<Option<Balance>, FetchError> {
     let url = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report";
     let body = http_get(url, api_key)?;
-    let data = body
-        .get("data")
-        .ok_or_else(|| FetchError::Api("balance response missing data".into()))?;
+    let Some(data) = body.get("data").filter(|d| d.is_object()) else {
+        return Ok(None);
+    };
     let num = |k: &str| {
         data.get(k)
             .and_then(Value::as_f64)
             .filter(|v| v.is_finite())
     };
-    // availableBalance 优先，回退 balance
-    let available = num("availableBalance")
-        .or_else(|| num("balance"))
-        .unwrap_or(0.0);
-    Ok(Balance {
+    // availableBalance 优先，回退 balance；两者皆缺说明形态未知，宁缺毋假
+    let Some(available) = num("availableBalance").or_else(|| num("balance")) else {
+        return Ok(None);
+    };
+    Ok(Some(Balance {
         available,
         recharged: num("rechargeAmount"),
         granted: num("giveAmount"),
         spent: num("totalSpendAmount"),
-    })
+    }))
 }
 
 fn http_get(url: &str, api_key: &str) -> Result<Value, FetchError> {
@@ -197,7 +204,9 @@ fn http_get_text(
         // 错误路径 body 只进消息前缀，读取失败按空串处理
         let body = read_body_capped(resp.into_body()).unwrap_or_default();
         let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
-        return Err(classify_status(status, &prefix).expect("非 2xx 必有分类"));
+        // 分类函数只在 2xx 返回 None，此处必非 2xx；兜底防分类逻辑与分支漂移后 panic
+        return Err(classify_status(status, &prefix)
+            .unwrap_or_else(|| FetchError::Api(format!("HTTP {status}"))));
     }
     read_body_capped(resp.into_body()).map_err(|e| FetchError::Network(e.to_string()))
 }

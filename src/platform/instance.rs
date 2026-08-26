@@ -38,12 +38,14 @@ pub fn acquire() -> InstanceGuard {
                 // CreateMutex 成功时 GetLastError 可能是 ERROR_ALREADY_EXISTS
                 let already = GetLastError() == ERROR_ALREADY_EXISTS;
                 if already {
+                    // 此分支拿到的 h 故意不关：本实例随即唤醒并退出，泄漏至进程终止无害
                     return InstanceGuard(GuardState::AlreadyRunning);
                 }
                 return InstanceGuard(GuardState::First(h));
             }
         }
-        // 两种命名空间都创建失败：保守放行，不让应用完全无法启动
+        // 两种命名空间都创建失败：保守放行，不让应用完全无法启动；
+        // 空句柄在 Drop 里 CloseHandle 会静默失败，同样无害
         InstanceGuard(GuardState::First(HANDLE::default()))
     }
 }

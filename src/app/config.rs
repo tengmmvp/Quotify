@@ -1,6 +1,6 @@
 //! 配置持久化
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -90,8 +90,9 @@ pub struct Config {
 impl Config {
     /// 生成账号 id
     pub fn new_account_id(&self) -> String {
-        let ms = chrono::Utc::now().timestamp_subsec_millis() as i64;
-        let sec = chrono::Utc::now().timestamp();
+        let now = chrono::Utc::now();
+        let ms = now.timestamp_subsec_millis() as i64;
+        let sec = now.timestamp();
         format!("acc_{sec:x}{ms:x}{}", self.accounts.len())
     }
 
@@ -152,8 +153,8 @@ peak_end = "18:00"
 selected = ""
 "#;
 
-/// 解析配置文本，损坏回退默认配置
-fn parse_or_default(text: &str) -> Config {
+/// 解析配置文本，损坏时坏文件改名留档并回退默认配置
+fn parse_or_default(text: &str, path: &Path) -> Config {
     toml::from_str(text).unwrap_or_else(|e| {
         let pos = e
             .span()
@@ -168,30 +169,50 @@ fn parse_or_default(text: &str) -> Config {
                 format!("（第 {line} 行第 {col} 列）")
             })
             .unwrap_or_default();
-        crate::platform::log(&format!("config.toml 解析失败，使用默认配置{pos}"));
+        crate::platform::log(&format!("config.toml 解析失败，使用默认配置{pos}: {e}"));
+        backup_broken(path);
         Config::default()
     })
 }
 
-/// 读取配置
+/// 坏文件改名 .bak 留档后再回退默认，用户手改的内容有处可寻
+fn backup_broken(path: &Path) {
+    if path.exists() {
+        let bak = path.with_extension("toml.bak");
+        if let Err(e) = std::fs::rename(path, &bak) {
+            crate::platform::log(&format!("config.toml 改名 .bak 失败: {e}"));
+        }
+    }
+}
+
+/// 读取配置；读不出或解析失败时坏文件先留档，再回退默认
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(text) => parse_or_default(&text),
+        Ok(text) => parse_or_default(&text, &path),
         Err(_) => {
+            backup_broken(&path);
             let _ = std::fs::write(&path, TEMPLATE);
             Config::default()
         }
     }
 }
 
-/// 写回配置文件
+/// 写回配置文件；先写临时文件再改名覆盖，中途失败原文件不被截断
 pub fn save(config: &Config) {
     let path = config_path();
-    if let Ok(text) = toml::to_string_pretty(config)
-        && let Err(e) = std::fs::write(&path, text)
-    {
+    let tmp = path.with_extension("toml.tmp");
+    let Ok(text) = toml::to_string_pretty(config) else {
+        return;
+    };
+    if let Err(e) = std::fs::write(&tmp, &text) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));
+        let _ = std::fs::remove_file(&tmp);
+        return;
+    }
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        crate::platform::log(&format!("config.toml 写入失败: {e}"));
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -202,7 +223,7 @@ mod tests {
     /// 模板须能解析回 Config 且不产生实际账号
     #[test]
     fn template_parses_back() {
-        let cfg = parse_or_default(TEMPLATE);
+        let cfg = parse_or_default(TEMPLATE, Path::new("no-such-config.toml"));
         assert_eq!(cfg.general.poll_interval_secs, 300);
         assert!(!cfg.general.notify_threshold_enabled);
         assert!(!cfg.general.notify_reset_5h_enabled);
@@ -213,7 +234,10 @@ mod tests {
     /// 损坏文本回退默认配置，不 panic、不部分采用
     #[test]
     fn corrupted_text_falls_back_to_default() {
-        let cfg = parse_or_default("this is not valid toml ]][");
+        let cfg = parse_or_default(
+            "this is not valid toml ]][",
+            Path::new("no-such-config.toml"),
+        );
         assert_eq!(
             cfg.general.poll_interval_secs,
             General::default().poll_interval_secs

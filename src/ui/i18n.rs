@@ -27,33 +27,46 @@ pub fn resolve_lang(setting: Option<&str>) -> Lang {
 }
 
 /// 全部界面文案
+///
+/// 字段按「通用前置、视图专属按 UI 顺序」分组，同族成对相邻；
+/// ZH / EN / check! 与本定义同序，增改字段四处同步。
 pub struct Strings {
-    // ── 主视图 ──
+    // ── 通用按钮 ──
+    pub cancel: &'static str,
+    pub save: &'static str,
+    pub apply: &'static str,
+
+    // ── 时间单位 ──
+    pub unit_day: &'static str,
+    pub unit_hour: &'static str,
+    pub unit_minute: &'static str,
+    pub unit_second: &'static str,
+
+    // ── 主视图 · 指标 ──
+    pub usage_section: &'static str,
     pub five_hour: &'static str,
     pub weekly: &'static str,
     pub mcp_tools: &'static str,
     pub resets_line: &'static str,
     pub used_of: &'static str,
-    pub usage_section: &'static str,
+    pub balance_label: &'static str,
+
+    // ── 主视图 · 峰谷 ──
     pub peak_badge: &'static str,
     pub peak_tip: &'static str,
-    pub peak_section: &'static str,
-    pub peak_start_label: &'static str,
-    pub peak_end_label: &'static str,
-    pub balance_label: &'static str,
+
+    // ── 主视图 · 状态 ──
     pub updated_just_now: &'static str,
     pub updated_ago: &'static str,
     pub data_as_of: &'static str,
+    pub loading: &'static str,
     pub fetch_failed: &'static str,
     pub retry: &'static str,
-    pub settings: &'static str,
-    pub exit: &'static str,
     pub not_configured_title: &'static str,
     pub not_configured_hint: &'static str,
-    pub loading: &'static str,
     pub key_invalid: &'static str,
 
-    // ── 错误提示 ──
+    // ── 错误前缀 ──
     /// 凭据失效（`FetchError::Auth`）：错误卡主文案
     pub err_auth: &'static str,
     /// 空 limits（`FetchError::EmptyLimits`）：key 无套餐权限 / 团队版缺选择头
@@ -65,39 +78,11 @@ pub struct Strings {
     /// 检查更新失败，对应 `service::update` 的 Err
     pub err_update: &'static str,
 
-    // ── 通用 ──
-    pub cancel: &'static str,
-    pub save: &'static str,
+    // ── 托盘菜单 ──
+    pub settings: &'static str,
+    pub exit: &'static str,
 
-    // ── 设置视图 ──
-    pub settings_general: &'static str,
-    pub poll_interval: &'static str,
-    /// 网络小节标题
-    pub network_section: &'static str,
-    pub proxy_label: &'static str,
-    pub proxy_hint: &'static str,
-    /// 配置管理分区标题
-    pub backup_section: &'static str,
-    pub interval_1m: &'static str,
-    pub interval_5m: &'static str,
-    pub interval_15m: &'static str,
-    pub interval_30m: &'static str,
-    pub interval_custom: &'static str,
-    pub interval_custom_unit: &'static str,
-    pub apply: &'static str,
-    pub language: &'static str,
-    pub follow_system: &'static str,
-    pub appearance_section: &'static str,
-    pub theme_light: &'static str,
-    pub theme_dark: &'static str,
-    pub notifications: &'static str,
-    pub notify_threshold: &'static str,
-    pub notify_threshold_desc: &'static str,
-    pub notify_reset_5h_opt: &'static str,
-    pub notify_reset_5h_desc: &'static str,
-    pub notify_reset_weekly_opt: &'static str,
-    pub notify_reset_weekly_desc: &'static str,
-    pub autostart: &'static str,
+    // ── 设置 · 当前账号 ──
     pub accounts_section: &'static str,
     pub switch_account: &'static str,
     pub platform_section: &'static str,
@@ -113,91 +98,111 @@ pub struct Strings {
     pub org_id_label: &'static str,
     pub project_id_label: &'static str,
     pub api_key_label: &'static str,
-    pub check_update: &'static str,
-    pub up_to_date: &'static str,
-    /// 有新版时的下载入口
-    pub go_download: &'static str,
+
+    // ── 设置 · 轮询间隔 ──
+    pub poll_interval: &'static str,
+    pub interval_1m: &'static str,
+    pub interval_5m: &'static str,
+    pub interval_15m: &'static str,
+    pub interval_30m: &'static str,
+    pub interval_custom: &'static str,
+    pub interval_custom_unit: &'static str,
+
+    // ── 设置 · 通用 ──
+    pub settings_general: &'static str,
+    pub language: &'static str,
+    pub follow_system: &'static str,
+    pub appearance_section: &'static str,
+    pub theme_light: &'static str,
+    pub theme_dark: &'static str,
+    pub autostart: &'static str,
+
+    // ── 设置 · 网络代理 ──
+    pub network_section: &'static str,
+    pub proxy_label: &'static str,
+    pub proxy_hint: &'static str,
+
+    // ── 设置 · 用量通知 ──
+    pub notifications: &'static str,
+    pub notify_threshold: &'static str,
+    pub notify_threshold_desc: &'static str,
+    pub notify_reset_5h_opt: &'static str,
+    pub notify_reset_5h_desc: &'static str,
+    pub notify_reset_weekly_opt: &'static str,
+    pub notify_reset_weekly_desc: &'static str,
+
+    // ── 设置 · 高峰区间 ──
+    pub peak_section: &'static str,
+    pub peak_start_label: &'static str,
+    pub peak_end_label: &'static str,
+
+    // ── 设置 · 配置管理与关于 ──
+    pub backup_section: &'static str,
     pub export_config: &'static str,
-    pub import_config: &'static str,
-    /// 导入结果气泡通知
-    pub import_done: &'static str,
-    pub import_failed: &'static str,
     pub export_done: &'static str,
     pub export_failed: &'static str,
+    pub import_config: &'static str,
+    pub import_done: &'static str,
+    pub import_failed: &'static str,
+    pub check_update: &'static str,
+    pub up_to_date: &'static str,
+    pub go_download: &'static str,
     pub version_label: &'static str,
 
-    // ── 通知 ──
+    // ── 系统通知标题 ──
     pub notify_threshold_title: &'static str,
     pub notify_reset_5h: &'static str,
     pub notify_reset_weekly: &'static str,
-
-    // ── 倒计时单位 ──
-    pub unit_day: &'static str,
-    pub unit_hour: &'static str,
-    pub unit_minute: &'static str,
-    pub unit_second: &'static str,
 }
 
 const ZH: Strings = Strings {
-    five_hour: "5 小时窗口",
-    weekly: "周额度",
+    // ── 通用按钮 ──
+    cancel: "取消",
+    save: "保存",
+    apply: "确定",
+
+    // ── 时间单位 ──
+    unit_day: "天",
+    unit_hour: "小时",
+    unit_minute: "分",
+    unit_second: "秒",
+
+    // ── 主视图 · 指标 ──
+    usage_section: "额度用量",
+    five_hour: "5 小时会话窗口",
+    weekly: "周会话窗口",
     mcp_tools: "MCP 工具",
     resets_line: "{t}后重置",
     used_of: "已用 {cur} / {tot}",
-    usage_section: "额度用量",
-    peak_badge: "高峰",
-    peak_tip: "高峰时段：工作日 {r}（北京时间），模型调用消耗更多额度",
-    peak_section: "高峰区间",
-    peak_start_label: "开始",
-    peak_end_label: "结束",
     balance_label: "账户余额",
+
+    // ── 主视图 · 峰谷 ──
+    peak_badge: "高峰",
+    peak_tip: "高峰时段：工作日 {r}（UTC+8），模型调用额度消耗更快",
+
+    // ── 主视图 · 状态 ──
     updated_just_now: "刚刚更新",
     updated_ago: "数据更新于 {t}前",
     data_as_of: "数据截至 {t}",
+    loading: "加载中…",
     fetch_failed: "获取失败",
     retry: "重试",
-    settings: "设置",
-    exit: "退出",
     not_configured_title: "未配置账号",
     not_configured_hint: "进入设置，添加 GLM Coding Plan 账号即可开始使用",
-    loading: "加载中…",
     key_invalid: "[提示] API key 无效，请在设置中检查",
 
+    // ── 错误前缀 ──
     err_auth: "API key 无效或已失效",
     err_empty: "未返回额度数据：请确认 API key 属于编码套餐（团队版需填写组织/项目 ID）",
     err_api: "接口错误",
     err_network: "网络错误",
     err_update: "检查更新失败",
 
-    cancel: "取消",
-    save: "保存",
+    // ── 托盘菜单 ──
+    settings: "设置",
+    exit: "退出",
 
-    settings_general: "通用设置",
-    poll_interval: "轮询间隔",
-    network_section: "网络代理",
-    proxy_label: "代理地址",
-    proxy_hint: "留空直连，支持 http:// 或 socks5://",
-    backup_section: "配置管理",
-    interval_1m: "1 分钟",
-    interval_5m: "5 分钟",
-    interval_15m: "15 分钟",
-    interval_30m: "30 分钟",
-    interval_custom: "自定义",
-    interval_custom_unit: "分钟",
-    apply: "确定",
-    language: "语言",
-    follow_system: "跟随系统",
-    appearance_section: "外观",
-    theme_light: "浅色",
-    theme_dark: "深色",
-    notifications: "用量通知",
-    notify_threshold: "用量预警",
-    notify_threshold_desc: "超过 80% 时提醒一次，额度恢复后重新计数",
-    notify_reset_5h_opt: "5 小时额度重置提醒",
-    notify_reset_5h_desc: "进入新 5 小时窗口时通知",
-    notify_reset_weekly_opt: "周额度重置提醒",
-    notify_reset_weekly_desc: "进入新的周周期时通知",
-    autostart: "开机自启",
+    // ── 设置 · 当前账号 ──
     accounts_section: "当前账号",
     switch_account: "切换账号",
     platform_section: "账号信息",
@@ -213,87 +218,111 @@ const ZH: Strings = Strings {
     org_id_label: "组织 ID",
     project_id_label: "项目 ID",
     api_key_label: "API Key",
-    check_update: "检查更新",
-    up_to_date: "已是最新版本",
-    go_download: "前往下载",
+
+    // ── 设置 · 轮询间隔 ──
+    poll_interval: "轮询间隔",
+    interval_1m: "1 分钟",
+    interval_5m: "5 分钟",
+    interval_15m: "15 分钟",
+    interval_30m: "30 分钟",
+    interval_custom: "自定义",
+    interval_custom_unit: "分钟",
+
+    // ── 设置 · 通用 ──
+    settings_general: "通用设置",
+    language: "语言",
+    follow_system: "跟随系统",
+    appearance_section: "外观",
+    theme_light: "浅色",
+    theme_dark: "深色",
+    autostart: "开机自启",
+
+    // ── 设置 · 网络代理 ──
+    network_section: "网络代理",
+    proxy_label: "代理地址",
+    proxy_hint: "留空直连，支持 http:// 或 socks5://",
+
+    // ── 设置 · 用量通知 ──
+    notifications: "用量通知",
+    notify_threshold: "用量预警",
+    notify_threshold_desc: "超过 80% 时提醒一次，额度恢复后重新计数",
+    notify_reset_5h_opt: "5 小时会话窗口重置提醒",
+    notify_reset_5h_desc: "进入新 5 小时会话窗口时发送系统通知",
+    notify_reset_weekly_opt: "周会话窗口重置提醒",
+    notify_reset_weekly_desc: "进入新的周会话窗口时发送系统通知",
+
+    // ── 设置 · 高峰区间 ──
+    peak_section: "高峰区间",
+    peak_start_label: "开始",
+    peak_end_label: "结束",
+
+    // ── 设置 · 配置管理与关于 ──
+    backup_section: "配置管理",
     export_config: "导出配置",
+    export_done: "配置已导出",
+    export_failed: "导出失败：无法写入所选文件",
     import_config: "导入配置",
     import_done: "配置已导入",
     import_failed: "导入失败：文件不可读或格式无效",
-    export_done: "配置已导出",
-    export_failed: "导出失败：无法写入所选文件",
+    check_update: "检查更新",
+    up_to_date: "已是最新版本",
+    go_download: "前往下载",
     version_label: "当前版本：{v}",
 
+    // ── 系统通知标题 ──
     notify_threshold_title: "额度预警",
     notify_reset_5h: "5 小时窗口已重置",
     notify_reset_weekly: "周额度已重置",
-
-    unit_day: "天",
-    unit_hour: "小时",
-    unit_minute: "分",
-    unit_second: "秒",
 };
 
 const EN: Strings = Strings {
+    // ── 通用按钮 ──
+    cancel: "Cancel",
+    save: "Save",
+    apply: "Apply",
+
+    // ── 时间单位 ──
+    unit_day: "d",
+    unit_hour: "h",
+    unit_minute: "m",
+    unit_second: "s",
+
+    // ── 主视图 · 指标 ──
+    usage_section: "USAGE",
     five_hour: "Session (5h)",
-    weekly: "Weekly",
+    weekly: "Session (weekly)",
     mcp_tools: "MCP tools",
     resets_line: "Resets in {t}",
     used_of: "{cur} of {tot} used",
-    usage_section: "USAGE",
-    peak_badge: "PEAK",
-    peak_tip: "Peak hours: weekdays {r} (UTC+8); model usage costs more quota",
-    peak_section: "Peak hours",
-    peak_start_label: "Start",
-    peak_end_label: "End",
     balance_label: "BALANCE",
+
+    // ── 主视图 · 峰谷 ──
+    peak_badge: "PEAK",
+    peak_tip: "Peak hours: weekdays {r} (UTC+8); model calls drain quota faster",
+
+    // ── 主视图 · 状态 ──
     updated_just_now: "Updated just now",
     updated_ago: "Updated {t} ago",
     data_as_of: "Data as of {t}",
+    loading: "Loading…",
     fetch_failed: "Fetch failed",
     retry: "Retry",
-    settings: "Settings",
-    exit: "Exit",
     not_configured_title: "No account configured",
     not_configured_hint: "Open Settings and add a GLM Coding Plan account to get started",
-    loading: "Loading…",
     key_invalid: "[Note] Invalid API key. Check it in Settings",
 
+    // ── 错误前缀 ──
     err_auth: "Invalid or expired API key",
     err_empty: "No quota data: make sure the API key belongs to a Coding Plan (team accounts need Organization/Project IDs)",
     err_api: "API error",
     err_network: "Network error",
     err_update: "Update check failed",
 
-    cancel: "Cancel",
-    save: "Save",
+    // ── 托盘菜单 ──
+    settings: "Settings",
+    exit: "Exit",
 
-    settings_general: "General",
-    poll_interval: "Poll interval",
-    network_section: "Network proxy",
-    proxy_label: "Proxy address",
-    proxy_hint: "Empty = direct; http:// or socks5://",
-    backup_section: "Config management",
-    interval_1m: "1 min",
-    interval_5m: "5 min",
-    interval_15m: "15 min",
-    interval_30m: "30 min",
-    interval_custom: "Custom",
-    interval_custom_unit: "min",
-    apply: "Apply",
-    language: "Language",
-    follow_system: "Follow system",
-    appearance_section: "Appearance",
-    theme_light: "Light",
-    theme_dark: "Dark",
-    notifications: "Notifications",
-    notify_threshold: "Usage alert",
-    notify_threshold_desc: "Alerts once above the threshold",
-    notify_reset_5h_opt: "5-hour reset alerts",
-    notify_reset_5h_desc: "When the 5-hour window resets",
-    notify_reset_weekly_opt: "Weekly reset alerts",
-    notify_reset_weekly_desc: "When the weekly quota resets",
-    autostart: "Start at login",
+    // ── 设置 · 当前账号 ──
     accounts_section: "Current account",
     switch_account: "Switch account",
     platform_section: "Account details",
@@ -309,25 +338,61 @@ const EN: Strings = Strings {
     org_id_label: "Organization ID",
     project_id_label: "Project ID",
     api_key_label: "API Key",
-    check_update: "Check for updates",
-    up_to_date: "Up to date",
-    go_download: "Download",
+
+    // ── 设置 · 轮询间隔 ──
+    poll_interval: "Poll interval",
+    interval_1m: "1 min",
+    interval_5m: "5 min",
+    interval_15m: "15 min",
+    interval_30m: "30 min",
+    interval_custom: "Custom",
+    interval_custom_unit: "min",
+
+    // ── 设置 · 通用 ──
+    settings_general: "General",
+    language: "Language",
+    follow_system: "Follow system",
+    appearance_section: "Appearance",
+    theme_light: "Light",
+    theme_dark: "Dark",
+    autostart: "Start at login",
+
+    // ── 设置 · 网络代理 ──
+    network_section: "Network proxy",
+    proxy_label: "Proxy address",
+    proxy_hint: "Empty = direct; http:// or socks5://",
+
+    // ── 设置 · 用量通知 ──
+    notifications: "Notifications",
+    notify_threshold: "Usage alert",
+    notify_threshold_desc: "Alerts once above the threshold",
+    notify_reset_5h_opt: "5-hour session reset alerts",
+    notify_reset_5h_desc: "Sends a system notification when the 5-hour session resets",
+    notify_reset_weekly_opt: "Weekly session reset alerts",
+    notify_reset_weekly_desc: "Sends a system notification when the weekly session resets",
+
+    // ── 设置 · 高峰区间 ──
+    peak_section: "Peak hours",
+    peak_start_label: "Start",
+    peak_end_label: "End",
+
+    // ── 设置 · 配置管理与关于 ──
+    backup_section: "Config management",
     export_config: "Export",
+    export_done: "Configuration exported",
+    export_failed: "Export failed: cannot write to the chosen file",
     import_config: "Import",
     import_done: "Configuration imported",
     import_failed: "Import failed: unreadable or invalid file",
-    export_done: "Configuration exported",
-    export_failed: "Export failed: cannot write to the chosen file",
+    check_update: "Check for updates",
+    up_to_date: "Up to date",
+    go_download: "Download",
     version_label: "Version: {v}",
 
+    // ── 系统通知标题 ──
     notify_threshold_title: "Quota alert",
     notify_reset_5h: "5-hour window has reset",
     notify_reset_weekly: "Weekly quota has reset",
-
-    unit_day: "d",
-    unit_hour: "h",
-    unit_minute: "m",
-    unit_second: "s",
 };
 
 impl Lang {
@@ -343,7 +408,6 @@ impl Lang {
 mod tests {
     use super::*;
 
-    /// 提取 `{name}` 占位符名并排序去重；不引 regex 依赖
     fn placeholder_set(s: &str) -> Vec<&str> {
         let mut names = Vec::new();
         let bytes = s.as_bytes();
@@ -363,8 +427,6 @@ mod tests {
         names
     }
 
-    /// 双语占位符名集合须一致——渲染层按名 replace，漏改留原文；
-    /// 新增字段须同步补进 check! 列表。
     #[test]
     fn zh_en_placeholders_match() {
         let (zh, en) = (&ZH, &EN);
@@ -380,57 +442,46 @@ mod tests {
             };
         }
         check!(
+            // ── 通用按钮 ──
+            cancel,
+            save,
+            apply,
+            // ── 时间单位 ──
+            unit_day,
+            unit_hour,
+            unit_minute,
+            unit_second,
+            // ── 主视图 · 指标 ──
+            usage_section,
             five_hour,
             weekly,
             mcp_tools,
             resets_line,
             used_of,
-            usage_section,
+            balance_label,
+            // ── 主视图 · 峰谷 ──
             peak_badge,
             peak_tip,
-            peak_section,
-            peak_start_label,
-            peak_end_label,
-            balance_label,
+            // ── 主视图 · 状态 ──
             updated_just_now,
             updated_ago,
             data_as_of,
+            loading,
             fetch_failed,
             retry,
-            settings,
-            exit,
             not_configured_title,
             not_configured_hint,
-            loading,
             key_invalid,
-            cancel,
-            save,
-            settings_general,
-            poll_interval,
-            network_section,
-            proxy_label,
-            proxy_hint,
-            backup_section,
-            interval_1m,
-            interval_5m,
-            interval_15m,
-            interval_30m,
-            interval_custom,
-            interval_custom_unit,
-            apply,
-            language,
-            follow_system,
-            appearance_section,
-            theme_light,
-            theme_dark,
-            notifications,
-            notify_threshold,
-            notify_threshold_desc,
-            notify_reset_5h_opt,
-            notify_reset_5h_desc,
-            notify_reset_weekly_opt,
-            notify_reset_weekly_desc,
-            autostart,
+            // ── 错误前缀 ──
+            err_auth,
+            err_empty,
+            err_api,
+            err_network,
+            err_update,
+            // ── 托盘菜单 ──
+            settings,
+            exit,
+            // ── 设置 · 当前账号 ──
             accounts_section,
             switch_account,
             platform_section,
@@ -446,28 +497,54 @@ mod tests {
             org_id_label,
             project_id_label,
             api_key_label,
-            check_update,
-            up_to_date,
-            go_download,
+            // ── 设置 · 轮询间隔 ──
+            poll_interval,
+            interval_1m,
+            interval_5m,
+            interval_15m,
+            interval_30m,
+            interval_custom,
+            interval_custom_unit,
+            // ── 设置 · 通用 ──
+            settings_general,
+            language,
+            follow_system,
+            appearance_section,
+            theme_light,
+            theme_dark,
+            autostart,
+            // ── 设置 · 网络代理 ──
+            network_section,
+            proxy_label,
+            proxy_hint,
+            // ── 设置 · 用量通知 ──
+            notifications,
+            notify_threshold,
+            notify_threshold_desc,
+            notify_reset_5h_opt,
+            notify_reset_5h_desc,
+            notify_reset_weekly_opt,
+            notify_reset_weekly_desc,
+            // ── 设置 · 高峰区间 ──
+            peak_section,
+            peak_start_label,
+            peak_end_label,
+            // ── 设置 · 配置管理与关于 ──
+            backup_section,
             export_config,
+            export_done,
+            export_failed,
             import_config,
             import_done,
             import_failed,
-            export_done,
-            export_failed,
-            err_auth,
-            err_empty,
-            err_api,
-            err_network,
-            err_update,
+            check_update,
+            up_to_date,
+            go_download,
             version_label,
+            // ── 系统通知标题 ──
             notify_threshold_title,
             notify_reset_5h,
             notify_reset_weekly,
-            unit_day,
-            unit_hour,
-            unit_minute,
-            unit_second,
         );
     }
 }

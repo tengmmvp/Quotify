@@ -116,11 +116,11 @@ impl Platform {
 #[derive(Debug, Clone)]
 pub struct AccountSpec {
     pub platform: Platform,
-    pub api_key: String,
     /// 团队版：组织 ID（`Bigmodel-Organization`）
     pub org_id: String,
     /// 团队版：项目 ID（`Bigmodel-Project`）
     pub project_id: String,
+    pub api_key: String,
 }
 
 impl AccountSpec {

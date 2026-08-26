@@ -20,7 +20,6 @@ pub struct PanelModel<'a> {
     pub error: Option<&'a crate::api::FetchError>,
     pub account: Option<AccountView<'a>>,
     pub accounts_count: usize,
-    /// 全部账号，账号切换弹窗渲染用
     pub accounts: &'a [crate::app::config::Account],
     pub poll_interval_secs: u64,
     pub language: Option<&'a str>,
@@ -33,9 +32,7 @@ pub struct PanelModel<'a> {
     pub reset_5h_enabled: bool,
     pub reset_weekly_enabled: bool,
     pub update_available: bool,
-    /// 高峰区间（当日分钟）
     pub peak_range: crate::ui::peak::PeakRange,
-    /// 配置原文，输入框未编辑时回显
     pub peak_start_raw: &'a str,
     pub peak_end_raw: &'a str,
     pub update: Option<&'a Result<crate::service::update::ReleaseInfo, String>>,

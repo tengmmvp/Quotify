@@ -58,43 +58,60 @@ pub enum ScopeChoice {
     Team,
 }
 
-/// 可点击元素标识，用于命中检测
+/// 可点击元素标识，用于命中检测；按 UI 场景分组，序同 handle_panel_hit 臂序
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
+    // ── 主视图 ──
     Refresh,
     Settings,
     AccountSwitch,
     Retry,
+    UsageInfo,
+
+    // ── 导航 ──
     Back,
+
+    // ── 设置 · 轮询间隔 ──
     IntervalPreset(u64),
     CustomizeInterval,
     ApplyInterval,
-    InputName,
-    InputKey,
     InputInterval,
-    InputOrg,
-    InputProject,
-    InputProxy,
-    InputPeakStart,
-    InputPeakEnd,
-    ApplyPeak,
+
+    // ── 设置 · 通用 ──
     Language(LanguageChoice),
     Appearance(AppearanceChoice),
-    Platform(Platform),
-    AccountType(ScopeChoice),
-    SaveAccount,
+    ToggleAutostart,
+
+    // ── 设置 · 网络代理 ──
+    InputProxy,
+
+    // ── 设置 · 用量通知 ──
     ToggleThreshold,
     ToggleReset5h,
     ToggleResetWeekly,
-    ToggleAutostart,
+
+    // ── 设置 · 高峰区间 ──
+    InputPeakStart,
+    InputPeakEnd,
+    ApplyPeak,
+
+    // ── 设置 · 账号 ──
     AddAccount,
     RemoveAccount(usize),
     PickAccount(usize),
-    CheckUpdate,
-    OpenDownload,
+    AccountType(ScopeChoice),
+    InputName,
+    InputKey,
+    InputOrg,
+    InputProject,
+    SaveAccount,
+    Platform(Platform),
+
+    // ── 设置 · 配置管理与关于 ──
     ExportConfig,
     ImportConfig,
-    UsageInfo,
+    CheckUpdate,
+    OpenDownload,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -84,7 +84,6 @@ pub struct Strings {
 
     // ── 设置 · 当前账号 ──
     pub accounts_section: &'static str,
-    pub switch_account: &'static str,
     pub platform_section: &'static str,
     pub add_account: &'static str,
     pub account_name: &'static str,
@@ -98,6 +97,7 @@ pub struct Strings {
     pub org_id_label: &'static str,
     pub project_id_label: &'static str,
     pub api_key_label: &'static str,
+    pub switch_account: &'static str,
 
     // ── 设置 · 轮询间隔 ──
     pub poll_interval: &'static str,
@@ -204,7 +204,6 @@ const ZH: Strings = Strings {
 
     // ── 设置 · 当前账号 ──
     accounts_section: "当前账号",
-    switch_account: "切换账号",
     platform_section: "账号信息",
     add_account: "添加账号",
     account_name: "名称",
@@ -218,6 +217,7 @@ const ZH: Strings = Strings {
     org_id_label: "组织 ID",
     project_id_label: "项目 ID",
     api_key_label: "API Key",
+    switch_account: "切换账号",
 
     // ── 设置 · 轮询间隔 ──
     poll_interval: "轮询间隔",
@@ -324,7 +324,6 @@ const EN: Strings = Strings {
 
     // ── 设置 · 当前账号 ──
     accounts_section: "Current account",
-    switch_account: "Switch account",
     platform_section: "Account details",
     add_account: "Add account",
     account_name: "Name",
@@ -338,6 +337,7 @@ const EN: Strings = Strings {
     org_id_label: "Organization ID",
     project_id_label: "Project ID",
     api_key_label: "API Key",
+    switch_account: "Switch account",
 
     // ── 设置 · 轮询间隔 ──
     poll_interval: "Poll interval",
@@ -483,7 +483,6 @@ mod tests {
             exit,
             // ── 设置 · 当前账号 ──
             accounts_section,
-            switch_account,
             platform_section,
             add_account,
             account_name,
@@ -497,6 +496,7 @@ mod tests {
             org_id_label,
             project_id_label,
             api_key_label,
+            switch_account,
             // ── 设置 · 轮询间隔 ──
             poll_interval,
             interval_1m,

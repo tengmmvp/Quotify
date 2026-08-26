@@ -55,14 +55,14 @@ impl Default for General {
 }
 
 /// 一个受监控的 GLM 账号
+/// 字段序同添加页表单（名称→平台→类型→组织→项目），凭据收尾；
+/// 此序即 config.toml 写出顺序
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Account {
     /// 稳定 id
     pub id: String,
     /// 显示名
     pub name: String,
-    /// API key
-    pub api_key: String,
     /// 站点：国内 open.bigmodel.cn / 国际 api.z.ai
     pub platform: Platform,
     /// 团队版标记，仅国内站；请求走 `?type=2` + 组织/项目选择头
@@ -74,6 +74,8 @@ pub struct Account {
     /// 团队版：`Bigmodel-Project` 头的值
     #[serde(default)]
     pub project_id: String,
+    /// API key
+    pub api_key: String,
 }
 
 /// 应用全量配置
@@ -140,11 +142,11 @@ peak_end = "18:00"
 # [[accounts]]
 # id = "acc_demo"
 # name = "Demo"
-# api_key = "你的 API key"
 # platform = "cn"          # cn = 国内版 open.bigmodel.cn；intl = 国际版 api.z.ai
 # team = false             # 团队版（仅国内站）：true 时下面两项必填
 # org_id = ""              # 团队版：组织 ID（bigmodel-organization 请求头）
 # project_id = ""          # 团队版：项目 ID（bigmodel-project 请求头）
+# api_key = "你的 API key"
 
 # 当前选中的账号 id
 selected = ""
@@ -227,8 +229,8 @@ mod tests {
 [[accounts]]
 id = "acc_demo"
 name = "demo"
-api_key = "sk-demo"
 platform = "cn"
+api_key = "sk-demo"
 "#;
         let cfg: Config = toml::from_str(text).expect("缺省字段应可反序列化");
         assert_eq!(cfg.accounts.len(), 1);

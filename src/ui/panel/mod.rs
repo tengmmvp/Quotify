@@ -51,36 +51,39 @@ pub enum PanelView {
     AccountPicker,
 }
 
-/// 自绘输入的目标字段
+/// 自绘输入的目标字段；设置页字段在前、添加页表单在后，各按所在分区顺序
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputField {
-    Name,
-    Key,
+    /// 设置页：自定义轮询间隔
     Interval,
-    /// 团队版：组织 ID
-    Org,
-    /// 团队版：项目 ID
-    Project,
     /// 设置页：网络代理地址
     Proxy,
     /// 设置页：高峰区间开始
     PeakStart,
     /// 设置页：高峰区间结束
     PeakEnd,
+    /// 添加页：账号名称
+    Name,
+    /// 添加页：API key
+    Key,
+    /// 添加页（团队版）：组织 ID
+    Org,
+    /// 添加页（团队版）：项目 ID
+    Project,
 }
 
-/// 自绘输入缓冲
+/// 自绘输入缓冲；字段序同 InputField
 #[derive(Default)]
 pub struct PanelInput {
     pub field: Option<InputField>,
-    pub name: String,
-    pub key: String,
     pub interval: String,
-    pub org: String,
-    pub project: String,
     pub proxy: String,
     pub peak_start: String,
     pub peak_end: String,
+    pub name: String,
+    pub key: String,
+    pub org: String,
+    pub project: String,
 }
 
 pub struct Panel {
@@ -490,14 +493,10 @@ impl Panel {
     /// 光标/IME 共用锚点；x/y 取自 layout，设置页各框随分区伸缩
     fn caret_anchor(&self, field: InputField) -> (&str, f32, f32) {
         let y = match field {
-            InputField::Name => layout::ADD_NAME_Y,
-            InputField::Key => layout::ADD_KEY_Y,
             InputField::Interval => {
                 let (has_account, auth_error) = self.caret_ctx;
                 layout::interval_input_y(has_account, auth_error)
             }
-            InputField::Org => layout::ADD_ORG_Y,
-            InputField::Project => layout::ADD_PROJECT_Y,
             InputField::Proxy => {
                 let (has_account, auth_error) = self.caret_ctx;
                 layout::proxy_input_y(has_account, auth_error, self.customizing_interval)
@@ -506,16 +505,20 @@ impl Panel {
                 let (has_account, auth_error) = self.caret_ctx;
                 layout::peak_input_y(has_account, auth_error, self.customizing_interval)
             }
+            InputField::Name => layout::ADD_NAME_Y,
+            InputField::Key => layout::ADD_KEY_Y,
+            InputField::Org => layout::ADD_ORG_Y,
+            InputField::Project => layout::ADD_PROJECT_Y,
         } + layout::CARET_Y_OFFSET;
         let (buf, bx) = match field {
-            InputField::Name => (self.input.name.as_str(), layout::INPUT_X),
-            InputField::Key => (self.input.key.as_str(), layout::INPUT_X),
             InputField::Interval => (self.input.interval.as_str(), layout::INPUT_X),
-            InputField::Org => (self.input.org.as_str(), layout::INPUT_X),
-            InputField::Project => (self.input.project.as_str(), layout::INPUT_X),
             InputField::Proxy => (self.input.proxy.as_str(), layout::INPUT_X),
             InputField::PeakStart => (self.input.peak_start.as_str(), layout::PEAK_START_X),
             InputField::PeakEnd => (self.input.peak_end.as_str(), layout::PEAK_END_X),
+            InputField::Name => (self.input.name.as_str(), layout::INPUT_X),
+            InputField::Key => (self.input.key.as_str(), layout::INPUT_X),
+            InputField::Org => (self.input.org.as_str(), layout::INPUT_X),
+            InputField::Project => (self.input.project.as_str(), layout::INPUT_X),
         };
         (buf, bx, y)
     }
@@ -763,13 +766,14 @@ pub extern "system" fn panel_wndproc(
                         let input = &mut app.panel.input;
                         let field = input.field;
                         let buf = match field {
+                            Some(InputField::Proxy) => &mut input.proxy,
+                            Some(InputField::PeakStart) => &mut input.peak_start,
+                            Some(InputField::PeakEnd) => &mut input.peak_end,
                             Some(InputField::Name) => &mut input.name,
                             Some(InputField::Key) => &mut input.key,
                             Some(InputField::Org) => &mut input.org,
                             Some(InputField::Project) => &mut input.project,
-                            Some(InputField::Proxy) => &mut input.proxy,
-                            Some(InputField::PeakStart) => &mut input.peak_start,
-                            Some(InputField::PeakEnd) => &mut input.peak_end,
+                            // Interval 走兜底臂，保持无输入态也可敲键
                             _ => &mut input.interval,
                         };
                         match char::from_u32(ch as u32) {

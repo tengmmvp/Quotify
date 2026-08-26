@@ -58,8 +58,8 @@ pub struct App {
     pub(crate) autostart_enabled: bool,
     last_icon_key: Option<(i64, bool, bool)>,
     threshold_armed_5h: bool,
-    threshold_armed_weekly: bool,
     last_reset_5h: Option<DateTime<Utc>>,
+    threshold_armed_weekly: bool,
     last_reset_weekly: Option<DateTime<Utc>>,
 }
 
@@ -67,9 +67,9 @@ impl App {
     fn new(config: Config) -> Self {
         let lang = crate::ui::i18n::resolve_lang(config.general.language.as_deref());
         Self {
-            strings: lang.strings(),
-            lang,
             config,
+            lang,
+            strings: lang.strings(),
             data: AccountData {
                 snapshot: None,
                 last_error: None,
@@ -86,8 +86,8 @@ impl App {
             autostart_enabled: crate::platform::autostart::is_enabled(),
             last_icon_key: None,
             threshold_armed_5h: true,
-            threshold_armed_weekly: true,
             last_reset_5h: None,
+            threshold_armed_weekly: true,
             last_reset_weekly: None,
         }
     }
@@ -103,9 +103,9 @@ impl App {
             .filter(|a| !a.api_key.trim().is_empty())
             .map(|a| crate::api::client::AccountSpec {
                 platform: a.platform,
-                api_key: a.api_key.clone(),
                 org_id: a.org_id.clone(),
                 project_id: a.project_id.clone(),
+                api_key: a.api_key.clone(),
             });
         *self.poll_target.lock().unwrap() = target;
         *self.poll_interval.lock().unwrap() =
@@ -453,6 +453,15 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             sync_customizing(app);
             relayout_panel(app, panel_hwnd);
         }
+        Hit::AccountSwitch => {
+            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
+            app.panel.view = crate::ui::panel::PanelView::AccountPicker;
+            relayout_panel(app, panel_hwnd);
+        }
+        // 悬停徽标无点击语义
+        Hit::UsageInfo => {}
+
+        // ── 导航 ──
         Hit::Back => {
             let was_adding = app.panel.adding_account;
             app.panel.adding_account = false;
@@ -463,6 +472,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
             relayout_panel(app, panel_hwnd);
         }
+
+        // ── 设置 · 轮询间隔 ──
         Hit::IntervalPreset(secs) => {
             app.config.general.poll_interval_secs = secs;
             crate::app::config::save(&app.config);
@@ -474,6 +485,23 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.clear_input(panel_hwnd);
             relayout_panel(app, panel_hwnd);
         }
+        Hit::CustomizeInterval => {
+            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
+            app.panel.customizing_interval = true;
+            if app.panel.input.interval.trim().is_empty() {
+                prefill_interval(app);
+            }
+            relayout_panel(app, panel_hwnd);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+        }
+        Hit::ApplyInterval => apply_interval(app, panel_hwnd),
+        Hit::InputInterval => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
+        }
+
+        // ── 设置 · 通用 ──
         Hit::Language(choice) => {
             app.config.general.language = match choice {
                 LanguageChoice::System => None,
@@ -498,25 +526,21 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 }
             }
         }
-        Hit::Platform(platform) => {
-            app.panel.pending_platform = platform;
-            if platform == crate::api::client::Platform::Intl {
-                // 团队版仅国内站：切到国际版时类型同步回个人版
-                app.panel.pending_team = false;
+        Hit::ToggleAutostart => {
+            let next = !crate::platform::autostart::is_enabled();
+            match crate::platform::autostart::set_enabled(next) {
+                Ok(()) => app.autostart_enabled = next,
+                Err(e) => crate::platform::log(&format!("[Quotify] 开机自启设置失败: {e}")),
             }
-            collapse_team_focus(app, panel_hwnd);
-            relayout_panel(app, panel_hwnd);
         }
-        Hit::AccountType(scope) => {
-            app.panel.pending_team = matches!(scope, ScopeChoice::Team);
-            if app.panel.pending_team {
-                // 团队版仅国内站：类型切团队时平台同步回国内
-                app.panel.pending_platform = crate::api::client::Platform::Cn;
-            }
-            collapse_team_focus(app, panel_hwnd);
-            relayout_panel(app, panel_hwnd);
+
+        // ── 设置 · 网络代理 ──
+        Hit::InputProxy => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Proxy);
         }
-        Hit::SaveAccount => save_pending_account(app, panel_hwnd),
+
+        // ── 设置 · 用量通知 ──
         Hit::ToggleThreshold => {
             app.config.general.notify_threshold_enabled =
                 !app.config.general.notify_threshold_enabled;
@@ -532,12 +556,31 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 !app.config.general.notify_reset_weekly_enabled;
             crate::app::config::save(&app.config);
         }
-        Hit::ToggleAutostart => {
-            let next = !crate::platform::autostart::is_enabled();
-            match crate::platform::autostart::set_enabled(next) {
-                Ok(()) => app.autostart_enabled = next,
-                Err(e) => crate::platform::log(&format!("[Quotify] 开机自启设置失败: {e}")),
-            }
+
+        // ── 设置 · 高峰区间 ──
+        Hit::InputPeakStart => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakStart);
+        }
+        Hit::InputPeakEnd => {
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakEnd);
+        }
+        Hit::ApplyPeak => apply_peak(app, panel_hwnd),
+
+        // ── 设置 · 账号 ──
+        Hit::AddAccount => {
+            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
+            app.panel.adding_account = true;
+            app.panel.pending_platform = crate::api::client::Platform::Cn;
+            app.panel.pending_team = false;
+            app.panel.input.name.clear();
+            app.panel.input.key.clear();
+            app.panel.input.org.clear();
+            app.panel.input.project.clear();
+            relayout_panel(app, panel_hwnd);
+            app.panel
+                .focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
         Hit::RemoveAccount(i) => {
             if i < app.config.accounts.len() {
@@ -563,18 +606,21 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 relayout_panel(app, panel_hwnd);
             }
         }
-        Hit::AddAccount => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
-            app.panel.adding_account = true;
-            app.panel.pending_platform = crate::api::client::Platform::Cn;
-            app.panel.pending_team = false;
-            app.panel.input.name.clear();
-            app.panel.input.key.clear();
-            app.panel.input.org.clear();
-            app.panel.input.project.clear();
+        Hit::PickAccount(i) => {
+            if i < app.config.accounts.len() {
+                select_account(app, i);
+                app.panel.view = crate::ui::panel::PanelView::Main;
+                relayout_panel(app, panel_hwnd);
+            }
+        }
+        Hit::AccountType(scope) => {
+            app.panel.pending_team = matches!(scope, ScopeChoice::Team);
+            if app.panel.pending_team {
+                // 团队版仅国内站：类型切团队时平台同步回国内
+                app.panel.pending_platform = crate::api::client::Platform::Cn;
+            }
+            collapse_team_focus(app, panel_hwnd);
             relayout_panel(app, panel_hwnd);
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::Name);
         }
         Hit::InputName => {
             app.panel
@@ -592,53 +638,18 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Project);
         }
-        Hit::InputInterval => {
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
-        }
-        Hit::InputProxy => {
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::Proxy);
-        }
-        Hit::InputPeakStart => {
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakStart);
-        }
-        Hit::InputPeakEnd => {
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::PeakEnd);
-        }
-        Hit::ApplyPeak => apply_peak(app, panel_hwnd),
-        Hit::CustomizeInterval => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
-            app.panel.customizing_interval = true;
-            if app.panel.input.interval.trim().is_empty() {
-                prefill_interval(app);
+        Hit::SaveAccount => save_pending_account(app, panel_hwnd),
+        Hit::Platform(platform) => {
+            app.panel.pending_platform = platform;
+            if platform == crate::api::client::Platform::Intl {
+                // 团队版仅国内站：切到国际版时类型同步回个人版
+                app.panel.pending_team = false;
             }
-            relayout_panel(app, panel_hwnd);
-            app.panel
-                .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
-        }
-        Hit::ApplyInterval => apply_interval(app, panel_hwnd),
-        Hit::AccountSwitch => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
-            app.panel.view = crate::ui::panel::PanelView::AccountPicker;
+            collapse_team_focus(app, panel_hwnd);
             relayout_panel(app, panel_hwnd);
         }
-        Hit::PickAccount(i) => {
-            if i < app.config.accounts.len() {
-                select_account(app, i);
-                app.panel.view = crate::ui::panel::PanelView::Main;
-                relayout_panel(app, panel_hwnd);
-            }
-        }
-        Hit::OpenDownload => {
-            if let Some(Ok(info)) = app.update_status.as_ref() {
-                crate::platform::open_url(&info.url);
-            }
-        }
-        // 悬停徽标无点击语义
-        Hit::UsageInfo => {}
+
+        // ── 设置 · 配置管理与关于 ──
         Hit::ExportConfig => export_config(app),
         Hit::ImportConfig => import_config(app, panel_hwnd),
         Hit::CheckUpdate => {
@@ -665,6 +676,11 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                         drop(unsafe { Box::from_raw(boxed) });
                     }
                 });
+            }
+        }
+        Hit::OpenDownload => {
+            if let Some(Ok(info)) = app.update_status.as_ref() {
+                crate::platform::open_url(&info.url);
             }
         }
     }
@@ -719,11 +735,11 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     let acc = crate::app::config::Account {
         id: app.config.new_account_id(),
         name,
-        api_key: key,
         platform: app.panel.pending_platform,
         team: app.panel.pending_team,
         org_id: app.panel.input.org.trim().to_string(),
         project_id: app.panel.input.project.trim().to_string(),
+        api_key: key,
     };
     let is_first = app.config.accounts.is_empty();
     app.config.accounts.push(acc.clone());

@@ -11,7 +11,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS,
+    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_DRAW_TEXT_OPTIONS_CLIP,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
     D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
     D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1CreateFactory, ID2D1Factory,
@@ -89,11 +89,11 @@ pub enum Hit {
     ToggleAutostart,
     AddAccount,
     RemoveAccount(usize),
+    PickAccount(usize),
     CheckUpdate,
     OpenDownload,
     ExportConfig,
     ImportConfig,
-    /// 峰谷徽标悬停区，无点击语义
     UsageInfo,
 }
 
@@ -221,9 +221,80 @@ impl Renderer {
             };
             let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
             let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+            // 单行布局：禁用自动换行，超宽由 ellipsize 截断负责，防文本折行溢出框外
+            let _ = fmt.SetWordWrapping(
+                windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+            );
             self.formats.insert(key, fmt.clone());
             Some(fmt)
         }
+    }
+
+    /// DWrite 真实测宽
+    unsafe fn measure(&mut self, s: &str, size: f32, weight: u16, mono: bool) -> f32 {
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return 0.0;
+        };
+        let w16: Vec<u16> = s.encode_utf16().collect();
+        if w16.is_empty() {
+            return 0.0;
+        }
+        let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
+            return 0.0;
+        };
+        let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+        if layout.GetMetrics(&mut m).is_ok() {
+            m.widthIncludingTrailingWhitespace
+        } else {
+            0.0
+        }
+    }
+
+    /// 真实度量保头截断：逐 cluster 宽累计 + 真实省略号宽
+    unsafe fn ellipsize(
+        &mut self,
+        s: &str,
+        size: f32,
+        max_w: f32,
+        weight: u16,
+        mono: bool,
+    ) -> String {
+        if s.is_empty() {
+            return String::new();
+        }
+        let ell_w = self.measure("…", size, weight, mono);
+        let budget = (max_w - ell_w).max(0.0);
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return s.to_string();
+        };
+        let w16: Vec<u16> = s.encode_utf16().collect();
+        let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
+            return s.to_string();
+        };
+        let mut cms = vec![
+            windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default();
+            w16.len()
+        ];
+        let mut n = 0u32;
+        if layout.GetClusterMetrics(Some(&mut cms), &mut n).is_err() {
+            return s.to_string();
+        }
+        cms.truncate(n as usize);
+        let mut w = 0.0f32;
+        let mut units = 0usize;
+        for cm in &cms {
+            if w + cm.width > budget {
+                break;
+            }
+            w += cm.width;
+            units += cm.length as usize;
+        }
+        if units >= w16.len() {
+            return s.to_string();
+        }
+        let mut out: Vec<u16> = w16[..units].to_vec();
+        out.push(0x2026);
+        String::from_utf16_lossy(&out)
     }
 
     /// 绘制一帧；`rect_phys` 为物理像素，绘制全程用逻辑像素 DIP。
@@ -294,6 +365,7 @@ impl Renderer {
         match view {
             PanelView::Main => self.draw_main(target, model, w, h, dy, alpha),
             PanelView::Settings => self.draw_settings(target, panel, model, w, dy, alpha),
+            PanelView::AccountPicker => self.draw_account_picker(target, model, w, dy, alpha),
         }
 
         // 峰谷说明卡片最后画，盖过数据行
@@ -346,10 +418,12 @@ impl Renderer {
         let (logo_size, logo_y) = (38.0, y + 7.0);
         self.logo(target, pad, logo_y, logo_size, alpha);
         let tx = pad + logo_size + 10.0;
-        let tw = w - tx - 88.0;
+        // 多账号时名称区还要给下拉箭头留位（前距 6 + 箭头 10 + 余量 2），长名称不再把箭头挤进右按钮区
+        let chevron_w = if model.accounts_count > 1 { 18.0 } else { 0.0 };
+        let tw = w - tx - 88.0 - chevron_w;
         let block_h = if meta.is_some() { 39.0 } else { 22.0 };
         let block_top = y + 26.0 - block_h / 2.0;
-        let title_disp = ellipsize_px(title, 16.0, tw);
+        let title_disp = self.ellipsize(title, 16.0, tw, 500, false);
         self.text(
             target,
             &title_disp,
@@ -364,7 +438,7 @@ impl Renderer {
         );
         // 多账号时账号名后给下拉箭头，与 logo 中心对齐；命中区只覆盖箭头附近
         if model.accounts_count > 1 {
-            let ax = tx + est_width(&title_disp, 16.0) + 6.0;
+            let ax = tx + self.measure(&title_disp, 16.0, 500, false) + 6.0;
             self.chevron(target, ax, y + 26.0, self.theme.text_secondary, alpha);
             self.hits.push((
                 Hit::AccountSwitch,
@@ -448,7 +522,7 @@ impl Renderer {
                         right: w - pad - 12.0,
                         bottom: top + 96.0 + 40.0,
                     };
-                    self.text_aligned(
+                    self.text_wrapped(
                         target,
                         t2,
                         &sub_rect,
@@ -1436,7 +1510,7 @@ impl Renderer {
         // 左「当前版本」12px，右描边小按钮——字号一致、视觉平衡；
         // 按钮宽随文案自适应，英文失败/新版本文案不折行
         let ver_line = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
-        let btn_w = (est_width(&update_label, 12.0) + 28.0).max(104.0);
+        let btn_w = (self.measure(&update_label, 12.0, 400, false) + 28.0).max(104.0);
         self.text(
             target,
             &ver_line,
@@ -1857,46 +1931,19 @@ impl Renderer {
         target.FillRoundedRectangle(&card, &fill);
         let edge = self.brush(target, self.theme.border, alpha * 0.8);
         target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-        // 保头截断给名牌留位，名牌永不被挤掉
-        let name_disp = ellipsize_px(name, 15.0, 104.0);
-        self.text_aligned_vc(
-            target,
-            &name_disp,
-            &D2D_RECT_F {
-                left: x + 12.0,
-                top: y,
-                right: x + w - 60.0,
-                bottom: y + h,
-            },
-            15.0,
-            500,
-            self.theme.text_primary,
-            alpha,
-            Align::Left,
-            false,
-        );
-        let name_w = est_width(&name_disp, 15.0);
-        // 名牌行紧随名称；三枚统一描边样式，仅等级牌按档位取墨阶色
-        let mut bx = x + 12.0 + name_w + 10.0;
+        // 徽标与关闭钮居右对齐，名称吃左侧剩余空间；从右界向左依次排 tier/version/platform
         let by = y + (h - 17.0) / 2.0;
-        let max_bx = x + w - 56.0; // 给右侧 × 留位
-        let pw = est_width(platform, 10.5) + 14.0;
-        if bx + pw <= max_bx {
-            self.badge(
-                target,
-                platform,
-                bx,
-                by,
-                pw,
-                self.theme.border,
-                self.theme.text_secondary,
-                alpha,
-                false,
-            );
-            bx += pw + 6.0;
+        let mut bx = x + w - 56.0; // 徽标区右界，给右侧 × 留位
+        if tier != "—" {
+            let tw = self.measure(tier, 10.5, 400, false) + 14.0;
+            bx -= tw;
+            let (edge, fg) = self.tier_badge_colors(tier);
+            self.badge(target, tier, bx, by, tw, edge, fg, alpha, false);
+            bx -= 6.0;
         }
-        let vw = est_width(version, 10.5) + 14.0;
-        if bx + vw <= max_bx && version != "—" {
+        if version != "—" {
+            let vw = self.measure(version, 10.5, 400, true) + 14.0;
+            bx -= vw;
             self.badge(
                 target,
                 version,
@@ -1908,13 +1955,39 @@ impl Renderer {
                 alpha,
                 true,
             );
-            bx += vw + 6.0;
+            bx -= 6.0;
         }
-        if bx + 40.0 <= max_bx && tier != "—" {
-            let (edge, fg) = self.tier_badge_colors(tier);
-            let tw = est_width(tier, 10.5) + 14.0;
-            self.badge(target, tier, bx, by, tw, edge, fg, alpha, false);
-        }
+        let pw = self.measure(platform, 10.5, 400, false) + 14.0;
+        bx -= pw;
+        self.badge(
+            target,
+            platform,
+            bx,
+            by,
+            pw,
+            self.theme.border,
+            self.theme.text_secondary,
+            alpha,
+            false,
+        );
+        let name_max = (bx - 10.0 - (x + 12.0)).max(60.0);
+        let name_disp = self.ellipsize(name, 15.0, name_max, 500, false);
+        self.text_aligned_vc(
+            target,
+            &name_disp,
+            &D2D_RECT_F {
+                left: x + 12.0,
+                top: y,
+                right: x + 12.0 + name_max,
+                bottom: y + h,
+            },
+            15.0,
+            500,
+            self.theme.text_primary,
+            alpha,
+            Align::Left,
+            false,
+        );
         self.x_button(target, remove, x + w - 24.0, y + 15.0);
     }
 
@@ -2447,10 +2520,53 @@ impl Renderer {
                 &fmt,
                 rect as *const D2D_RECT_F,
                 &brush,
-                D2D1_DRAW_TEXT_OPTIONS(0),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
             );
         }
+        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
+    /// 多行文案：临时开自动换行，长文按框宽折行（如空态副标题）。
+    /// format 是缓存共享句柄，用后必须还原换行与对齐
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn text_wrapped(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        s: &str,
+        rect: &D2D_RECT_F,
+        size: f32,
+        weight: u16,
+        color: [f32; 4],
+        alpha: f32,
+        align: Align,
+        mono: bool,
+    ) {
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return;
+        };
+        let _ =
+            fmt.SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP);
+        let align_set = match align {
+            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+        };
+        let _ = fmt.SetTextAlignment(align_set);
+        let w16: Vec<u16> = s.encode_utf16().collect();
+        if !w16.is_empty() {
+            let brush = self.brush(target, color, alpha);
+            target.DrawText(
+                &w16,
+                &fmt,
+                rect as *const D2D_RECT_F,
+                &brush,
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
+                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        let _ = fmt
+            .SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP);
         let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
     }
 
@@ -2487,7 +2603,7 @@ impl Renderer {
                 &fmt,
                 rect as *const D2D_RECT_F,
                 &brush,
-                D2D1_DRAW_TEXT_OPTIONS(0),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP,
                 windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
             );
         }
@@ -2495,7 +2611,7 @@ impl Renderer {
         let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
     }
 
-    /// 应用 logo（assets/logo.svg 的矢量重绘）：圆角磁贴 + 白色 Z 字形
+    /// 应用 logo：圆角磁贴 + 白色 Z 字形
     /// 几何按 30×30 viewBox 构建一次，绘制时以矩阵缩放平移，任意 DPI 无损。
     unsafe fn logo(
         &mut self,
@@ -2539,7 +2655,7 @@ impl Renderer {
         target.SetTransform(&Matrix3x2::identity());
     }
 
-    /// 构建白色 Z 字形路径（坐标取自 logo.svg 的三段图形单位）
+    /// 构建白色 Z 字形路径（三段图形单位）
     fn build_logo_glyph(&self) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
@@ -2671,94 +2787,139 @@ impl Renderer {
         self.dash_style = None;
     }
 
-    /// 账号切换弹窗绘制；hover 为行索引
-    pub unsafe fn paint_popup(
+    /// 账号切换页：导航行 + 账号列表 + 添加入口；当前项左竖条，hover 整行淡填充
+    unsafe fn draw_account_picker(
         &mut self,
-        hwnd: HWND,
-        rect_phys: &RECT,
+        target: &ID2D1HwndRenderTarget,
         model: &PanelModel,
-        dpi: f32,
-        hover: Option<usize>,
+        w: f32,
+        dy: f32,
+        alpha: f32,
     ) {
-        let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
-            return;
+        let s = model.strings;
+        let pad = 20.0;
+        let mut y = dy + 12.0;
+
+        // 导航行：返回 + 居中标题，同设置页
+        self.back_arrow(target, Hit::Back, pad, y + 6.0);
+        let title_rect = D2D_RECT_F {
+            left: pad,
+            top: y,
+            right: w - pad,
+            bottom: y + 26.0,
         };
-        let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
-        let h = (rect_phys.bottom - rect_phys.top) as f32 / dpi;
-        let (dy, alpha) = match &self.anim.appear {
-            Some(t) if self.anim_allowed => {
-                let p = ease_out_cubic(t.progress());
-                ((1.0 - p) * 6.0, p)
-            }
-            _ => (0.0, 1.0),
-        };
-        target.BeginDraw();
-        let bg_rect = D2D_RECT_F {
-            left: 0.0,
-            top: 0.0,
-            right: w,
-            bottom: h,
-        };
-        let bg = self.brush(&target, self.theme.bg, 1.0);
-        target.FillRectangle(&bg_rect, &bg);
+        self.text_aligned(
+            target,
+            s.switch_account,
+            &title_rect,
+            16.0,
+            400,
+            self.theme.text_primary,
+            alpha,
+            Align::Center,
+            false,
+        );
+        y += 30.0;
 
         let selected = model.account.map(|a| a.index);
         for (i, acc) in model.accounts.iter().enumerate() {
-            let top = 6.0 + dy + i as f32 * 36.0;
-            if selected == Some(i) || hover == Some(i) {
-                let row = D2D_RECT_F {
-                    left: 6.0,
-                    top,
-                    right: w - 6.0,
-                    bottom: top + 32.0,
+            if self.hover == Some(Hit::PickAccount(i)) {
+                let row = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: pad - 6.0,
+                        top: y + 4.0,
+                        right: w - pad + 6.0,
+                        bottom: y + 40.0,
+                    },
+                    radiusX: 6.0,
+                    radiusY: 6.0,
                 };
-                let fill = self.brush(&target, self.theme.track, alpha);
-                target.FillRectangle(&row, &fill);
+                let fill = self.brush(target, self.theme.track, alpha);
+                target.FillRoundedRectangle(&row, &fill);
             }
-            let name = ellipsize_px(&acc.name, 14.0, w - 16.0 - 64.0);
-            self.text(
-                &target,
-                &name,
-                16.0,
-                top + 8.0,
-                w - 16.0 - 60.0,
-                18.0,
-                14.0,
-                500,
-                self.theme.text_primary,
-                alpha,
-            );
-            let s = model.strings;
+            let cur = selected == Some(i);
+            if cur {
+                let bar = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left: pad - 6.0,
+                        top: y + 14.0,
+                        right: pad - 3.0,
+                        bottom: y + 30.0,
+                    },
+                    radiusX: 1.5,
+                    radiusY: 1.5,
+                };
+                let b = self.brush(target, self.theme.accent, alpha);
+                target.FillRoundedRectangle(&bar, &b);
+            }
+            // 右端徽标：平台最右，key 前缀徽标在其左；空 key 跳过。宽度先算后定名称可用区
             let platform = if acc.platform == crate::api::client::Platform::Cn {
                 s.platform_cn
             } else {
                 s.platform_intl
             };
-            let label = if acc.team {
+            let platform_label = if acc.team {
                 format!("{platform} · {}", s.team_badge)
             } else {
                 platform.to_string()
             };
-            let bw = est_width(&label, 10.5) + 14.0;
-            let bx = w - 10.0 - bw;
+            let pw = self.measure(&platform_label, 10.5, 400, false) + 14.0;
+            let px = w - pad - pw;
             self.badge(
-                &target,
-                &label,
-                bx,
-                top + 10.0,
-                bw,
+                target,
+                &platform_label,
+                px,
+                y + 13.5,
+                pw,
                 self.theme.border,
                 self.theme.text_secondary,
                 alpha,
-                true,
+                false,
             );
-        }
-        match target.EndDraw(None, None) {
-            Ok(()) => {}
-            Err(e) => {
-                crate::platform::log(&format!("[Quotify] 弹窗 EndDraw 失败: {e}"));
-                self.drop_device_resources();
+            // chars 截取规避多字节切片 panic；不足 4 位有多少显多少
+            let prefix: String = acc.api_key.chars().take(4).collect();
+            let mut name_right = px - 10.0;
+            if !prefix.is_empty() {
+                let key_label = format!("{prefix}…");
+                let kw = self.measure(&key_label, 10.5, 400, true) + 14.0;
+                let kx = px - 6.0 - kw;
+                self.badge(
+                    target,
+                    &key_label,
+                    kx,
+                    y + 13.5,
+                    kw,
+                    self.theme.border,
+                    self.theme.text_tertiary,
+                    alpha,
+                    true,
+                );
+                name_right = kx - 8.0;
             }
+            let name_w = (name_right - (pad + 8.0)).max(60.0);
+            let name = self.ellipsize(&acc.name, 14.0, name_w, 500, false);
+            self.text(
+                target,
+                &name,
+                pad + 8.0,
+                y + 12.0,
+                name_w,
+                20.0,
+                14.0,
+                if cur { 600 } else { 500 },
+                self.theme.text_primary,
+                alpha,
+            );
+            self.hits.push((
+                Hit::PickAccount(i),
+                D2D_RECT_F {
+                    left: pad - 6.0,
+                    top: y,
+                    right: w - pad + 6.0,
+                    bottom: y + 44.0,
+                },
+            ));
+            y += 44.0;
         }
     }
 
@@ -2798,7 +2959,7 @@ impl Renderer {
         // 与 12px 标题行视觉平衡：文字同 12px，闪电 14px 居中
         let bh = 14.0;
         let bw = bh * (7.0 / 13.0);
-        let badge_w = bw + 4.0 + est_width(s.peak_badge, 12.0);
+        let badge_w = bw + 4.0 + self.measure(s.peak_badge, 12.0, 600, false);
         let bx = w - pad - badge_w;
         if self.bolt_geo.is_none() {
             self.bolt_geo = self.build_bolt_glyph();
@@ -2908,35 +3069,6 @@ impl Renderer {
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// 单字符宽度模型（est_width / ellipsize_px 共用）：ASCII ≈ 0.58×字号，
-/// 全角 CJK ≈ 1.0×字号
-fn char_w(c: char, size: f32) -> f32 {
-    if c.is_ascii() { size * 0.58 } else { size }
-}
-
-/// 估算比例字体文本像素宽，名牌排布用
-fn est_width(s: &str, size: f32) -> f32 {
-    s.chars().map(|c| char_w(c, size)).sum()
-}
-
-/// 按像素预算保头截断，省略号收尾
-fn ellipsize_px(s: &str, size: f32, max_w: f32) -> String {
-    let ellipsis_w = size * 0.7;
-    let budget = (max_w - ellipsis_w).max(0.0);
-    let mut w = 0.0;
-    let mut out = String::new();
-    for c in s.chars() {
-        let cw = char_w(c, size);
-        if w + cw > budget {
-            out.push('…');
-            return out;
-        }
-        out.push(c);
-        w += cw;
-    }
-    out
 }
 
 /// 错误 → 本地化展示文案（api 层只给英文技术细节）

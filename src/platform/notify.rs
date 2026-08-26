@@ -1,31 +1,56 @@
-//! 系统通知
+//! 系统 Toast 通知
 
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::Shell::{
-    NIF_INFO, NIIF_LARGE_ICON, NIM_MODIFY, NOTIFYICONDATAW, Shell_NotifyIconW,
-};
+use windows::Data::Xml::Dom::XmlDocument;
+use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
+use windows::core::HSTRING;
 
-/// 弹出气泡通知
-pub fn show(hwnd: HWND, tray_id: u32, title: &str, body: &str) {
-    let title16: Vec<u16> = title.encode_utf16().take(63).collect();
-    let body16: Vec<u16> = body.encode_utf16().take(255).collect();
+/// Toast 归属标识：未在注册表登记的标识发通知会被系统直接丢弃
+const AUMID: &str = "Quotify.Quotify";
 
-    let mut nid = NOTIFYICONDATAW {
-        hWnd: hwnd,
-        uID: tray_id,
-        uFlags: NIF_INFO,
-        ..Default::default()
+/// 启动时登记 AUMID：通知中心里显示应用名 Quotify；重复调用无副作用
+pub fn ensure_aumid() {
+    match windows_registry::CURRENT_USER
+        .create(r"Software\Classes\AppUserModelId\Quotify.Quotify")
+        .and_then(|key| key.set_string("DisplayName", "Quotify"))
+    {
+        Ok(()) => {}
+        Err(e) => crate::platform::log(&format!("[Quotify] AUMID 登记失败，通知将不可用: {e}")),
+    }
+}
+
+/// 弹出系统 Toast：标题一行加粗 + 正文一行
+pub fn show(title: &str, body: &str) {
+    // 文案拼进 XML，&<> 转义防破坏结构
+    let esc = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
     };
-    nid.szInfoTitle[..title16.len()].copy_from_slice(&title16);
-    if title16.len() < nid.szInfoTitle.len() {
-        nid.szInfoTitle[title16.len()] = 0;
+    let xml = format!(
+        "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text>\
+         </binding></visual></toast>",
+        esc(title),
+        esc(body)
+    );
+    let Ok(doc) = XmlDocument::new() else {
+        return;
+    };
+    if doc.LoadXml(&HSTRING::from(xml.as_str())).is_err() {
+        crate::platform::log("[Quotify] Toast XML 解析失败");
+        return;
     }
-    nid.szInfo[..body16.len()].copy_from_slice(&body16);
-    if body16.len() < nid.szInfo.len() {
-        nid.szInfo[body16.len()] = 0;
-    }
-    nid.dwInfoFlags = NIIF_LARGE_ICON;
-    unsafe {
-        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    let Ok(toast) = ToastNotification::CreateToastNotification(&doc) else {
+        return;
+    };
+    let notifier = match ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(AUMID))
+    {
+        Ok(n) => n,
+        Err(e) => {
+            crate::platform::log(&format!("[Quotify] Toast notifier 创建失败: {e}"));
+            return;
+        }
+    };
+    if let Err(e) = notifier.Show(&toast) {
+        crate::platform::log(&format!("[Quotify] Toast 发送失败: {e}"));
     }
 }

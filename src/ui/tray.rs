@@ -1,13 +1,12 @@
 //! 系统托盘
 
+use crate::platform::log;
 use crate::platform::msg::WM_APP_TRAY;
-use crate::platform::{log, wide};
 
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, WPARAM};
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
-    NOTIFYICON_VERSION_4, NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NOTIFYICON_VERSION_4,
+    NOTIFYICONDATAW, NOTIFYICONIDENTIFIER, Shell_NotifyIconGetRect, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::HICON;
 
@@ -36,10 +35,10 @@ impl TrayIcon {
     pub fn new(hwnd: HWND, hicon: HICON) -> Option<Self> {
         unsafe {
             let mut nid = base_data(hwnd, 1);
-            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+            // 不注册 NIF_TIP：tooltip 弹在光标上方，恰是置顶面板所在区域，必然被遮挡
+            nid.uFlags = NIF_ICON | NIF_MESSAGE;
             nid.uCallbackMessage = WM_APP_TRAY;
             nid.hIcon = hicon;
-            copy_tip(&mut nid, "Quotify");
             if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
                 log(&format!(
                     "[Quotify] 托盘 NIM_ADD 失败: {}",
@@ -71,11 +70,6 @@ impl TrayIcon {
         }
     }
 
-    /// 托盘图标 id，通知等 API 需要。
-    pub fn tray_id(&self) -> u32 {
-        self.id
-    }
-
     /// 托盘图标在屏幕上的矩形，面板弹出的定位锚点
     pub fn rect(&self) -> Option<RECT> {
         let ident = NOTIFYICONIDENTIFIER {
@@ -103,14 +97,6 @@ impl Drop for TrayIcon {
     fn drop(&mut self) {
         self.remove();
     }
-}
-
-fn copy_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {
-    // szTip 容量 128（含 NUL）：截到 127 个 UTF-16 单元后补终止符
-    let mut chars = wide(tip);
-    chars.truncate(127);
-    nid.szTip[..chars.len()].copy_from_slice(&chars);
-    nid.szTip[chars.len()] = 0;
 }
 
 /// 解析 v4 回调：返回 (通知码, 图标id)。

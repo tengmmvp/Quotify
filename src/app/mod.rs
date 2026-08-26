@@ -52,7 +52,6 @@ pub struct App {
     poll_interval: PollInterval,
     tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
     pub(crate) panel: Panel,
-    pub(crate) popup: crate::ui::panel::popup::AccountPopup,
     hwnd: Option<HWND>,
     pub(crate) update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
     update_checking: bool,
@@ -81,7 +80,6 @@ impl App {
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
             tray_icon: None,
             panel: Panel::new(),
-            popup: crate::ui::panel::popup::AccountPopup::new(),
             hwnd: None,
             update_status: None,
             update_checking: false,
@@ -164,9 +162,7 @@ impl App {
 
     fn check_notifications(&mut self, snap: &UsageSnapshot) {
         let g = &self.config.general;
-        let hwnd = self.hwnd();
-        let tray_id = self.tray.as_ref().map(|t| t.tray_id()).unwrap_or(1);
-        let notify = |body: &str| crate::platform::notify::show(hwnd, tray_id, NOTIFY_TITLE, body);
+        let notify = |body: &str| crate::platform::notify::show(NOTIFY_TITLE, body);
 
         check_reset(
             snap.five_hour.as_ref(),
@@ -385,11 +381,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         let _ = InvalidateRect(Some(p), None, true);
                     }
                 }
-                if let Some(p) = app.popup.hwnd {
-                    unsafe {
-                        let _ = InvalidateRect(Some(p), None, true);
-                    }
-                }
             }
             LRESULT(0)
         }
@@ -447,10 +438,6 @@ fn app_from(hwnd: HWND) -> Option<&'static mut App> {
 /// 面板命中处理
 pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
     use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
-    // 弹窗开着时点面板任意处（箭头除外，箭头是开关）即收起弹窗
-    if !matches!(hit, Hit::AccountSwitch) && app.popup.is_open() {
-        app.popup.close();
-    }
     match hit {
         Hit::Refresh | Hit::Retry => {
             if let Some(p) = &app.poller {
@@ -554,7 +541,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::RemoveAccount(i) => {
             if i < app.config.accounts.len() {
-                app.popup.close();
                 let removed_id = app.config.accounts[i].id.clone();
                 app.config.accounts.remove(i);
                 if app.config.selected.as_deref() == Some(removed_id.as_str()) {
@@ -635,13 +621,15 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::ApplyInterval => apply_interval(app, panel_hwnd),
         Hit::AccountSwitch => {
-            let n = app.config.accounts.len();
-            let parent = app.hwnd();
-            let panel = app.panel.hwnd;
-            if n > 1
-                && let Some(panel_hwnd) = panel
-            {
-                app.popup.toggle(parent, panel_hwnd, n);
+            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
+            app.panel.view = crate::ui::panel::PanelView::AccountPicker;
+            relayout_panel(app, panel_hwnd);
+        }
+        Hit::PickAccount(i) => {
+            if i < app.config.accounts.len() {
+                select_account(app, i);
+                app.panel.view = crate::ui::panel::PanelView::Main;
+                relayout_panel(app, panel_hwnd);
             }
         }
         Hit::OpenDownload => {
@@ -832,12 +820,17 @@ fn export_config(app: &App) {
     let Some(path) = crate::platform::save_dialog("quotify-config.json") else {
         return;
     };
-    let result = serde_json::to_string_pretty(&app.config)
+    let body = match serde_json::to_string_pretty(&app.config)
         .map_err(|e| e.to_string())
-        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
-    if let Err(e) = result {
-        crate::platform::log(&format!("[Quotify] 导出失败: {e}"));
-    }
+        .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
+    {
+        Ok(()) => app.strings.export_done.to_string(),
+        Err(e) => {
+            crate::platform::log(&format!("[Quotify] 导出失败: {e}"));
+            app.strings.export_failed.to_string()
+        }
+    };
+    crate::platform::notify::show(NOTIFY_TITLE, &body);
 }
 
 /// 导入配置 JSON；模态期间冻结面板巡检防止误收起
@@ -862,7 +855,6 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
 
     let notify_body = match parsed {
         Some(cfg) => {
-            app.popup.close();
             app.config = cfg;
             if app.config.selected_account().is_none() {
                 app.config.selected = None;
@@ -894,9 +886,7 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
             app.strings.import_failed.to_string()
         }
     };
-    let hwnd = app.hwnd();
-    let tray_id = app.tray.as_ref().map(|t| t.tray_id()).unwrap_or(1);
-    crate::platform::notify::show(hwnd, tray_id, NOTIFY_TITLE, &notify_body);
+    crate::platform::notify::show(NOTIFY_TITLE, &notify_body);
 }
 
 /// 非预设间隔展开自定义行并预填；预设则收起
@@ -979,9 +969,6 @@ fn apply_appearance(app: &mut App) {
     if let Some(r) = app.panel.renderer.as_mut() {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }
-    if let Some(r) = app.popup.renderer.as_mut() {
-        r.theme = crate::ui::panel::theme::Theme::new(appearance);
-    }
 }
 
 fn sync_main_height(app: &mut App) {
@@ -1032,6 +1019,7 @@ pub fn run() -> i32 {
             windows::Win32::UI::HiDpi::DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
         );
         let com = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        crate::platform::notify::ensure_aumid();
 
         let config = config::load();
         // 配置的代理在首次请求前生效；地址无效仅记录，不阻断启动

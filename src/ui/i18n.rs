@@ -35,11 +35,8 @@ pub struct Strings {
     pub resets_line: &'static str,
     pub used_of: &'static str,
     pub usage_section: &'static str,
-    /// 高峰期用量标题旁的徽标文字
     pub peak_badge: &'static str,
-    /// 高峰徽标悬停说明，{r} 为区间
     pub peak_tip: &'static str,
-    /// 高峰区间设置区标题
     pub peak_section: &'static str,
     pub peak_start_label: &'static str,
     pub peak_end_label: &'static str,
@@ -102,6 +99,7 @@ pub struct Strings {
     pub notify_reset_weekly_desc: &'static str,
     pub autostart: &'static str,
     pub accounts_section: &'static str,
+    pub switch_account: &'static str,
     pub platform_section: &'static str,
     pub add_account: &'static str,
     pub account_name: &'static str,
@@ -124,6 +122,8 @@ pub struct Strings {
     /// 导入结果气泡通知
     pub import_done: &'static str,
     pub import_failed: &'static str,
+    pub export_done: &'static str,
+    pub export_failed: &'static str,
     pub version_label: &'static str,
 
     // ── 通知 ──
@@ -199,6 +199,7 @@ const ZH: Strings = Strings {
     notify_reset_weekly_desc: "进入新的周周期时通知",
     autostart: "开机自启",
     accounts_section: "当前账号",
+    switch_account: "切换账号",
     platform_section: "账号信息",
     add_account: "添加账号",
     account_name: "名称",
@@ -219,6 +220,8 @@ const ZH: Strings = Strings {
     import_config: "导入配置",
     import_done: "配置已导入",
     import_failed: "导入失败：文件不可读或格式无效",
+    export_done: "配置已导出",
+    export_failed: "导出失败：无法写入所选文件",
     version_label: "当前版本：{v}",
 
     notify_threshold_title: "额度预警",
@@ -292,6 +295,7 @@ const EN: Strings = Strings {
     notify_reset_weekly_desc: "When the weekly quota resets",
     autostart: "Start at login",
     accounts_section: "Current account",
+    switch_account: "Switch account",
     platform_section: "Account details",
     add_account: "Add account",
     account_name: "Name",
@@ -312,6 +316,8 @@ const EN: Strings = Strings {
     import_config: "Import",
     import_done: "Configuration imported",
     import_failed: "Import failed: unreadable or invalid file",
+    export_done: "Configuration exported",
+    export_failed: "Export failed: cannot write to the chosen file",
     version_label: "Version: {v}",
 
     notify_threshold_title: "Quota alert",
@@ -426,6 +432,7 @@ mod tests {
             notify_reset_weekly_desc,
             autostart,
             accounts_section,
+            switch_account,
             platform_section,
             add_account,
             account_name,
@@ -446,6 +453,8 @@ mod tests {
             import_config,
             import_done,
             import_failed,
+            export_done,
+            export_failed,
             err_auth,
             err_empty,
             err_api,

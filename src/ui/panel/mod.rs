@@ -3,7 +3,6 @@
 pub mod anim;
 pub mod layout;
 pub mod model;
-pub mod popup;
 pub mod render;
 pub mod theme;
 
@@ -49,6 +48,7 @@ pub enum PanelMode {
 pub enum PanelView {
     Main,
     Settings,
+    AccountPicker,
 }
 
 /// 自绘输入的目标字段
@@ -190,6 +190,12 @@ impl Panel {
                     // 有新版时版本行上方的「前往下载」行：按钮 30 + 行距 8
                     + if self.update_available { 38 } else { 0 };
                 base + if self.customizing_interval { 40 } else { 10 }
+            }
+            // 逐段对照 draw_account_picker 的 y 累加链（dy=0）
+            PanelView::AccountPicker => {
+                // 顶部留白 12 + 导航行 30，返回箭头 + 居中标题
+                42 + accounts as i32 * 44 // 账号行：名称 + 右侧徽标单行
+                    + 12 // 底部余量
             }
         }
     }
@@ -609,11 +615,8 @@ pub extern "system" fn panel_wndproc(
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
-                                // 子控件与账号弹窗同样算在面板内，光标移向弹窗不能收起
-                                let root = GetAncestor(w, GA_ROOT);
-                                let in_panel = w == hwnd
-                                    || root == hwnd
-                                    || app.popup.hwnd.is_some_and(|p| root == p);
+                                // 子控件同样算在面板内
+                                let in_panel = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                                 // 正在输入则绝不收起
                                 let focus_in_panel = app.panel.input.field.is_some()
                                     || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()

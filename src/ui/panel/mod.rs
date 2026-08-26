@@ -169,7 +169,7 @@ impl Panel {
             PanelView::Settings if self.adding_account => {
                 layout::add_page_height(self.pending_team)
             }
-            // 逐段对照 draw_settings 的 y 累加链（dy=0）；间隔行展开 +40、收起 +10：
+            // 逐段对照 draw_settings 的 y 累加链（dy=0）；间隔行展开 +38（输入框 26 + 尾隙 12）：
             PanelView::Settings => {
                 // 有账号：卡片 48 + 常驻添加按钮行 36；无账号：仅添加按钮行 36
                 let account_block = if accounts > 0 { 84 } else { 36 };
@@ -180,7 +180,7 @@ impl Panel {
                     + account_block
                     + error_line
                     + 33 // 轮询区标题：分隔线上隙 12 + 标题 21
-                    + 40 // 间隔分段控件：段体 30 + 段后间距 10
+                    + 39 // 间隔分段控件：段体 30 + 段后间距 9
                     + 33 // 通用区标题
                     + 63 // 语言行：sub_label 21 + segmented 40 + 行后 2
                     + 63 // 外观行，同语言行
@@ -192,11 +192,11 @@ impl Panel {
                     + 33 // 通知区标题：分隔线上隙 12 + 标题 21
                     + 126 // 三个通知开关行：标题 19 + 描述 14 + 行后 9 = 42 × 3
                     + 67 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
-                    + 73 // 配置管理区：标题 33 + 按钮 28 + 行后 12
+                    + 70 // 配置管理区：标题 33 + 按钮 28 + 行后 9
                     + 18 // 关于区纯分隔，无标题：上隙 12 + 下隙 6
                     + 29 // 版本行：描边按钮顶偏移 1 + 高 28
-                    + 16; // 底部余量，按钮边框需完整呈现
-                base + if self.customizing_interval { 40 } else { 10 }
+                    + 12; // 底部余量，同顶部留白
+                base + if self.customizing_interval { 38 } else { 0 }
             }
             // 逐段对照 draw_account_picker 的 y 累加链（dy=0）
             PanelView::AccountPicker => {

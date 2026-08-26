@@ -373,9 +373,9 @@ const EN: Strings = Strings {
     notify_threshold: "Usage alert",
     notify_threshold_desc: "Alerts once above the threshold",
     notify_reset_5h_opt: "5-hour session reset alerts",
-    notify_reset_5h_desc: "Sends a system notification when the 5-hour session resets",
+    notify_reset_5h_desc: "Alerts when the 5-hour window resets",
     notify_reset_weekly_opt: "Weekly session reset alerts",
-    notify_reset_weekly_desc: "Sends a system notification when the weekly session resets",
+    notify_reset_weekly_desc: "Alerts when the weekly window resets",
 
     // ── 设置 · 高峰区间 ──
     peak_section: "Peak hours",

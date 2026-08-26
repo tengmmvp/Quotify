@@ -92,7 +92,7 @@ impl Renderer {
         let edge = self.brush(target, self.theme.border, alpha * 0.9);
         target.DrawRoundedRectangle(&r, &edge, 1.0, None);
         let fg = if hovered {
-            self.theme.accent
+            self.theme.text_primary
         } else {
             self.theme.text_secondary
         };

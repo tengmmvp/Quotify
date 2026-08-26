@@ -10,7 +10,7 @@ pub const SECTION_LABEL_H: f32 = 21.0;
 /// segmented_raw 段体高度
 pub const SEGMENTED_H: f32 = 30.0;
 /// segmented_raw 返回值内含的段后间距
-pub const SEGMENTED_GAP: f32 = 10.0;
+pub const SEGMENTED_GAP: f32 = 9.0;
 /// 自绘输入框高度
 pub const INPUT_H: f32 = 26.0;
 /// 输入框左侧 x，与内容区 pad 一致
@@ -43,13 +43,13 @@ pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
     } else {
         36.0
     };
-    y + 12.0 + SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP + 2.0
+    y + 12.0 + SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP
 }
 
 /// 设置页高峰区间输入行顶 y，位于通知区之后
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流已含 +10 间隙，比 IY 多 8
-    let after_interval = if customizing { 38.0 } else { 8.0 };
+    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流与 IY 同点（分段返回值即 IY）
+    let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
         + 33.0 // 通知区标题
@@ -59,8 +59,8 @@ pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f
 
 /// 设置页代理输入框顶 y，与 draw_settings 的 y 推进链逐段对齐
 pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流已含 +10 间隙，比 IY 多 8
-    let after_interval = if customizing { 38.0 } else { 8.0 };
+    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流与 IY 同点（分段返回值即 IY）
+    let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
         + 33.0 // 通知区标题
@@ -85,28 +85,28 @@ mod tests {
 
     #[test]
     fn interval_input_y_pinned() {
-        assert_eq!(interval_input_y(false, false), 174.0);
-        assert_eq!(interval_input_y(false, true), 174.0);
-        assert_eq!(interval_input_y(true, false), 222.0);
-        assert_eq!(interval_input_y(true, true), 240.0);
+        assert_eq!(interval_input_y(false, false), 171.0);
+        assert_eq!(interval_input_y(false, true), 171.0);
+        assert_eq!(interval_input_y(true, false), 219.0);
+        assert_eq!(interval_input_y(true, true), 237.0);
     }
 
     #[test]
     fn peak_input_y_pinned() {
-        assert_eq!(peak_input_y(false, false, false), 374.0);
-        assert_eq!(peak_input_y(true, false, false), 422.0);
-        assert_eq!(peak_input_y(true, true, false), 440.0);
-        assert_eq!(peak_input_y(true, true, true), 470.0);
-        assert_eq!(peak_input_y(false, false, true), 404.0);
+        assert_eq!(peak_input_y(false, false, false), 363.0);
+        assert_eq!(peak_input_y(true, false, false), 411.0);
+        assert_eq!(peak_input_y(true, true, false), 429.0);
+        assert_eq!(peak_input_y(true, true, true), 467.0);
+        assert_eq!(peak_input_y(false, false, true), 401.0);
     }
 
     #[test]
     fn proxy_input_y_pinned() {
-        assert_eq!(proxy_input_y(false, false, false), 649.0);
-        assert_eq!(proxy_input_y(true, false, false), 697.0);
-        assert_eq!(proxy_input_y(true, true, false), 715.0);
-        assert_eq!(proxy_input_y(true, true, true), 745.0);
-        assert_eq!(proxy_input_y(false, false, true), 679.0);
+        assert_eq!(proxy_input_y(false, false, false), 638.0);
+        assert_eq!(proxy_input_y(true, false, false), 686.0);
+        assert_eq!(proxy_input_y(true, true, false), 704.0);
+        assert_eq!(proxy_input_y(true, true, true), 742.0);
+        assert_eq!(proxy_input_y(false, false, true), 676.0);
     }
 
     #[test]

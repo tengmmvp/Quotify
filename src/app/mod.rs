@@ -1062,9 +1062,14 @@ pub fn peak_range_of(config: &Config) -> crate::ui::peak::PeakRange {
     }
 }
 
-/// 应用生效外观；渲染器未创建时由创建路径兜底
+/// 应用生效外观
 fn apply_appearance(app: &mut App) {
     let appearance = resolved_appearance(app.config.general.appearance.as_deref());
+    // 托盘菜单是系统绘制的，须在进程级单独设模式；此后弹出的菜单才带上主题
+    crate::platform::menu_theme::apply(matches!(
+        appearance,
+        crate::ui::panel::theme::Appearance::Dark
+    ));
     if let Some(r) = app.panel.renderer.as_mut() {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }

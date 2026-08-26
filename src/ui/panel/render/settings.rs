@@ -341,8 +341,6 @@ impl Renderer {
                 alpha,
             );
             y = iy + 38.0;
-        } else {
-            y += 10.0;
         }
 
         // ── 通知 ──
@@ -590,7 +588,7 @@ impl Renderer {
             s.import_config,
             alpha,
         );
-        y += 28.0 + 12.0;
+        y += 28.0 + 9.0;
 
         // ── 关于：检查更新 + 版本，位于底部 ──
         let update_label = match model.update {
@@ -991,7 +989,7 @@ impl Renderer {
                 },
             ));
         }
-        y + h + 10.0
+        y + h + layout::SEGMENTED_GAP
     }
 
     /// 单账号卡片：名称 + 平台/版本/等级三枚名牌，右上删除

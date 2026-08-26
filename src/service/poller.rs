@@ -8,10 +8,13 @@ use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WPARAM};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
 use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
-use crate::api::client::AccountSpec;
-use crate::app::config::MIN_POLL_SECS;
-pub(crate) use crate::platform::msg::WM_APP_POLL_RESULT;
+use crate::api::AccountSpec;
+use crate::platform::msg::WM_APP_POLL_RESULT;
 
+/// 默认轮询间隔（秒）
+pub const DEFAULT_INTERVAL_SECS: u64 = 300;
+/// 轮询间隔下限（秒）
+pub const MIN_POLL_SECS: u64 = 10;
 /// 轮询间隔上限（秒）= 1 天
 pub const MAX_POLL_SECS: u64 = 86400;
 

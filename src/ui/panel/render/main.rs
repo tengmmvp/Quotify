@@ -10,6 +10,7 @@ use super::{Align, Hit, Renderer};
 use crate::api::FetchError;
 use crate::ui::fmt;
 use crate::ui::i18n::Strings;
+use crate::ui::panel::layout;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::RADIUS;
 
@@ -25,7 +26,7 @@ impl Renderer {
         alpha: f32,
     ) {
         let s = model.strings;
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let mut y = dy + 16.0;
         let snap = model.snapshot;
 
@@ -448,7 +449,7 @@ impl Renderer {
         alpha: f32,
         lang: crate::ui::i18n::Lang,
     ) -> f32 {
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let strings = lang.strings();
         // ≥90% 数值与进度条入危险色，阈值与托盘图标红档一致
         let critical = used_percent >= 90.0;
@@ -559,7 +560,7 @@ impl Renderer {
         alpha: f32,
         s: &Strings,
     ) {
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let bh = 14.0;
         let bw = bh * (7.0 / 13.0);
         let badge_w = bw + 4.0 + self.measure(s.peak_badge, 12.0, 600, false);
@@ -619,7 +620,7 @@ impl Renderer {
         alpha: f32,
         tip: &str,
     ) {
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let cw = (w - pad * 2.0).min(300.0);
         let cx = x.min(pad + w - pad - cw).max(pad);
         let card = D2D1_ROUNDED_RECT {

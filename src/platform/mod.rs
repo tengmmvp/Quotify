@@ -59,6 +59,15 @@ pub fn open_url(url: &str) {
     }
 }
 
+/// 归还工作集，静止时保持低内存；换出页面按需换回
+pub fn trim_working_set() {
+    unsafe {
+        use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let _ = EmptyWorkingSet(GetCurrentProcess());
+    }
+}
+
 /// 模态保存文件对话框；取消返回 None
 pub fn save_dialog(default_name: &str) -> Option<std::path::PathBuf> {
     file_dialog(default_name, true)

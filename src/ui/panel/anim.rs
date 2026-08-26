@@ -6,17 +6,6 @@ pub fn ease_out_cubic(t: f32) -> f32 {
     1.0 - (1.0 - t).powi(3)
 }
 
-/// 缓入缓出
-#[allow(dead_code)]
-pub fn ease_in_out_cubic(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    if t < 0.5 {
-        4.0 * t * t * t
-    } else {
-        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
-    }
-}
-
 /// 单条动画的时间状态
 #[derive(Debug, Clone, Copy)]
 pub struct Tween {
@@ -68,8 +57,6 @@ mod tests {
     fn easing_bounds() {
         assert_eq!(ease_out_cubic(0.0), 0.0);
         assert_eq!(ease_out_cubic(1.0), 1.0);
-        assert_eq!(ease_in_out_cubic(0.0), 0.0);
-        assert_eq!(ease_in_out_cubic(1.0), 1.0);
         assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-6);
     }
 

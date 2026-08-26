@@ -248,7 +248,7 @@ const ZH: Strings = Strings {
     // ── 设置 · 用量通知 ──
     notifications: "用量通知",
     notify_threshold: "用量预警",
-    notify_threshold_desc: "超过 80% 时提醒一次，额度恢复后重新计数",
+    notify_threshold_desc: "超过 {p}% 时提醒一次，额度恢复后重新计数",
     notify_reset_5h_opt: "5 小时会话窗口重置提醒",
     notify_reset_5h_desc: "进入新 5 小时会话窗口时发送系统通知",
     notify_reset_weekly_opt: "周会话窗口重置提醒",
@@ -262,7 +262,7 @@ const ZH: Strings = Strings {
     // ── 设置 · 配置管理与关于 ──
     backup_section: "配置管理",
     export_config: "导出配置",
-    export_done: "配置已导出",
+    export_done: "配置已导出：含 API key，请妥善保管",
     export_failed: "导出失败：无法写入所选文件",
     import_config: "导入配置",
     import_done: "配置已导入",
@@ -371,7 +371,7 @@ const EN: Strings = Strings {
     // ── 设置 · 用量通知 ──
     notifications: "Notifications",
     notify_threshold: "Usage alert",
-    notify_threshold_desc: "Alerts once above the threshold",
+    notify_threshold_desc: "Alerts once above {p}%",
     notify_reset_5h_opt: "5-hour session reset alerts",
     notify_reset_5h_desc: "Alerts when the 5-hour window resets",
     notify_reset_weekly_opt: "Weekly session reset alerts",
@@ -385,7 +385,7 @@ const EN: Strings = Strings {
     // ── 设置 · 配置管理与关于 ──
     backup_section: "Config management",
     export_config: "Export",
-    export_done: "Configuration exported",
+    export_done: "Exported: contains API keys — keep it safe",
     export_failed: "Export failed: cannot write to the chosen file",
     import_config: "Import",
     import_done: "Configuration imported",

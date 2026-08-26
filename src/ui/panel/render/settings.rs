@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
 use super::{Align, AppearanceChoice, Hit, LanguageChoice, Renderer, ScopeChoice};
-use crate::api::client::Platform;
+use crate::api::Platform;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::RADIUS;
 use crate::ui::panel::{InputField, Panel, layout};
@@ -23,7 +23,7 @@ impl Renderer {
         alpha: f32,
     ) {
         let s = model.strings;
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let cw = w - pad * 2.0;
         let mut y = dy + 12.0;
 
@@ -345,11 +345,14 @@ impl Renderer {
 
         // ── 通知 ──
         y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
+        let threshold_desc = s
+            .notify_threshold_desc
+            .replace("{p}", &model.threshold_percent.to_string());
         y = self.toggle_row(
             target,
             Hit::ToggleThreshold,
             s.notify_threshold,
-            s.notify_threshold_desc,
+            &threshold_desc,
             model.threshold_enabled,
             pad,
             y,
@@ -1169,16 +1172,12 @@ impl Renderer {
     }
 }
 
-/// key 掩码显示串：聚焦时逐字符圆点（数量与原串一致，光标步宽仍对），
-/// 未聚焦只露首尾各 4 位；不足 12 位整体作前缀 + 省略号
+/// key 掩码显示串：聚焦或不足 12 位时逐字符圆点，圆点数与原串一致，
+/// 光标步宽仍对且短串不露明文；未聚焦且足 12 位只露首尾各 4 位
 fn mask_key(key: &str, active: bool) -> String {
     let n = key.chars().count();
-    if active {
+    if active || n < 12 {
         "•".repeat(n)
-    } else if n == 0 {
-        String::new()
-    } else if n < 12 {
-        format!("{key}…")
     } else {
         let head: String = key.chars().take(4).collect();
         let tail: String = key.chars().skip(n - 4).collect();

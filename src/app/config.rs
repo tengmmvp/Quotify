@@ -4,12 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::client::Platform;
-
-/// 默认轮询间隔（秒）
-pub const DEFAULT_INTERVAL_SECS: u64 = 300;
-/// 轮询间隔下限（秒）
-pub const MIN_POLL_SECS: u64 = 10;
+use crate::api::Platform;
+use crate::service::poller::DEFAULT_INTERVAL_SECS;
 
 /// 全局偏好
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -185,14 +181,18 @@ fn backup_broken(path: &Path) {
     }
 }
 
-/// 读取配置；读不出或解析失败时坏文件先留档，再回退默认
+/// 读取配置：解析失败留档回退默认；不存在写模板；其余读失败
+/// 只回退默认不动磁盘。
 pub fn load() -> Config {
     let path = config_path();
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_or_default(&text, &path),
-        Err(_) => {
-            backup_broken(&path);
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let _ = std::fs::write(&path, TEMPLATE);
+            Config::default()
+        }
+        Err(e) => {
+            crate::platform::log(&format!("config.toml 读取失败，本次用默认配置: {e}"));
             Config::default()
         }
     }

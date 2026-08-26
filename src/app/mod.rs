@@ -1,6 +1,7 @@
 //! 应用层：装配各模块、维护全局状态、驱动消息循环。
 
 pub mod config;
+mod notify;
 
 use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -15,27 +16,32 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::PCWSTR;
 
-use crate::api::{FetchError, QuotaBucket, UsageSnapshot};
-use crate::app::config::{Config, DEFAULT_INTERVAL_SECS, MIN_POLL_SECS};
+use crate::api::{FetchError, UsageSnapshot};
+use crate::app::config::Config;
 use crate::platform::instance::TRAY_WND_CLASS;
 use crate::platform::msg::{
     WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
 };
 use crate::platform::wide;
-use crate::service::poller::{MAX_POLL_SECS, PollInterval, PollOutcome, PollTarget, Poller};
+use crate::service::poller::{
+    DEFAULT_INTERVAL_SECS, MAX_POLL_SECS, MIN_POLL_SECS, PollInterval, PollOutcome, PollTarget,
+    Poller,
+};
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
 use crate::ui::panel::Panel;
 use crate::ui::panel::layout::INTERVAL_PRESETS;
 use crate::ui::tray::{self, TrayIcon};
+use notify::{NOTIFY_TITLE, check_reset, check_threshold};
 
 const IDM_SETTINGS: u16 = 1001;
 const IDM_EXIT: u16 = 1002;
 
+/// 导入配置文件大小上限
+const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
+
 /// v4 回调的键盘激活通知码
 const NIN_KEYSELECT: u32 = 0x0401;
-
-const NOTIFY_TITLE: &str = "Quotify";
 
 /// 失败时保留旧快照供面板显示。
 pub struct AccountData {
@@ -64,12 +70,12 @@ pub struct App {
     last_reset_5h: Option<DateTime<Utc>>,
     threshold_armed_weekly: bool,
     last_reset_weekly: Option<DateTime<Utc>>,
+    last_logged_error: Option<String>,
 }
 
 impl App {
     fn new(mut config: Config) -> Self {
-        config.general.notify_threshold_percent =
-            config.general.notify_threshold_percent.clamp(1, 100);
+        normalize_config(&mut config);
         let lang = crate::ui::i18n::resolve_lang(config.general.language.as_deref());
         Self {
             config,
@@ -94,6 +100,7 @@ impl App {
             last_reset_5h: None,
             threshold_armed_weekly: true,
             last_reset_weekly: None,
+            last_logged_error: None,
         }
     }
 
@@ -106,15 +113,18 @@ impl App {
             .config
             .selected_account()
             .filter(|a| !a.api_key.trim().is_empty())
-            .map(|a| crate::api::client::AccountSpec {
+            .map(|a| crate::api::AccountSpec {
                 platform: a.platform,
                 org_id: a.org_id.clone(),
                 project_id: a.project_id.clone(),
                 api_key: a.api_key.clone(),
             });
-        *self.poll_target.lock().unwrap() = target;
-        *self.poll_interval.lock().unwrap() =
-            self.config.general.poll_interval_secs.max(MIN_POLL_SECS);
+        *borrow(&self.poll_target) = target;
+        *borrow(&self.poll_interval) = self
+            .config
+            .general
+            .poll_interval_secs
+            .clamp(MIN_POLL_SECS, MAX_POLL_SECS);
     }
 
     fn update_tray_icon(&mut self) {
@@ -137,11 +147,13 @@ impl App {
             None => icon::logo_icon(px),
         };
         if let Some(new) = new {
-            if let Some(old) = self.tray_icon.take() {
-                icon::destroy_owned(old);
-            }
+            // 先换新再销毁旧：成功时 shell 全程不引用已销毁句柄；NIM_MODIFY
+            // 失败时旧句柄仍销毁、托盘空到下次更新，与旧顺序结局相同
             if let Some(tray) = &self.tray {
                 tray.update_icon(new);
+            }
+            if let Some(old) = self.tray_icon.take() {
+                icon::destroy_owned(old);
             }
             self.tray_icon = Some(new);
             self.last_icon_key = Some(key);
@@ -154,8 +166,19 @@ impl App {
                 self.check_notifications(&snap);
                 self.data.snapshot = Some(*snap);
                 self.data.last_error = None;
+                self.last_logged_error = None;
             }
             PollOutcome::Failure(e) => {
+                // 文案与上次相同的失败只记一次，固定间隔重试不刷屏
+                let msg = e.to_string();
+                let repeated = self
+                    .last_logged_error
+                    .as_ref()
+                    .is_some_and(|prev| *prev == msg);
+                if !repeated {
+                    crate::platform::log(&format!("[Quotify] 轮询失败: {msg}"));
+                }
+                self.last_logged_error = Some(msg);
                 self.data.last_error = Some(*e);
             }
         }
@@ -163,6 +186,8 @@ impl App {
         if let Some(p) = self.panel.hwnd {
             relayout_panel(self, p);
         }
+        // UI 更新完毕即静止，归还工作集保持低内存
+        crate::platform::trim_working_set();
     }
 
     fn check_notifications(&mut self, snap: &UsageSnapshot) {
@@ -238,44 +263,10 @@ impl App {
     }
 }
 
-/// 重置时刻变化即新窗口
-fn check_reset(
-    bucket: Option<&QuotaBucket>,
-    last: &mut Option<DateTime<Utc>>,
-    armed: &mut bool,
-    enabled: bool,
-    msg: &'static str,
-    notify: &dyn Fn(&str),
-) {
-    if let Some(b) = bucket {
-        if last.is_some_and(|old| old != b.resets_at.unwrap_or(old)) {
-            if enabled {
-                notify(msg);
-            }
-            *armed = true;
-        }
-        *last = b.resets_at;
-    }
-}
-
-/// 越线提醒一次，回落重新武装
-fn check_threshold(
-    bucket: Option<&QuotaBucket>,
-    armed: &mut bool,
-    th: f64,
-    label: &'static str,
-    title: &'static str,
-    notify: &dyn Fn(&str),
-) {
-    if let Some(b) = bucket {
-        if b.used_percent >= th && *armed {
-            *armed = false;
-            let body = format!("{label} {title} {}%", b.used_percent.round() as i64);
-            notify(&body);
-        } else if b.used_percent < th {
-            *armed = true;
-        }
-    }
+/// 毒化锁取回内部数据继续用，与 service::poller 同策略：锁只被短临界区持有，
+/// 毒化意味着持锁线程已死，数据本身仍完好
+fn borrow<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// lparam 指向的宽字符串是否为 "ImmersiveColorSet"
@@ -338,23 +329,21 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         WM_APP_POLL_RESULT => {
-            let app = app_from(hwnd);
-            if let Some(app) = app {
-                let boxed = wparam.0 as *mut PollOutcome;
-                if !boxed.is_null() {
-                    let outcome = unsafe { Box::from_raw(boxed) };
-                    app.handle_poll_result(*outcome);
-                }
+            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
+            let boxed = wparam.0 as *mut PollOutcome;
+            let outcome = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
+            if let (Some(app), Some(outcome)) = (app_from(hwnd), outcome) {
+                app.handle_poll_result(*outcome);
             }
             LRESULT(0)
         }
         WM_APP_UPDATE_RESULT => {
-            let app = app_from(hwnd);
-            if let Some(app) = app {
+            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
+            let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
+            let result = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
+            if let Some(app) = app_from(hwnd) {
                 app.update_checking = false;
-                let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
-                if !boxed.is_null() {
-                    let r = unsafe { Box::from_raw(boxed) };
+                if let Some(r) = result {
                     app.panel.update_available = match r.as_ref() {
                         Ok(info) => {
                             crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION"))
@@ -445,6 +434,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
     match hit {
         Hit::Refresh | Hit::Retry => {
+            // 主动重试开启新一轮记录，同文案失败再现时也重记日志
+            app.last_logged_error = None;
             if let Some(p) = &app.poller {
                 p.refresh_now();
             }
@@ -578,7 +569,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::AddAccount => {
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.adding_account = true;
-            app.panel.pending_platform = crate::api::client::Platform::Cn;
+            app.panel.pending_platform = crate::api::Platform::Cn;
             app.panel.pending_team = false;
             app.panel.input.name.clear();
             app.panel.input.key.clear();
@@ -599,17 +590,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                     r.hits.clear();
                     r.hover = None;
                 }
-                crate::app::config::save(&app.config);
-                app.data = AccountData {
-                    snapshot: None,
-                    last_error: None,
-                };
-                reset_notify_state(app);
-                app.sync_poll_context();
-                app.update_tray_icon();
-                if let Some(p) = &app.poller {
-                    p.refresh_now();
-                }
+                switch_poll_source(app);
                 relayout_panel(app, panel_hwnd);
             }
         }
@@ -624,7 +605,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.pending_team = matches!(scope, ScopeChoice::Team);
             if app.panel.pending_team {
                 // 团队版仅国内站：类型切团队时平台同步回国内
-                app.panel.pending_platform = crate::api::client::Platform::Cn;
+                app.panel.pending_platform = crate::api::Platform::Cn;
             }
             collapse_team_focus(app, panel_hwnd);
             relayout_panel(app, panel_hwnd);
@@ -657,7 +638,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::SaveAccount => save_pending_account(app, panel_hwnd),
         Hit::Platform(platform) => {
             app.panel.pending_platform = platform;
-            if platform == crate::api::client::Platform::Intl {
+            if platform == crate::api::Platform::Intl {
                 // 团队版仅国内站：切到国际版时类型同步回个人版
                 app.panel.pending_team = false;
             }
@@ -713,20 +694,28 @@ fn reset_notify_state(app: &mut App) {
     app.last_reset_weekly = None;
 }
 
+/// 账号切换/增删/导入共用的换源序列：落盘、清快照与提醒基线、重置失败
+/// 日志游标、重排轮询并立即拉取、刷新托盘图标。
+/// renderer 命中清理与面板 relayout 仅部分路径需要，留在各调用点。
+fn switch_poll_source(app: &mut App) {
+    crate::app::config::save(&app.config);
+    app.data = AccountData {
+        snapshot: None,
+        last_error: None,
+    };
+    app.last_logged_error = None;
+    reset_notify_state(app);
+    app.sync_poll_context();
+    app.update_tray_icon();
+    if let Some(p) = &app.poller {
+        p.refresh_now();
+    }
+}
+
 pub(crate) fn select_account(app: &mut App, i: usize) {
     if let Some(id) = app.config.accounts.get(i).map(|a| a.id.clone()) {
         app.config.selected = Some(id);
-        crate::app::config::save(&app.config);
-        reset_notify_state(app);
-        app.data = AccountData {
-            snapshot: None,
-            last_error: None,
-        };
-        app.sync_poll_context();
-        app.update_tray_icon();
-        if let Some(p) = &app.poller {
-            p.refresh_now();
-        }
+        switch_poll_source(app);
     }
 }
 
@@ -775,20 +764,10 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         r.hits.clear();
         r.hover = None;
     }
-    crate::app::config::save(&app.config);
+    switch_poll_source(app);
     app.panel.adding_account = false;
     app.panel.key_revealed = false;
     app.panel.clear_input(panel_hwnd);
-    app.data = AccountData {
-        snapshot: None,
-        last_error: None,
-    };
-    reset_notify_state(app);
-    app.sync_poll_context();
-    app.update_tray_icon();
-    if let Some(p) = &app.poller {
-        p.refresh_now();
-    }
     relayout_panel(app, panel_hwnd);
 }
 
@@ -855,6 +834,8 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
         crate::platform::log(&format!("[Quotify] 代理地址无效，保持原连接: {e}"));
     }
     app.panel.input.field = None;
+    // 换代理后的拉取是新尝试轮次，同文案失败再现时也重记日志
+    app.last_logged_error = None;
     if let Some(p) = &app.poller {
         p.refresh_now();
     }
@@ -934,9 +915,32 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
         // 用户取消选择文件，无事发生
         return;
     };
-    let parsed = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Config>(&text).ok());
+    // 外部文件不可信：先限大小防超大文件撑内存；三类失败分别落日志，区分
+    // 超限 / 读取事故 / 坏文件，用户 toast 统一为导入失败
+    let parsed = match std::fs::metadata(&path) {
+        Ok(m) if m.len() > IMPORT_MAX_BYTES => {
+            crate::platform::log(&format!(
+                "[Quotify] 配置导入放弃：文件 {} 字节超上限",
+                m.len()
+            ));
+            None
+        }
+        meta => {
+            let _ = meta; // Err(metadata) 随读取一并报错
+            std::fs::read_to_string(&path)
+                .map_err(|e| {
+                    crate::platform::log(&format!("[Quotify] 配置导入读取失败: {e}"));
+                })
+                .ok()
+                .and_then(|text| {
+                    serde_json::from_str::<Config>(&text)
+                        .map_err(|e| {
+                            crate::platform::log(&format!("[Quotify] 配置导入解析失败: {e}"));
+                        })
+                        .ok()
+                })
+        }
+    };
 
     let notify_body = match parsed {
         Some(cfg) => {
@@ -947,6 +951,8 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
                 return;
             }
             app.config = cfg;
+            // 外部文件的值域不可信，归一化与启动加载保持一致
+            normalize_config(&mut app.config);
             app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
             app.strings = app.lang.strings();
             if app.config.selected_account().is_none() {
@@ -959,23 +965,13 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
                 r.hits.clear();
                 r.hover = None;
             }
-            crate::app::config::save(&app.config);
+            switch_poll_source(app);
             app.panel.adding_account = false;
             app.panel.key_revealed = false;
             app.panel.input.field = None;
             app.update_status = None;
             app.update_checking = false;
             app.panel.update_available = false;
-            reset_notify_state(app);
-            app.data = AccountData {
-                snapshot: None,
-                last_error: None,
-            };
-            app.sync_poll_context();
-            app.update_tray_icon();
-            if let Some(p) = &app.poller {
-                p.refresh_now();
-            }
             sync_customizing(app);
             relayout_panel(app, panel_hwnd);
             app.strings.import_done.to_string()
@@ -1062,6 +1058,16 @@ pub fn peak_range_of(config: &Config) -> crate::ui::peak::PeakRange {
     }
 }
 
+/// 配置值域归一化，启动加载与导入共用；阈值越界夹回 1–100，
+/// 间隔夹进合法区间，保证 UI 预填值与实际轮询行为一致
+fn normalize_config(c: &mut Config) {
+    c.general.notify_threshold_percent = c.general.notify_threshold_percent.clamp(1, 100);
+    c.general.poll_interval_secs = c
+        .general
+        .poll_interval_secs
+        .clamp(MIN_POLL_SECS, MAX_POLL_SECS);
+}
+
 /// 应用生效外观
 fn apply_appearance(app: &mut App) {
     let appearance = resolved_appearance(app.config.general.appearance.as_deref());
@@ -1076,22 +1082,22 @@ fn apply_appearance(app: &mut App) {
 }
 
 fn sync_main_height(app: &mut App) {
-    app.panel.main_h = match app.data.snapshot.as_ref() {
-        None => 300,
-        Some(snap) => {
-            let rows = [
+    let (rows, bal) = match app.data.snapshot.as_ref() {
+        None => (0, false),
+        Some(snap) => (
+            [
                 snap.five_hour.is_some(),
                 snap.weekly.is_some(),
                 snap.mcp.is_some(),
             ]
             .iter()
             .filter(|b| **b)
-            .count() as i32;
-            let bal = snap.balance.is_some() as i32;
-            // 顶栏（恒定 52）+ 刊头 + 指标行 + 余额块（撕线 + 行）+ 底部 footer 区
-            16 + 52 + 42 + rows * 52 + bal * 40 + 40
-        }
+            .count(),
+            snap.balance.is_some(),
+        ),
     };
+    app.panel.main_h =
+        crate::ui::panel::layout::main_view_height(app.data.snapshot.is_some(), rows, bal);
 }
 
 /// 同步状态并重定位面板
@@ -1198,7 +1204,7 @@ pub fn run() -> i32 {
                 app.panel.view = crate::ui::panel::PanelView::Settings;
                 app.panel.mode = crate::ui::panel::PanelMode::Pinned;
                 app.panel.adding_account = true;
-                app.panel.pending_platform = crate::api::client::Platform::Cn;
+                app.panel.pending_platform = crate::api::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {
                     relayout_panel(&mut app, p);
                     app.panel.focus_input(p, crate::ui::panel::InputField::Name);

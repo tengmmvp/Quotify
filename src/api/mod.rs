@@ -8,6 +8,46 @@ pub mod client;
 /// 错误详情携带的响应文本长度上限（字符数）
 pub(crate) const ERR_BODY_CHARS: usize = 160;
 
+/// API 平台
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Platform {
+    /// 国内版 open.bigmodel.cn
+    Cn,
+    /// 国际版 api.z.ai
+    Intl,
+}
+
+impl Platform {
+    pub fn base_url(self) -> &'static str {
+        match self {
+            Platform::Cn => "https://open.bigmodel.cn",
+            Platform::Intl => "https://api.z.ai",
+        }
+    }
+}
+
+/// 一次查询的账号参数。团队版仅国内站：API Key + `?type=2` + 两个
+/// 选择头缺一不可；缺 selector 回 success + 空 limits
+#[derive(Debug, Clone)]
+pub struct AccountSpec {
+    pub platform: Platform,
+    /// 团队版：组织 ID（`Bigmodel-Organization`）
+    pub org_id: String,
+    /// 团队版：项目 ID（`Bigmodel-Project`）
+    pub project_id: String,
+    pub api_key: String,
+}
+
+impl AccountSpec {
+    /// 两个选择头齐全才按团队查询，不全时按个人版
+    fn team_scope(&self) -> Option<(&str, &str)> {
+        let org = self.org_id.trim();
+        let project = self.project_id.trim();
+        (!org.is_empty() && !project.is_empty()).then_some((org, project))
+    }
+}
+
 /// 套餐代际
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanVersion {

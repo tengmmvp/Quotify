@@ -6,6 +6,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
 use super::{Align, Hit, Renderer};
+use crate::ui::panel::layout;
 use crate::ui::panel::model::PanelModel;
 
 impl Renderer {
@@ -19,7 +20,7 @@ impl Renderer {
         alpha: f32,
     ) {
         let s = model.strings;
-        let pad = 20.0;
+        let pad = layout::CONTENT_PAD;
         let mut y = dy + 12.0;
 
         // 导航行：返回 + 居中标题，同设置页
@@ -75,7 +76,7 @@ impl Renderer {
                 target.FillRoundedRectangle(&bar, &b);
             }
             // 右端徽标：平台最右，key 前缀徽标在其左；空 key 跳过。宽度先算后定名称可用区
-            let platform = if acc.platform == crate::api::client::Platform::Cn {
+            let platform = if acc.platform == crate::api::Platform::Cn {
                 s.platform_cn
             } else {
                 s.platform_intl

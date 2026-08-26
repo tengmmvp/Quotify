@@ -23,7 +23,7 @@ use windows::core::PCWSTR;
 
 use crate::platform::wide;
 use crate::ui::panel::model::PanelModel;
-use crate::ui::panel::render::{Hit, Renderer};
+use crate::ui::panel::render::Renderer;
 use crate::ui::panel::theme::PANEL_WIDTH;
 
 const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
@@ -98,10 +98,9 @@ pub struct Panel {
     pub(crate) anchor: Option<RECT>,
     pub renderer: Option<Renderer>,
     pub adding_account: bool,
-    pub pending_platform: crate::api::client::Platform,
+    pub pending_platform: crate::api::Platform,
     pub pending_team: bool,
     pub input: PanelInput,
-    /// key 输入框明文态；面板收起或离开添加表单时回落
     pub(crate) key_revealed: bool,
     pub customizing_interval: bool,
     pub(crate) anim_x: i32,
@@ -133,7 +132,7 @@ impl Panel {
             anchor: None,
             renderer: None,
             adding_account: false,
-            pending_platform: crate::api::client::Platform::Cn,
+            pending_platform: crate::api::Platform::Cn,
             pending_team: false,
             input: PanelInput::default(),
             key_revealed: false,
@@ -181,17 +180,17 @@ impl Panel {
                     + error_line
                     + 33 // 轮询区标题：分隔线上隙 12 + 标题 21
                     + 39 // 间隔分段控件：段体 30 + 段后间距 9
+                    + 33 // 通知区标题：分隔线上隙 12 + 标题 21
+                    + 126 // 三个通知开关行：标题 19 + 描述 14 + 行后 9 = 42 × 3
+                    + 67 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
                     + 33 // 通用区标题
-                    + 63 // 语言行：sub_label 21 + segmented 40 + 行后 2
-                    + 63 // 外观行，同语言行
+                    + 62 // 语言行：sub_label 21 + segmented 39 + 行后 2
+                    + 62 // 外观行，同语言行
                     + 28 // 开机自启开关行：标题 19 + 行后 9，无描述行
                     + 33 // 网络代理区标题：同轮询区标题
                     + 21 // 代理子标签
                     + 26 // 代理输入框
                     + 6 // 输入框后下隙，提示文字为框内占位
-                    + 33 // 通知区标题：分隔线上隙 12 + 标题 21
-                    + 126 // 三个通知开关行：标题 19 + 描述 14 + 行后 9 = 42 × 3
-                    + 67 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
                     + 70 // 配置管理区：标题 33 + 按钮 28 + 行后 9
                     + 18 // 关于区纯分隔，无标题：上隙 12 + 下隙 6
                     + 29 // 版本行：描边按钮顶偏移 1 + 高 28
@@ -246,7 +245,7 @@ impl Panel {
             ) {
                 Ok(hwnd) => hwnd,
                 Err(e) => {
-                    eprintln!("[Quotify] 面板窗口创建失败: {e}");
+                    crate::platform::log(&format!("[Quotify] 面板窗口创建失败: {e}"));
                     return None;
                 }
             };
@@ -408,13 +407,15 @@ impl Panel {
         self.drag_offset = None;
         self.clear_input(hwnd);
         // 直接隐藏：自绘收缩/淡出会与 DWM 过渡叠加闪烁
-        // 此处不 trim 工作集：高频悬停反复 trim/软缺页，静止内存由轮询路径保证
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
         }
+        // 收起后到下次打开前不再绘制，归还工作集把静止内存压回托盘档；
+        // 重开时的软缺页按次一次性发生，换常驻低占用
+        crate::platform::trim_working_set();
     }
 
     /// 左键：预览 ⇄ 锁定；已锁定 → 收起
@@ -426,6 +427,11 @@ impl Panel {
                 }
             }
             _ => {
+                // 悬停预览中锁定：面板本就显示，保持正在看的视图；
+                // 从隐藏重开才回主视图，不停留在上次滚动的旧设置页
+                if self.mode == PanelMode::Hidden {
+                    self.reset_to_main();
+                }
                 self.mode = PanelMode::Pinned;
                 self.show_at(parent, anchor, accounts);
                 // 显示后立即激活——后台窗口拿不到键盘焦点，IME 异常
@@ -440,8 +446,15 @@ impl Panel {
 
     pub fn show_preview(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
         self.mode = PanelMode::Preview;
+        self.reset_to_main();
+        self.show_at(parent, anchor, accounts);
+    }
+
+    /// 打开面板前的复位：回主视图、清滚动偏移、添加表单与输入临时态；
+    /// 预览/锁定两条打开路径共用，防收起后重开停在上次滚动的旧设置页。
+    /// 间隔行展开态不清：view_height 有配套 +38 钩子，保留展开属既有行为
+    fn reset_to_main(&mut self) {
         self.view = PanelView::Main;
-        // 主视图恒不滚动；从已滚动的设置页回来时偏移归零
         self.scroll_dy = 0.0;
         self.adding_account = false;
         self.key_revealed = false;
@@ -450,7 +463,6 @@ impl Panel {
         } else {
             self.input.field = None;
         }
-        self.show_at(parent, anchor, accounts);
     }
 
     /// 结束输入状态，销毁光标与 IME 上下文
@@ -624,21 +636,37 @@ pub extern "system" fn panel_wndproc(
                 if let Some(app) = app {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
-                    // take 成局部值，避免与后续 &Panel / 模型组装的不可变借用冲突
-                    let mut renderer = app.panel.renderer.take().or_else(Renderer::new);
+                    // take 成局部值，避免与后续 &Panel / 模型组装的不可变借用冲突；
+                    // 首建标记同时驱动下面的主题对齐
+                    let cached = app.panel.renderer.take();
+                    let fresh = cached.is_none();
+                    let mut renderer = cached.or_else(|| Renderer::new(hwnd, &rect, app.panel.dpi));
+                    let mut keep = true;
                     if let Some(r) = renderer.as_mut() {
-                        // 首建即对齐配置外观：Renderer::new 兜底读系统外观，
-                        // 配置强制浅/深色与系统相反时首帧会用错主题
-                        r.theme =
-                            crate::ui::panel::theme::Theme::new(crate::app::resolved_appearance(
-                                app.config.general.appearance.as_deref(),
-                            ));
+                        // 仅首建时对齐配置外观：Renderer::new 兜底读系统外观，
+                        // 配置强制浅/深色与系统相反时首帧会用错主题；日常外观
+                        // 切换由 app 侧 apply_appearance 推送，跟随系统模式下
+                        // 逐帧重建主题会反复读注册表
+                        if fresh {
+                            r.theme = crate::ui::panel::theme::Theme::new(
+                                crate::app::resolved_appearance(
+                                    app.config.general.appearance.as_deref(),
+                                ),
+                            );
+                        }
                         let model = PanelModel::from_app(app);
                         let view = app.panel.view;
                         let dpi = app.panel.dpi;
-                        r.paint(hwnd, &rect, &app.panel, &model, view, dpi);
+                        keep = r.paint(hwnd, &rect, &app.panel, &model, view, dpi);
                     }
-                    app.panel.renderer = renderer;
+                    // paint 判定设备丢失时丢弃整个 Renderer，并立即请求下一帧
+                    // 走 fresh 路径全量重建、重新对齐主题——不请求的话静止面板
+                    // 要等分钟心跳才有下一帧，期间空白且命中全部失效
+                    if keep {
+                        app.panel.renderer = renderer;
+                    } else {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
                 LRESULT(0)
             }
@@ -824,23 +852,9 @@ pub extern "system" fn panel_wndproc(
                     if !moved_far {
                         let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
                         let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
-                        // 会进入/保持输入态的命中；其余点击一律结束输入，光标不再滞留框外
-                        let refocus = matches!(
-                            hit,
-                            Some(
-                                Hit::InputInterval
-                                    | Hit::CustomizeInterval
-                                    | Hit::InputProxy
-                                    | Hit::InputPeakStart
-                                    | Hit::InputPeakEnd
-                                    | Hit::AddAccount
-                                    | Hit::InputName
-                                    | Hit::InputKey
-                                    | Hit::RevealKey
-                                    | Hit::InputOrg
-                                    | Hit::InputProject
-                            )
-                        );
+                        // 会进入/保持输入态的命中；其余点击一律结束输入，光标不再滞留框外。
+                        // 列表收敛在 Hit::is_input_hit，新增输入框时与枚举同文件维护
+                        let refocus = hit.is_some_and(|h| h.is_input_hit());
                         if let Some(hit) = hit {
                             crate::app::handle_panel_hit(app, hit, hwnd);
                         }
@@ -863,7 +877,10 @@ pub extern "system" fn panel_wndproc(
                     {
                         let input = &mut app.panel.input;
                         let field = input.field;
+                        // 穷尽列出全部字段缓冲，新增 InputField 变体时编译器强制此处补臂；
+                        // None 已被外层 is_some 守卫滤除，兜底写入 Interval 沿旧语义
                         let buf = match field {
+                            Some(InputField::Interval) => &mut input.interval,
                             Some(InputField::Proxy) => &mut input.proxy,
                             Some(InputField::PeakStart) => &mut input.peak_start,
                             Some(InputField::PeakEnd) => &mut input.peak_end,
@@ -871,8 +888,7 @@ pub extern "system" fn panel_wndproc(
                             Some(InputField::Key) => &mut input.key,
                             Some(InputField::Org) => &mut input.org,
                             Some(InputField::Project) => &mut input.project,
-                            // Interval 走兜底臂，保持无输入态也可敲键
-                            _ => &mut input.interval,
+                            None => &mut input.interval,
                         };
                         match char::from_u32(ch as u32) {
                             Some('\r') | Some('\n') => confirm = true,
@@ -1092,4 +1108,32 @@ fn x_of(l: LPARAM) -> f32 {
 
 fn y_of(l: LPARAM) -> f32 {
     ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32
+}
+
+/// 高度链钉位回归：期望值由 draw_settings / draw_account_picker 的 y 累加链
+/// 推导而来，布局改动须同步更新
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_view_height_pinned() {
+        let mut p = Panel::new();
+        p.view = PanelView::Settings;
+        assert_eq!(p.view_height(0), 797);
+        assert_eq!(p.view_height(1), 845);
+        p.customizing_interval = true;
+        assert_eq!(p.view_height(0), 835);
+        assert_eq!(p.view_height(1), 883);
+        p.account_error = true;
+        assert_eq!(p.view_height(1), 901);
+    }
+
+    #[test]
+    fn picker_view_height_pinned() {
+        let mut p = Panel::new();
+        p.view = PanelView::AccountPicker;
+        assert_eq!(p.view_height(1), 98);
+        assert_eq!(p.view_height(3), 186);
+    }
 }

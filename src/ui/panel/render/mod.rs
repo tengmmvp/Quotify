@@ -104,13 +104,35 @@ pub enum Hit {
     InputOrg,
     InputProject,
     SaveAccount,
-    Platform(crate::api::client::Platform),
+    Platform(crate::api::Platform),
 
     // ── 设置 · 配置管理与关于 ──
     ExportConfig,
     ImportConfig,
     CheckUpdate,
     OpenDownload,
+}
+
+/// Hit 的谓词集中放在枚举旁维护；新增输入框类变体须同步收录
+impl Hit {
+    /// 点击后会进入/保持输入态或 key 明文查看态的命中；
+    /// WM_LBUTTONUP 据此决定点击后是否清空输入缓冲与光标
+    pub(crate) fn is_input_hit(&self) -> bool {
+        matches!(
+            self,
+            Self::CustomizeInterval
+                | Self::InputInterval
+                | Self::InputProxy
+                | Self::InputPeakStart
+                | Self::InputPeakEnd
+                | Self::AddAccount
+                | Self::InputName
+                | Self::InputKey
+                | Self::RevealKey
+                | Self::InputOrg
+                | Self::InputProject
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,8 +188,8 @@ impl Renderer {
 pub struct Renderer {
     factory: ID2D1Factory,
     dwrite: IDWriteFactory,
-    target: Option<ID2D1HwndRenderTarget>,
-    black: Option<ID2D1SolidColorBrush>,
+    target: ID2D1HwndRenderTarget,
+    black: ID2D1SolidColorBrush,
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: HashMap<(u32, u16, bool), IDWriteTextFormat>,
     pub theme: Theme,
@@ -186,17 +208,20 @@ pub struct Renderer {
 
 /// 渲染器
 impl Renderer {
-    /// 创建渲染器
-    pub fn new() -> Option<Self> {
+    /// 创建渲染器；target 与 black 刷子成对随建，任一失败即放弃整个渲染器，
+    /// 由调用方跳过本帧、待下次绘制消息重试——这是 black 恒为活句柄的契约来源
+    pub fn new(hwnd: HWND, rect_phys: &RECT, dpi: f32) -> Option<Self> {
         unsafe {
             let factory: ID2D1Factory =
                 D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
             let dwrite: IDWriteFactory = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED).ok()?;
+            let dpi = sane_dpi(dpi);
+            let (target, black) = create_hwnd_target(&factory, hwnd, rect_phys, dpi)?;
             Some(Self {
                 factory,
                 dwrite,
-                target: None,
-                black: None,
+                target,
+                black,
                 brushes: HashMap::new(),
                 formats: HashMap::new(),
                 theme: Theme::new(Theme::system_appearance()),
@@ -205,7 +230,7 @@ impl Renderer {
                 anim: AnimState::new(),
                 pending_tip: None,
                 font_fallback: false,
-                target_dpi: 0.0,
+                target_dpi: dpi,
                 anim_allowed: animations_allowed(),
                 logo_geo: None,
                 bolt_geo: None,
@@ -321,6 +346,7 @@ impl Renderer {
     }
 
     /// 绘制一帧；`rect_phys` 为物理像素，绘制全程用逻辑像素 DIP。
+    /// 返回 false 表示设备已丢失，调用方须丢弃整个 Renderer，下帧全量重建
     pub fn paint(
         &mut self,
         hwnd: HWND,
@@ -329,10 +355,11 @@ impl Renderer {
         model: &PanelModel,
         view: PanelView,
         dpi: f32,
-    ) {
+    ) -> bool {
         unsafe {
+            // 整建失败只跳过本帧：Renderer 本体仍健康，保留待下次绘制消息重试
             let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
-                return;
+                return true;
             };
             let rect_logical = RECT {
                 left: 0,
@@ -344,11 +371,12 @@ impl Renderer {
             target.BeginDraw();
             self.draw(&target, panel, model, view, &rect_logical);
             match target.EndDraw(None, None) {
-                Ok(()) => {}
+                Ok(()) => true,
                 Err(e) => {
-                    // 设备丢失：丢弃 target 与设备绑定资源，下帧整建——不清理则面板永久空白
+                    // 设备丢失：target 与全部设备绑定刷子一并失效，残留只会让
+                    // 面板永久空白——整个 Renderer 丢弃，下帧重建并重新对齐主题
                     crate::platform::log(&format!("[Quotify] EndDraw 失败: {e}"));
-                    self.drop_device_resources();
+                    false
                 }
             }
         }
@@ -668,27 +696,10 @@ impl Renderer {
                 self.brushes.insert(key, b.clone());
                 b
             }
-            // 创建失败只在设备濒死时发生：black 惰性重建、再退缓存任取。
-            // 随后 EndDraw 即失败走整建，本帧可能的色偏可接受，不再 panic
-            Err(_) => {
-                if self.black.is_none() {
-                    self.black = target
-                        .CreateSolidColorBrush(
-                            &D2D1_COLOR_F {
-                                r: 0.0,
-                                g: 0.0,
-                                b: 0.0,
-                                a: 1.0,
-                            },
-                            None,
-                        )
-                        .ok();
-                }
-                self.black
-                    .clone()
-                    .or_else(|| self.brushes.values().next().cloned())
-                    .expect("no brush available")
-            }
+            // 创建失败只在设备濒死时发生：black 随 target 常驻必有活句柄，拿它
+            // 绘制把错误递延给 EndDraw，本帧色偏可接受；随后 Renderer 整体
+            // 丢弃重建，绝不 panic=abort 把瞬时设备丢失升级成进程终止
+            Err(_) => self.black.clone(),
         }
     }
 
@@ -699,90 +710,40 @@ impl Renderer {
         rect_phys: &RECT,
         dpi: f32,
     ) -> Option<ID2D1HwndRenderTarget> {
-        let dpi = if dpi.is_finite() && dpi >= 1.0 {
-            dpi
-        } else {
-            1.0
-        };
+        let dpi = sane_dpi(dpi);
         let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
         let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
         // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准
-        let need_rebuild = match self.target.as_ref() {
-            Some(t) => {
-                let sz = t.GetPixelSize();
-                sz.width != w_px || sz.height != h_px || self.target_dpi != dpi
-            }
-            None => true,
-        };
+        let sz = self.target.GetPixelSize();
+        let need_rebuild = sz.width != w_px || sz.height != h_px || self.target_dpi != dpi;
         if need_rebuild {
-            // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫
-            let size_only = self.target.is_some() && self.target_dpi == dpi;
+            // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫；
+            // Resize 不换设备，既有刷子继续有效
+            let size_only = self.target_dpi == dpi;
             let resized = size_only
-                && self.target.as_ref().is_some_and(|t| {
-                    t.Resize(&D2D_SIZE_U {
+                && self
+                    .target
+                    .Resize(&D2D_SIZE_U {
                         width: w_px,
                         height: h_px,
                     })
-                    .is_ok()
-                });
+                    .is_ok();
             if !resized {
-                self.target = None;
-                let pf = D2D1_PIXEL_FORMAT {
-                    format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
-                };
-                // 软件渲染：硬件路径会拉起 d3d11+显卡驱动栈，驱动内部提交
-                // 占 60MB+，远超本程序预算；窗口小，软光栅耗时可忽略
-                let props = D2D1_RENDER_TARGET_PROPERTIES {
-                    r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
-                    pixelFormat: pf,
-                    dpiX: dpi * 96.0,
-                    dpiY: dpi * 96.0,
-                    ..Default::default()
-                };
-                let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
-                    hwnd,
-                    pixelSize: D2D_SIZE_U {
-                        width: w_px,
-                        height: h_px,
-                    },
-                    presentOptions: D2D1_PRESENT_OPTIONS_NONE,
-                };
-                match self.factory.CreateHwndRenderTarget(&props, &hwnd_props) {
-                    Ok(target) => {
-                        let black = target
-                            .CreateSolidColorBrush(
-                                &D2D1_COLOR_F {
-                                    r: 0.0,
-                                    g: 0.0,
-                                    b: 0.0,
-                                    a: 1.0,
-                                },
-                                None,
-                            )
-                            .ok();
+                // 整建换 target：缓存刷子绑死创建它的旧 target，残留句柄会让
+                // 整建后首帧绘制报错递延到 EndDraw 而白费一帧，先清缓存
+                self.brushes.clear();
+                match create_hwnd_target(&self.factory, hwnd, rect_phys, dpi) {
+                    Some((target, black)) => {
+                        self.target = target;
                         self.black = black;
-                        self.target = Some(target);
                         self.target_dpi = dpi;
                     }
-                    Err(e) => {
-                        crate::platform::log(&format!(
-                            "[Quotify] CreateHwndRenderTarget 失败: {e}"
-                        ));
-                        return None;
-                    }
+                    // 保留旧 target 原样跳过本帧，待下次绘制消息重试整建；失败细节由助手内记录
+                    None => return None,
                 }
             }
         }
-        self.target.clone()
-    }
-
-    /// 设备丢失时丢弃 target 绑定资源，下帧整建。
-    /// logo/bolt 几何与 dash 样式挂在 factory 上、不随 target 失效，保留复用
-    fn drop_device_resources(&mut self) {
-        self.target = None;
-        self.black = None;
-        self.brushes.clear();
+        Some(self.target.clone())
     }
 }
 
@@ -794,6 +755,71 @@ fn wide(s: &str) -> Vec<u16> {
 fn pack_color(r: f32, g: f32, b: f32, a: f32) -> u32 {
     let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
     (q(r) << 24) | (q(g) << 16) | (q(b) << 8) | q(a)
+}
+
+/// 非法 DPI 兜底为 1.0，防 0/NaN 混进 target 建立参数
+fn sane_dpi(dpi: f32) -> f32 {
+    if dpi.is_finite() && dpi >= 1.0 {
+        dpi
+    } else {
+        1.0
+    }
+}
+
+/// 软件渲染 target 与 black 刷子成对建立；任一失败返回 None，
+/// 首建与 DPI 整建两路共用，保证 target 存在时 black 必然就位
+unsafe fn create_hwnd_target(
+    factory: &ID2D1Factory,
+    hwnd: HWND,
+    rect_phys: &RECT,
+    dpi: f32,
+) -> Option<(ID2D1HwndRenderTarget, ID2D1SolidColorBrush)> {
+    let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
+    let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
+    let pf = D2D1_PIXEL_FORMAT {
+        format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM,
+        alphaMode: D2D1_ALPHA_MODE_IGNORE,
+    };
+    // 软件渲染：硬件路径会拉起 d3d11+显卡驱动栈，驱动内部提交
+    // 占 60MB+，远超本程序预算；窗口小，软光栅耗时可忽略
+    let props = D2D1_RENDER_TARGET_PROPERTIES {
+        r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+        pixelFormat: pf,
+        dpiX: dpi * 96.0,
+        dpiY: dpi * 96.0,
+        ..Default::default()
+    };
+    let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
+        hwnd,
+        pixelSize: D2D_SIZE_U {
+            width: w_px,
+            height: h_px,
+        },
+        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+    };
+    let target = match factory.CreateHwndRenderTarget(&props, &hwnd_props) {
+        Ok(t) => t,
+        Err(e) => {
+            crate::platform::log(&format!("[Quotify] CreateHwndRenderTarget 失败: {e}"));
+            return None;
+        }
+    };
+    let black = match target.CreateSolidColorBrush(
+        &D2D1_COLOR_F {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        },
+        None,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            crate::platform::log(&format!("[Quotify] black 刷子创建失败: {e}"));
+            return None;
+        }
+    };
+    Some((target, black))
 }
 
 impl Default for AnimState {

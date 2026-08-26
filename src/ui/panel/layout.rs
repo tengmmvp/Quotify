@@ -13,8 +13,10 @@ pub const SEGMENTED_H: f32 = 30.0;
 pub const SEGMENTED_GAP: f32 = 9.0;
 /// 自绘输入框高度
 pub const INPUT_H: f32 = 26.0;
+/// 设置/主视图内容区左右留白
+pub const CONTENT_PAD: f32 = 20.0;
 /// 输入框左侧 x，与内容区 pad 一致
-pub const INPUT_X: f32 = 20.0;
+pub const INPUT_X: f32 = CONTENT_PAD;
 /// 输入框后到下一 sub_label 的间距
 pub const INPUT_GAP: f32 = 6.0;
 
@@ -49,7 +51,7 @@ pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
 
 /// 设置页高峰区间输入行顶 y，位于通知区之后
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走（输入框 26 + 尾隙 12）；
+    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走：38 = 输入框 26 + 尾隙 12；
     // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
     let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
@@ -61,7 +63,7 @@ pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f
 
 /// 设置页代理输入框顶 y，与 draw_settings 的 y 推进链逐段对齐
 pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走（输入框 26 + 尾隙 12）；
+    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走：38 = 输入框 26 + 尾隙 12；
     // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
     let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
@@ -70,8 +72,8 @@ pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> 
         + 126.0 // 三个通知开关行
         + 67.0 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
         + 33.0 // 通用区标题
-        + 63.0 // 语言行
-        + 63.0 // 外观行
+        + 62.0 // 语言行：sub_label 21 + segmented 39 + 行后 2
+        + 62.0 // 外观行，同语言行
         + 28.0 // 开机自启行
         + 33.0 // 网络代理区标题
         + 21.0 // 代理子标签
@@ -80,6 +82,16 @@ pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> 
 /// 添加页总高（逻辑像素），团队版追加组织/项目两行
 pub fn add_page_height(team: bool) -> i32 {
     338 + if team { 106 } else { 0 }
+}
+
+/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态随指标行数与余额块伸缩，
+/// 各段对照 draw_main 的 y 推进链（顶部留白 + 顶栏 52 + 刊头 42 +
+/// 指标行 52×n + 余额块 40 + footer 40）
+pub fn main_view_height(has_data: bool, rows: usize, has_balance: bool) -> i32 {
+    if !has_data {
+        return 300;
+    }
+    16 + 52 + 42 + rows as i32 * 52 + has_balance as i32 * 40 + 40
 }
 
 /// 钉位回归：期望值由渲染 y 链推导而来，布局改动须同步更新
@@ -106,16 +118,24 @@ mod tests {
 
     #[test]
     fn proxy_input_y_pinned() {
-        assert_eq!(proxy_input_y(false, false, false), 638.0);
-        assert_eq!(proxy_input_y(true, false, false), 686.0);
-        assert_eq!(proxy_input_y(true, true, false), 704.0);
-        assert_eq!(proxy_input_y(true, true, true), 742.0);
-        assert_eq!(proxy_input_y(false, false, true), 676.0);
+        assert_eq!(proxy_input_y(false, false, false), 636.0);
+        assert_eq!(proxy_input_y(true, false, false), 684.0);
+        assert_eq!(proxy_input_y(true, true, false), 702.0);
+        assert_eq!(proxy_input_y(true, true, true), 740.0);
+        assert_eq!(proxy_input_y(false, false, true), 674.0);
     }
 
     #[test]
     fn add_page_height_pinned() {
         assert_eq!(add_page_height(false), 338);
         assert_eq!(add_page_height(true), 444);
+    }
+
+    #[test]
+    fn main_view_height_pinned() {
+        assert_eq!(main_view_height(false, 0, false), 300);
+        assert_eq!(main_view_height(true, 0, false), 150);
+        assert_eq!(main_view_height(true, 1, false), 202);
+        assert_eq!(main_view_height(true, 3, true), 346);
     }
 }

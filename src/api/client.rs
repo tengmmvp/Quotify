@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use super::{Balance, ERR_BODY_CHARS, FetchError, UsageSnapshot, parse_response};
+use super::{
+    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, UsageSnapshot, parse_response,
+};
 
 /// body 读取硬上限
 pub(crate) const MAX_BODY_BYTES: u64 = 1024 * 1024;
@@ -96,46 +98,6 @@ fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
         builder = builder.proxy(Some(p.clone()));
     }
     builder.build().into()
-}
-
-/// API 平台
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Platform {
-    /// 国内版 open.bigmodel.cn
-    Cn,
-    /// 国际版 api.z.ai
-    Intl,
-}
-
-impl Platform {
-    pub fn base_url(self) -> &'static str {
-        match self {
-            Platform::Cn => "https://open.bigmodel.cn",
-            Platform::Intl => "https://api.z.ai",
-        }
-    }
-}
-
-/// 一次查询的账号参数。团队版仅国内站：API Key + `?type=2` + 两个
-/// 选择头缺一不可；缺 selector 回 success + 空 limits
-#[derive(Debug, Clone)]
-pub struct AccountSpec {
-    pub platform: Platform,
-    /// 团队版：组织 ID（`Bigmodel-Organization`）
-    pub org_id: String,
-    /// 团队版：项目 ID（`Bigmodel-Project`）
-    pub project_id: String,
-    pub api_key: String,
-}
-
-impl AccountSpec {
-    /// 两个选择头齐全才按团队查询，不全时按个人版
-    fn team_scope(&self) -> Option<(&str, &str)> {
-        let org = self.org_id.trim();
-        let project = self.project_id.trim();
-        (!org.is_empty() && !project.is_empty()).then_some((org, project))
-    }
 }
 
 /// 查询一次用量快照

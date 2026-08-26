@@ -1,6 +1,6 @@
 //! 渲染视图模型
 
-use crate::api::client::Platform;
+use crate::api::Platform;
 use crate::ui::i18n::{Lang, Strings};
 
 /// 选中账号的展示摘要
@@ -27,7 +27,6 @@ pub struct PanelModel<'a> {
     pub proxy: Option<&'a str>,
     pub autostart: bool,
     pub threshold_enabled: bool,
-    #[allow(dead_code)]
     pub threshold_percent: u8,
     pub reset_5h_enabled: bool,
     pub reset_weekly_enabled: bool,

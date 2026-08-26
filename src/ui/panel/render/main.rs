@@ -637,17 +637,21 @@ impl Renderer {
         target.FillRoundedRectangle(&card, &fill);
         let line = self.brush(target, self.theme.border, alpha);
         target.DrawRoundedRectangle(&card, &line, 1.0, None);
-        self.text(
+        self.text_wrapped(
             target,
             tip,
-            cx + 10.0,
-            y + 8.0,
-            cw - 20.0,
-            32.0,
+            &D2D_RECT_F {
+                left: cx + 10.0,
+                top: y + 8.0,
+                right: cx + cw - 10.0,
+                bottom: y + 40.0,
+            },
             11.0,
             400,
             self.theme.text_secondary,
             alpha,
+            Align::Left,
+            false,
         );
     }
 }

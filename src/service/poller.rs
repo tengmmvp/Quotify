@@ -110,6 +110,7 @@ impl Drop for Poller {
     }
 }
 
+/// 轮询循环
 fn poll_loop(
     hwnd: windows::Win32::Foundation::HWND,
     target: PollTarget,
@@ -120,6 +121,7 @@ fn poll_loop(
 ) {
     let handles = [stop, wake];
     let mut next_due = Instant::now();
+    let mut last_secs = 0u64;
 
     loop {
         let now = Instant::now();
@@ -138,9 +140,11 @@ fn poll_loop(
         let manual = refresh_flag.swap(false, Ordering::AcqRel);
         let due = Instant::now() >= next_due;
         if !manual && !due {
-            // 变更类唤醒不拉取，但按新间隔重排，否则新间隔要等旧周期走完才生效
+            // 仅间隔变化才重排，未变保持原到期锚点不被推迟
             let secs = clamp_interval(*borrow(&interval));
-            next_due = Instant::now() + Duration::from_secs(secs);
+            if secs != last_secs {
+                next_due = Instant::now() + Duration::from_secs(secs);
+            }
             continue;
         }
 
@@ -175,6 +179,7 @@ fn poll_loop(
         }
 
         let secs = clamp_interval(*borrow(&interval));
+        last_secs = secs;
         next_due = Instant::now() + Duration::from_secs(secs);
     }
 }

@@ -31,6 +31,8 @@ const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 const TIMER_ANIM: usize = 1;
 const TIMER_CLOSE_DEBOUNCE: usize = 2;
 pub(crate) const TIMER_OUTSIDE_CHECK: usize = 3;
+/// 分钟级重绘心跳
+const TIMER_MINUTE_TICK: usize = 4;
 
 /// DPI 探测失败时的兜底值
 pub(crate) const FALLBACK_DPI: f32 = 1.5;
@@ -364,6 +366,7 @@ impl Panel {
             }
             // 巡检首延给足弹出宽限，防弹出瞬间即被误收回
             SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 1200, None);
+            SetTimer(Some(hwnd), TIMER_MINUTE_TICK, 60_000, None);
             let _ = InvalidateRect(Some(hwnd), None, true);
         }
     }
@@ -410,6 +413,7 @@ impl Panel {
             let _ = ShowWindow(hwnd, SW_HIDE);
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
         }
     }
 
@@ -642,6 +646,11 @@ pub extern "system" fn panel_wndproc(
                 let id = wparam.0;
                 match id {
                     TIMER_ANIM => on_anim_tick(hwnd),
+                    // 心跳只请求重绘：无数据事件时相对时间文案也能推进
+                    TIMER_MINUTE_TICK => {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        LRESULT(0)
+                    }
                     TIMER_CLOSE_DEBOUNCE => {
                         let app = app_from_tray(hwnd);
                         if let Some(app) = app {
@@ -787,26 +796,31 @@ pub extern "system" fn panel_wndproc(
             }
             WM_LBUTTONUP => {
                 let mut app = app_from_tray(hwnd);
-                // 手动拖动结束：恢复完整高度并记拖动态
-                if let Some(app) = app.as_mut()
-                    && app.panel.drag_offset.take().is_some()
-                {
-                    let _ = ReleaseCapture();
-                    app.panel.dragged = true;
-                    let n = app.config.accounts.len();
-                    let logical_h = app.panel.view_height(n);
-                    app.panel.place(hwnd, logical_h, true);
-                    let _ = InvalidateRect(Some(hwnd), None, true);
-                    return LRESULT(0);
-                }
-                let app = app_from_tray(hwnd);
-                if let Some(app) = app {
-                    // 按下→松手位移过大视为拖动尾程，不触发点击
+                if let Some(app) = app.as_mut() {
+                    // 按下→松手位移超过阈值才算拖动；press_at 在 BUTTONDOWN 记录
                     let moved_far = app.panel.press_at.take().is_some_and(|(px, py)| {
                         let mut cursor = POINT::default();
                         let _ = GetCursorPos(&mut cursor);
                         (cursor.x - px).abs() + (cursor.y - py).abs() > 8
                     });
+                    // 空白处按下即进入拖动态，松手须先按位移分流：原地点击不是拖动
+                    if app.panel.drag_offset.take().is_some() {
+                        let _ = ReleaseCapture();
+                        if moved_far {
+                            // 真拖动结束：保持当前位置恢复完整高度
+                            app.panel.dragged = true;
+                            let n = app.config.accounts.len();
+                            let logical_h = app.panel.view_height(n);
+                            app.panel.place(hwnd, logical_h, true);
+                            let _ = InvalidateRect(Some(hwnd), None, true);
+                        } else if app.panel.input.field.is_some() || app.panel.key_revealed {
+                            // 空白点击结束输入态与明文查看；缓冲文本保留
+                            app.panel.clear_input(hwnd);
+                            app.panel.key_revealed = false;
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
+                        return LRESULT(0);
+                    }
                     if !moved_far {
                         let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
                         let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
@@ -830,9 +844,9 @@ pub extern "system" fn panel_wndproc(
                         if let Some(hit) = hit {
                             crate::app::handle_panel_hit(app, hit, hwnd);
                         }
-                        if !refocus && app.panel.input.field.is_some() {
-                            // 缓冲文本保留，只退出输入态
+                        if !refocus && (app.panel.input.field.is_some() || app.panel.key_revealed) {
                             app.panel.clear_input(hwnd);
+                            app.panel.key_revealed = false;
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
                     }

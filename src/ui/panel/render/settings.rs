@@ -720,8 +720,6 @@ impl Renderer {
     }
 
     /// 自绘输入框；光标用系统 caret——CreateCaret，IME 候选窗跟随其定位。
-    /// content 为空且未聚焦时显示弱色占位提示。
-    /// eye 为 (命中区, 明文态) 时框内右端画切换眼睛，文本区相应右缩
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
@@ -771,8 +769,7 @@ impl Renderer {
                 false,
             );
         } else {
-            // 尾部可视切片按真实测宽取最长可放入后缀：等宽点数估算遇
-            // CJK（全角约 2 倍宽）会溢出框外或截掉过多字符
+            // 尾部可视切片按真实测宽取最长可放入后缀
             let avail = (w - 6.0 - tail).max(1.0);
             let chars: Vec<char> = content.chars().collect();
             let mut vis = String::new();
@@ -781,7 +778,7 @@ impl Renderer {
                     vis = content.to_string();
                 } else {
                     // 至少保尾 1 字符；前缀每扩一字符宽度单调增，
-                    // 首个溢出处的前一候选即最长可放入后缀（缓冲 ≤128，线性够快）
+                    // 首个溢出处的前一候选即最长可放入后缀
                     vis = chars.last().map(|c| c.to_string()).unwrap_or_default();
                     for k in (0..chars.len() - 1).rev() {
                         let cand: String = chars[k..].iter().collect();
@@ -806,12 +803,15 @@ impl Renderer {
         }
         if let Some((eye_hit, revealed)) = eye {
             let (ecx, ecy) = (x + w - 15.0, y + layout::INPUT_H / 2.0);
-            let color = if self.hover == Some(eye_hit) {
-                self.theme.text_primary
-            } else {
-                self.theme.text_secondary
-            };
-            self.eye(target, ecx, ecy, 13.0, revealed, color, alpha);
+            self.eye(
+                target,
+                ecx,
+                ecy,
+                13.0,
+                revealed,
+                self.theme.text_secondary,
+                alpha,
+            );
             // 眼睛命中区先于整框登记：hit_at 取首个命中，后登记会被整框吞掉
             self.hits.push((
                 eye_hit,

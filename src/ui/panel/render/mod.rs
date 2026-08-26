@@ -56,7 +56,7 @@ pub enum ScopeChoice {
     Team,
 }
 
-/// 可点击元素标识，用于命中检测；按 UI 场景分组，序同 handle_panel_hit 臂序
+/// 可点击元素标识，用于命中检测；按 UI 场景分组，与 handle_panel_hit 的臂分组对应
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Hit {
     // ── 主视图 ──
@@ -116,7 +116,7 @@ pub enum Hit {
 /// Hit 的谓词集中放在枚举旁维护；新增输入框类变体须同步收录
 impl Hit {
     /// 点击后会进入/保持输入态或 key 明文查看态的命中；
-    /// WM_LBUTTONUP 据此决定点击后是否清空输入缓冲与光标
+    /// WM_LBUTTONUP 据此决定点击后是否结束输入态
     pub(crate) fn is_input_hit(&self) -> bool {
         matches!(
             self,
@@ -142,13 +142,12 @@ enum Align {
     Right,
 }
 
-/// 进度条等数值的动画插值状态
+/// 淡入与刷新旋转两类动画的插值状态
 pub struct AnimState {
     pub appear: Option<Tween>,
     pub spin: f32,
 }
 
-/// 动画状态
 impl AnimState {
     pub fn new() -> Self {
         Self {
@@ -158,7 +157,6 @@ impl AnimState {
     }
 }
 
-/// 渲染器
 impl Renderer {
     /// 刷新按钮动画是否仍在进行
     pub fn spin_remaining(&mut self) -> bool {
@@ -192,6 +190,9 @@ pub struct Renderer {
     black: ID2D1SolidColorBrush,
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: HashMap<(u32, u16, bool), IDWriteTextFormat>,
+    /// measure_ro 专用格式缓存：&self 上下文无法写 formats，
+    /// 经 RefCell 提供内部可变性
+    ro_formats: std::cell::RefCell<HashMap<(&'static str, u32, u16), IDWriteTextFormat>>,
     pub theme: Theme,
     pub hits: Vec<(Hit, D2D_RECT_F)>,
     pub hover: Option<Hit>,
@@ -206,7 +207,6 @@ pub struct Renderer {
     dash_style: Option<ID2D1StrokeStyle>,
 }
 
-/// 渲染器
 impl Renderer {
     /// 创建渲染器；target 与 black 刷子成对随建，任一失败即放弃整个渲染器，
     /// 由调用方跳过本帧、待下次绘制消息重试——这是 black 恒为活句柄的契约来源
@@ -224,6 +224,7 @@ impl Renderer {
                 black,
                 brushes: HashMap::new(),
                 formats: HashMap::new(),
+                ro_formats: std::cell::RefCell::new(HashMap::new()),
                 theme: Theme::new(Theme::system_appearance()),
                 hits: Vec::new(),
                 hover: None,
@@ -283,18 +284,57 @@ impl Renderer {
         let Some(fmt) = self.format(size, weight, mono) else {
             return 0.0;
         };
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        if w16.is_empty() {
-            return 0.0;
+        self.measure_with(&fmt, s)
+    }
+
+    /// 只读测宽：供 &self 上下文（光标定位与渲染共用 caret_layout）使用。
+    /// format 按 (字号,字重,字体族) 缓存——拖选高频路径上每次鼠标移动
+    /// 做多次测宽，逐次建 COM 对象纯属浪费
+    pub(crate) unsafe fn measure_ro(&self, s: &str, size: f32, weight: u16, mono: bool) -> f32 {
+        unsafe {
+            let family = if mono {
+                "Consolas"
+            } else if self.font_fallback {
+                "Segoe UI"
+            } else {
+                "Segoe UI Variable Text"
+            };
+            let key = (family, size.to_bits(), weight);
+            if let Some(f) = self.ro_formats.borrow().get(&key) {
+                return self.measure_with(f, s);
+            }
+            let Ok(fmt) = self.dwrite.CreateTextFormat(
+                PCWSTR(wide(family).as_ptr()),
+                None,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT(weight as i32),
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                size,
+                PCWSTR(wide("").as_ptr()),
+            ) else {
+                return 0.0;
+            };
+            self.ro_formats.borrow_mut().insert(key, fmt.clone());
+            self.measure_with(&fmt, s)
         }
-        let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
-            return 0.0;
-        };
-        let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
-        if layout.GetMetrics(&mut m).is_ok() {
-            m.widthIncludingTrailingWhitespace
-        } else {
-            0.0
+    }
+
+    /// 按 format 建 layout 取宽
+    unsafe fn measure_with(&self, fmt: &IDWriteTextFormat, s: &str) -> f32 {
+        unsafe {
+            let w16: Vec<u16> = s.encode_utf16().collect();
+            if w16.is_empty() {
+                return 0.0;
+            }
+            let Ok(layout) = self.dwrite.CreateTextLayout(&w16, fmt, 1.0e6, 1.0e6) else {
+                return 0.0;
+            };
+            let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut m).is_ok() {
+                m.widthIncludingTrailingWhitespace
+            } else {
+                0.0
+            }
         }
     }
 
@@ -673,7 +713,7 @@ impl Renderer {
     }
 
     /// 纯色刷子：按量化颜色缓存复用，命中即克隆；alpha 乘进颜色分量。
-    /// 每色独立实例缓存——单刷 SetColor 复用会被并行交替覆盖，滑杆曾整支隐形
+    /// 每色独立实例缓存——单刷 SetColor 复用会被交替覆盖，滑杆图标整支隐形
     unsafe fn brush(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -718,7 +758,7 @@ impl Renderer {
         let need_rebuild = sz.width != w_px || sz.height != h_px || self.target_dpi != dpi;
         if need_rebuild {
             // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫；
-            // Resize 不换设备，既有刷子继续有效
+            // Resize 不换设备，已建刷子继续有效
             let size_only = self.target_dpi == dpi;
             let resized = size_only
                 && self

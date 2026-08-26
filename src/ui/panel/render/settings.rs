@@ -55,7 +55,7 @@ impl Renderer {
         );
         y += 30.0;
 
-        // ── 账号：设置页首项即数据来源；添加页此处标题用「版本」──
+        // ── 账号：设置页首项即数据来源；添加页此处标题用「账号信息」──
         let section = if panel.adding_account {
             s.platform_section
         } else {
@@ -63,7 +63,6 @@ impl Renderer {
         };
         y = self.section_label(target, section, pad, y, w, alpha, false);
         if panel.adding_account {
-            // TODO: 添加表单与设置页布局规则渐行渐远，条件成熟时拆独立 add 视图文件
             // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID
             y = self.sub_label(target, s.account_platform, pad, y, cw, alpha);
             let plats: [(Hit, &str); 2] = [
@@ -100,6 +99,7 @@ impl Renderer {
             self.sub_label(target, s.account_name, pad, y, cw, alpha);
             let name_y = dy + layout::ADD_NAME_Y;
             self.input_field(
+                panel,
                 target,
                 Hit::InputName,
                 layout::INPUT_X,
@@ -114,7 +114,7 @@ impl Renderer {
             y = name_y + layout::INPUT_H + layout::INPUT_GAP;
             self.sub_label(target, s.api_key_label, pad, y, cw, alpha);
             let key_y = dy + layout::ADD_KEY_Y;
-            // key 不整串落屏：聚焦显等宽圆点，未聚焦只露首尾各 4 位；框内眼睛可切明文
+            // key 不整串落屏：聚焦显等宽圆点，未聚焦且足 12 位只露首尾各 4 位；框内眼睛可切明文
             let key_active = input.field == Some(InputField::Key);
             let key_disp = if panel.key_revealed {
                 input.key.clone()
@@ -122,6 +122,7 @@ impl Renderer {
                 mask_key(&input.key, key_active)
             };
             self.input_field(
+                panel,
                 target,
                 Hit::InputKey,
                 layout::INPUT_X,
@@ -139,6 +140,7 @@ impl Renderer {
                 self.sub_label(target, s.org_id_label, pad, y, cw, alpha);
                 let org_y = dy + layout::ADD_ORG_Y;
                 self.input_field(
+                    panel,
                     target,
                     Hit::InputOrg,
                     layout::INPUT_X,
@@ -154,6 +156,7 @@ impl Renderer {
                 self.sub_label(target, s.project_id_label, pad, y, cw, alpha);
                 let project_y = dy + layout::ADD_PROJECT_Y;
                 self.input_field(
+                    panel,
                     target,
                     Hit::InputProject,
                     layout::INPUT_X,
@@ -307,6 +310,7 @@ impl Renderer {
             let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
             let input = &panel.input;
             self.input_field(
+                panel,
                 target,
                 Hit::InputInterval,
                 layout::INPUT_X,
@@ -418,6 +422,7 @@ impl Renderer {
             alpha,
         );
         self.input_field(
+            panel,
             target,
             Hit::InputPeakStart,
             layout::PEAK_START_X,
@@ -442,6 +447,7 @@ impl Renderer {
             alpha,
         );
         self.input_field(
+            panel,
             target,
             Hit::InputPeakEnd,
             layout::PEAK_END_X,
@@ -538,7 +544,7 @@ impl Renderer {
             alpha,
         );
 
-        // ── 网络代理：地址留空直连，提示在框内占位 ──
+        // ── 网络代理：地址留空直连，未配置时框内只显占位提示 ──
         y = self.section_label(target, s.network_section, pad, y, w, alpha, true);
         self.sub_label(target, s.proxy_label, pad, y, cw, alpha);
         // y 钉在 layout::proxy_input_y，与光标、高度公式同源
@@ -548,19 +554,15 @@ impl Renderer {
                 panel.account_error,
                 panel.customizing_interval,
             );
-        let proxy_disp: String = if panel.input.proxy.is_empty() {
-            model.proxy.unwrap_or("").to_string()
-        } else {
-            panel.input.proxy.clone()
-        };
         self.input_field(
+            panel,
             target,
             Hit::InputProxy,
             layout::INPUT_X,
             py,
             cw,
             None,
-            &proxy_disp,
+            &panel.input.proxy,
             s.proxy_hint,
             panel.input.field == Some(InputField::Proxy),
             alpha,
@@ -647,7 +649,7 @@ impl Renderer {
 
     // ── 设置页专属小件 ──
 
-    /// 区块主标题：墨色强调块 + 标题；子标签不带块以区分层级
+    /// 区块主标题：text_primary 色强调块 + 标题；子标签不带块以区分层级
     #[allow(clippy::too_many_arguments)]
     unsafe fn section_label(
         &mut self,
@@ -720,10 +722,12 @@ impl Renderer {
         y + 21.0
     }
 
-    /// 自绘输入框；光标用系统 caret——CreateCaret，IME 候选窗跟随其定位。
+    /// 自绘输入框：光标用系统 CreateCaret，IME 组合窗随光标定位。
+    /// 激活态按光标可视窗口绘制并高亮选区，失焦态画尾部切片。
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
+        panel: &Panel,
         target: &ID2D1HwndRenderTarget,
         hit: Hit,
         x: f32,
@@ -769,8 +773,55 @@ impl Renderer {
                 Align::Left,
                 false,
             );
+        } else if active {
+            let avail = (w - 6.0 - tail).max(1.0);
+            let (vis_start, _) = panel.caret_layout(self);
+            let chars: Vec<char> = content.chars().collect();
+            let start = vis_start.min(chars.len());
+            let mut vis = String::new();
+            for c in &chars[start..] {
+                let cand: String = format!("{vis}{c}");
+                if self.measure(&cand, 12.0, 400, true) > avail {
+                    break;
+                }
+                vis = cand;
+            }
+            if let Some((a, b)) = panel.input.edit.selection() {
+                let a = a.min(chars.len());
+                let b = b.min(chars.len());
+                let mut sx = |n: usize| -> f32 {
+                    let lo = start.min(n);
+                    let s: String = chars[lo..n].iter().collect();
+                    self.measure(&s, 12.0, 400, true)
+                };
+                let sel_left = x + 6.0 + sx(a);
+                let sel_right = x + 6.0 + sx(b);
+                if sel_right > x + 6.0 && sel_left < x + w - tail {
+                    let hl = self.brush(target, self.theme.action, alpha * 0.16);
+                    target.FillRectangle(
+                        &D2D_RECT_F {
+                            left: sel_left.max(x + 6.0),
+                            top: y + 5.0,
+                            right: sel_right.min(x + w - tail),
+                            bottom: y + 21.0,
+                        },
+                        &hl,
+                    );
+                }
+            }
+            self.text_rect_opts(
+                target,
+                &vis,
+                &text_rect,
+                12.0,
+                400,
+                self.theme.text_primary,
+                alpha,
+                Align::Left,
+                true,
+            );
         } else {
-            // 尾部可视切片按真实测宽取最长可放入后缀
+            // 失焦态：尾部可视切片按真实测宽取最长可放入后缀
             let avail = (w - 6.0 - tail).max(1.0);
             let chars: Vec<char> = content.chars().collect();
             let mut vis = String::new();
@@ -995,7 +1046,7 @@ impl Renderer {
         y + h + layout::SEGMENTED_GAP
     }
 
-    /// 单账号卡片：名称 + 平台/版本/等级三枚名牌，右上删除
+    /// 单账号卡片
     #[allow(clippy::too_many_arguments)]
     unsafe fn account_card(
         &mut self,
@@ -1097,7 +1148,7 @@ impl Renderer {
         }
     }
 
-    /// 按钮：primary 为 Ink 填充，次级 Linen
+    /// 小圆角填充按钮
     #[allow(clippy::too_many_arguments)]
     unsafe fn pill_button(
         &mut self,
@@ -1123,14 +1174,12 @@ impl Renderer {
             radiusY: RADIUS,
         };
         let (base, fill_alpha, fg) = if primary {
-            // 主按钮 hover 轻微透纸——alpha 呼吸，不变色
             (
                 self.theme.action,
                 if hovered { alpha * 0.86 } else { alpha },
                 self.theme.action_text,
             )
         } else {
-            // 次级：Linen，hover 沉一档到 Stone
             (
                 if hovered {
                     self.theme.border

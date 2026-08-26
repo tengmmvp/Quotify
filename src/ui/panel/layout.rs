@@ -3,9 +3,9 @@
 /// 轮询间隔预设档（秒）
 pub const INTERVAL_PRESETS: [u64; 4] = [60, 300, 900, 1800];
 
-/// 导航栏高度
+/// 顶部导航栏高度
 pub const NAV_H: f32 = 30.0;
-/// section_label 返回的段高
+/// section_label 返回值内含的段高
 pub const SECTION_LABEL_H: f32 = 21.0;
 /// segmented_raw 段体高度
 pub const SEGMENTED_H: f32 = 30.0;
@@ -30,7 +30,7 @@ pub const ADD_PROJECT_Y: f32 = 365.0;
 /// caret 高 16 在 26 高框内垂直居中的偏移
 pub const CARET_Y_OFFSET: f32 = 5.0;
 
-/// 高峰区间输入框 x（设置页内容区 pad = 20）
+/// 高峰起/止输入框 x，跟随各自文本标签右侧；设置页内容区 pad = 20
 pub const PEAK_START_X: f32 = 48.0;
 pub const PEAK_END_X: f32 = 148.0;
 
@@ -43,12 +43,14 @@ pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
     } else {
         36.0
     };
+    // 尾段：轮询区标题 rule 上隙 12 + 标题 + 分段体 + 段后隙
     y + 12.0 + SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP
 }
 
 /// 设置页高峰区间输入行顶 y，位于通知区之后
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流与 IY 同点（分段返回值即 IY）
+    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走（输入框 26 + 尾隙 12）；
+    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
     let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
@@ -59,7 +61,8 @@ pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f
 
 /// 设置页代理输入框顶 y，与 draw_settings 的 y 推进链逐段对齐
 pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 自定义间隔时渲染链从 IY+38 续走；非自定义时 y 流与 IY 同点（分段返回值即 IY）
+    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走（输入框 26 + 尾隙 12）；
+    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
     let after_interval = if customizing { 38.0 } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
@@ -79,6 +82,7 @@ pub fn add_page_height(team: bool) -> i32 {
     338 + if team { 106 } else { 0 }
 }
 
+/// 钉位回归：期望值由渲染 y 链推导而来，布局改动须同步更新
 #[cfg(test)]
 mod tests {
     use super::*;

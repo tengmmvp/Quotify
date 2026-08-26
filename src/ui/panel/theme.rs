@@ -47,7 +47,7 @@ impl Theme {
     pub fn new(appearance: Appearance) -> Self {
         match appearance {
             Appearance::Light => Self {
-                bg: rgba(0xF7, 0xF7, 0xF4, 0.97),
+                bg: rgba(0xF7, 0xF7, 0xF4, 1.0),
                 text_primary: rgba(0x26, 0x25, 0x1E, 0.94),
                 text_secondary: rgba(0x84, 0x84, 0x7E, 1.0),
                 text_tertiary: rgba(0x7A, 0x79, 0x74, 1.0),
@@ -62,7 +62,7 @@ impl Theme {
                 logo_tile: rgba(0x26, 0x25, 0x1E, 1.0),
             },
             Appearance::Dark => Self {
-                bg: rgba(0x20, 0x1F, 0x1B, 0.97),
+                bg: rgba(0x20, 0x1F, 0x1B, 1.0),
                 text_primary: rgba(0xEC, 0xEA, 0xE4, 0.94),
                 text_secondary: rgba(0xA8, 0xA7, 0xA0, 1.0),
                 text_tertiary: rgba(0x7D, 0x7C, 0x75, 1.0),

@@ -148,6 +148,7 @@ pub struct Strings {
     pub up_to_date: &'static str,
     pub go_download: &'static str,
     pub version_label: &'static str,
+    pub version_new: &'static str,
 
     // ── 系统通知标题 ──
     pub notify_threshold_title: &'static str,
@@ -268,6 +269,7 @@ const ZH: Strings = Strings {
     up_to_date: "已是最新版本",
     go_download: "前往下载",
     version_label: "当前版本：{v}",
+    version_new: "当前版本：{cur} → {new}",
 
     // ── 系统通知标题 ──
     notify_threshold_title: "额度预警",
@@ -388,6 +390,7 @@ const EN: Strings = Strings {
     up_to_date: "Up to date",
     go_download: "Download",
     version_label: "Version: {v}",
+    version_new: "Version: {cur} → {new}",
 
     // ── 系统通知标题 ──
     notify_threshold_title: "Quota alert",
@@ -541,6 +544,7 @@ mod tests {
             up_to_date,
             go_download,
             version_label,
+            version_new,
             // ── 系统通知标题 ──
             notify_threshold_title,
             notify_reset_5h,

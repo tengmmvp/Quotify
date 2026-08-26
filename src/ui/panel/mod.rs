@@ -189,9 +189,7 @@ impl Panel {
                     + 73 // 配置管理区：标题 33 + 按钮 28 + 行后 12
                     + 18 // 关于区纯分隔，无标题：上隙 12 + 下隙 6
                     + 29 // 版本行：描边按钮顶偏移 1 + 高 28
-                    + 16 // 底部余量，按钮边框需完整呈现
-                    // 有新版时版本行上方的「前往下载」行：按钮 30 + 行距 8
-                    + if self.update_available { 38 } else { 0 };
+                    + 16; // 底部余量，按钮边框需完整呈现
                 base + if self.customizing_interval { 40 } else { 10 }
             }
             // 逐段对照 draw_account_picker 的 y 累加链（dy=0）

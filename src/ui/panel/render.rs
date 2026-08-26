@@ -1508,26 +1508,22 @@ impl Renderer {
             None => s.check_update.into(),
         };
         y = self.section_label(target, "", pad, y, w, alpha, true);
-        // 有新版时先给一行下载入口；版本行保持设置页收尾
-        if model.update_available {
-            let bw = 104.0;
-            self.pill_button(
-                target,
-                Hit::OpenDownload,
-                (w - bw) / 2.0,
-                y + 2.0,
-                bw,
-                30.0,
-                s.go_download,
-                alpha,
-                true,
-            );
-            y += 38.0;
-        }
-        // 左「当前版本」12px，右描边小按钮——字号一致、视觉平衡；
-        // 按钮宽随文案自适应，英文失败/新版本文案不折行
-        let ver_line = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
-        let btn_w = (self.measure(&update_label, 12.0, 400, false) + 28.0).max(104.0);
+        // 版本行收尾：有新版时文字带「当前 → 最新」、按钮换「前往下载」
+        let (btn_hit, btn_label) = if model.update_available {
+            (Hit::OpenDownload, s.go_download)
+        } else {
+            (Hit::CheckUpdate, update_label.as_str())
+        };
+        let ver_line = if model.update_available
+            && let Some(Ok(info)) = model.update
+        {
+            s.version_new
+                .replace("{cur}", env!("CARGO_PKG_VERSION"))
+                .replace("{new}", info.tag.trim_start_matches('v'))
+        } else {
+            s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"))
+        };
+        let btn_w = (self.measure(btn_label, 12.0, 400, false) + 28.0).max(104.0);
         self.text(
             target,
             &ver_line,
@@ -1542,12 +1538,12 @@ impl Renderer {
         );
         self.outline_button(
             target,
-            Hit::CheckUpdate,
+            btn_hit,
             w - pad - btn_w,
             y + 1.0,
             btn_w,
             28.0,
-            &update_label,
+            btn_label,
             alpha,
         );
     }

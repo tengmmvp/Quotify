@@ -4,15 +4,16 @@
 
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
+use windows::Win32::Graphics::Direct2D::{D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
+use windows_numerics::Vector2;
 
 use super::{Align, Hit, Renderer};
 use crate::service::whatsnew::NewsItem;
 use crate::ui::panel::anim::ease_out_cubic;
 use crate::ui::panel::model::PanelModel;
 
-/// 关于窗逻辑宽；需容纳最长语言的项目描述单行
-pub const ABOUT_W: f32 = 320.0;
+/// 关于窗逻辑宽
+pub const ABOUT_W: f32 = 500.0;
 
 /// 仓库主页
 pub const REPO_URL: &str = "https://github.com/tengmmvp/Quotify";
@@ -30,6 +31,12 @@ const NEWS_GAP: f32 = 6.0;
 const NEWS_LINE_H: f32 = 16.0;
 /// 动态区首条起点（相对窗顶）；位于描述与双链接等固定区之后
 const NEWS_TOP: f32 = 204.0;
+/// 时间轴列位：轴线与节点、日期、标题与正文
+const NEWS_AXIS_X: f32 = 30.0;
+/// 日期列起点
+const NEWS_DATE_X: f32 = 40.0;
+/// 标题与正文列起点
+const NEWS_BODY_X: f32 = 78.0;
 
 /// 关于窗逻辑高；无动态时为基础布局，有动态逐条累加。
 /// 数值与 draw_about 的 y 推进链同源，布局改动须同步更新
@@ -217,8 +224,19 @@ impl Renderer {
                 Align::Center,
                 false,
             );
+            let items: Vec<(usize, &NewsItem)> = news.iter().take(NEWS_MAX).enumerate().collect();
+            let mut node_cys = Vec::new();
+            let mut yy = dy + NEWS_TOP;
+            for &(i, item) in &items {
+                node_cys.push(yy + 9.0);
+                yy += item_h(item, expanded == Some(i)) + NEWS_GAP;
+            }
+            if let (Some(&first), Some(&last)) = (node_cys.first(), node_cys.last()) {
+                let axis = self.brush(target, self.theme.text_tertiary, alpha * 0.5);
+                self.line(target, NEWS_AXIS_X, first, NEWS_AXIS_X, last, &axis, 1.0);
+            }
             let mut y = dy + NEWS_TOP;
-            for (i, item) in news.iter().take(NEWS_MAX).enumerate() {
+            for &(i, item) in &items {
                 self.news_item(target, model, item, i, expanded == Some(i), y, w, alpha);
                 y += item_h(item, expanded == Some(i)) + NEWS_GAP;
             }
@@ -268,16 +286,63 @@ impl Renderer {
         alpha: f32,
     ) {
         let pad = 24.0;
+        let right = w - pad;
+        let mid = y + 9.0;
         let unread = model.last_news_read.is_none_or(|r| item.date.as_str() > r);
-        // 标题
-        let date_w = self.measure(&item.date, 10.0, 400, false) + 8.0;
-        let new_w = if unread { 36.0 } else { 0.0 }; // NEW 徽标 30 + 右隙 6
-        let title_w = w - pad * 2.0 - date_w - new_w;
+
+        // 节点：未读实心强调色、已读空心三级色；右延短横线接日期列
+        let node = D2D1_ELLIPSE {
+            point: Vector2 {
+                X: NEWS_AXIS_X,
+                Y: mid,
+            },
+            radiusX: 3.5,
+            radiusY: 3.5,
+        };
+        let tick = self.brush(target, self.theme.text_tertiary, alpha * 0.6);
+        self.line(target, NEWS_AXIS_X + 3.5, mid, NEWS_DATE_X, mid, &tick, 1.0);
+        if unread {
+            let b = self.brush(target, self.theme.accent, alpha);
+            target.FillEllipse(&node, &b);
+        } else {
+            let b = self.brush(target, self.theme.text_tertiary, alpha);
+            target.DrawEllipse(&node, &b, 1.0, None);
+        }
+
+        // 日期取 MM-DD
+        self.text(
+            target,
+            &item.date[5..],
+            NEWS_DATE_X,
+            mid - 7.0,
+            36.0,
+            14.0,
+            10.0,
+            400,
+            self.theme.text_tertiary,
+            alpha,
+        );
+
+        // 右端展开/收起箭头，NEW 徽标在其左
+        let arrow_x = right - 4.0;
+        let stroke = self.brush(target, self.theme.text_tertiary, alpha);
+        let (ay, by) = if expanded {
+            (mid + 2.5, mid - 1.5)
+        } else {
+            (mid - 2.5, mid + 1.5)
+        };
+        self.line(target, arrow_x - 3.0, ay, arrow_x, by, &stroke, 1.2);
+        self.line(target, arrow_x, by, arrow_x + 3.0, ay, &stroke, 1.2);
+
+        // 标题；右端为箭头与 NEW 留位，截断宽随 NEW 有无伸缩
+        let new_w = if unread { 36.0 } else { 0.0 }; // NEW 徽标 30 + 左隙 6
+        let title_w = (right - 14.0 - new_w - NEWS_BODY_X).max(40.0);
         let title = self.ellipsize(&item.title, 13.0, title_w, 600, false);
+        let tw = self.measure(&title, 13.0, 600, false);
         self.text(
             target,
             &title,
-            pad,
+            NEWS_BODY_X,
             y,
             title_w,
             18.0,
@@ -286,42 +351,27 @@ impl Renderer {
             self.theme.text_primary,
             alpha,
         );
-        self.text(
-            target,
-            &item.date,
-            w - pad - date_w + 8.0,
-            y + 3.0,
-            date_w,
-            14.0,
-            10.0,
-            400,
-            self.theme.text_tertiary,
-            alpha,
-        );
-        // New 徽标
+
+        // NEW 徽标紧跟标题尾部；上限防越入右端箭头区
         if unread {
-            let left = w - pad - date_w - new_w;
+            let left = (NEWS_BODY_X + tw + 6.0).min(right - 44.0);
+            let badge_rect = D2D_RECT_F {
+                left,
+                top: mid - 6.0,
+                right: left + 30.0,
+                bottom: mid + 6.0,
+            };
             let badge = D2D1_ROUNDED_RECT {
-                rect: D2D_RECT_F {
-                    left,
-                    top: y + 2.0,
-                    right: left + 30.0,
-                    bottom: y + 14.0,
-                },
+                rect: badge_rect,
                 radiusX: 4.0,
                 radiusY: 4.0,
             };
             let b = self.brush(target, self.theme.accent, alpha);
             target.FillRoundedRectangle(&badge, &b);
-            self.text_aligned(
+            self.text_aligned_vc(
                 target,
                 "NEW",
-                &D2D_RECT_F {
-                    left,
-                    top: y + 1.0,
-                    right: left + 30.0,
-                    bottom: y + 14.0,
-                },
+                &badge_rect,
                 9.0,
                 700,
                 [1.0, 1.0, 1.0, 1.0],
@@ -334,13 +384,13 @@ impl Renderer {
         if expanded {
             let mut ly = y + 18.0;
             for line in &item.lines {
-                let t = self.ellipsize(line, 12.0, w - pad * 2.0, 400, false);
+                let t = self.ellipsize(line, 12.0, right - NEWS_BODY_X, 400, false);
                 self.text(
                     target,
                     &t,
-                    pad,
+                    NEWS_BODY_X,
                     ly,
-                    w - pad * 2.0,
+                    right - NEWS_BODY_X,
                     NEWS_LINE_H,
                     12.0,
                     400,
@@ -350,13 +400,13 @@ impl Renderer {
                 ly += NEWS_LINE_H;
             }
         } else if let Some(first) = item.lines.first() {
-            let t = self.ellipsize(first, 12.0, w - pad * 2.0, 400, false);
+            let t = self.ellipsize(first, 12.0, right - NEWS_BODY_X, 400, false);
             self.text(
                 target,
                 &t,
-                pad,
+                NEWS_BODY_X,
                 y + 18.0,
-                w - pad * 2.0,
+                right - NEWS_BODY_X,
                 15.0,
                 12.0,
                 400,
@@ -370,7 +420,7 @@ impl Renderer {
             D2D_RECT_F {
                 left: pad - 6.0,
                 top: y,
-                right: w - pad + 6.0,
+                right: right + 6.0,
                 bottom: y + block_h,
             },
         ));

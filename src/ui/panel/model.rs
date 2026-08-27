@@ -34,6 +34,8 @@ pub struct PanelModel<'a> {
     pub peak_start_raw: &'a str,
     pub peak_end_raw: &'a str,
     pub update: Option<&'a Result<crate::service::update::ReleaseInfo, String>>,
+    pub news: Option<&'a [crate::service::whatsnew::NewsItem]>,
+    pub last_news_read: Option<&'a str>,
 }
 
 impl<'a> PanelModel<'a> {
@@ -73,6 +75,8 @@ impl<'a> PanelModel<'a> {
             peak_start_raw: &app.config.general.peak_start,
             peak_end_raw: &app.config.general.peak_end,
             update: app.update_status.as_ref(),
+            news: app.news.as_deref(),
+            last_news_read: app.config.general.last_news_read.as_deref(),
         }
     }
 }

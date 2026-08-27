@@ -31,6 +31,7 @@ impl Renderer {
         if !panel.adding_account {
             self.back_arrow(target, Hit::Back, pad, y + 6.0);
         }
+        self.x_button(target, Hit::ClosePanel, w - pad - 10.0, y + 6.0);
         let nav_title = if panel.adding_account {
             s.add_account
         } else {

@@ -10,6 +10,26 @@ use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, H
 /// 图标最小边长（px）
 const MIN_PX: i32 = 16;
 
+/// 从嵌入资源加载指定尺寸的独立图标句柄，取 assets/icon.ico 的对应层，
+/// 由调用方销毁；不带 LR_SHARED——共享句柄归系统，销毁会破坏共享缓存
+pub fn resource_icon(px: i32) -> Option<HICON> {
+    let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()? };
+    #[allow(clippy::manual_dangling_ptr)]
+    let resid = 1usize as *const u16;
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::LoadImageW(
+            Some(hinst.into()),
+            windows::core::PCWSTR(resid),
+            windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
+            px,
+            px,
+            Default::default(),
+        )
+        .ok()
+        .map(|h| HICON(h.0))
+    }
+}
+
 /// 加载嵌入资源中的应用图标
 pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
     #[allow(clippy::manual_dangling_ptr)]
@@ -40,6 +60,31 @@ fn tier_color(used_percent: f64) -> (u8, u8, u8) {
     }
 }
 
+/// Q 字轮廓三件（30×30 网格）：外环、内环、尾部斜杠；面板 D2D 路径与
+/// 托盘像素图标共用，几何与 assets/icon.svg 同源，改动两处同步
+pub fn q_outline() -> [Vec<(f32, f32)>; 3] {
+    let ring = |r: f32| -> Vec<(f32, f32)> {
+        (0..24)
+            .map(|i| {
+                let a = (i as f32) * (std::f32::consts::TAU / 24.0);
+                let (s, c) = a.sin_cos();
+                (15.0 + r * c, 14.4 + r * s)
+            })
+            .collect()
+    };
+    [
+        ring(9.2),
+        ring(4.2),
+        // 尾部斜矩形：起点埋进环带避免交界露缝
+        vec![
+            (17.62, 19.84),
+            (21.69, 23.91),
+            (24.51, 21.09),
+            (20.44, 17.02),
+        ],
+    ]
+}
+
 /// 默认 logo 图标
 pub fn logo_icon(px: i32) -> Option<HICON> {
     let px = px.max(MIN_PX);
@@ -52,43 +97,41 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
     let scale = 0.98 * s / 30.0;
     let bias = 0.01 * s;
     let m = |v: f32| v * scale + bias;
-    let polys: [Vec<(f32, f32)>; 3] = [
-        vec![
-            (15.47, 7.1),
-            (14.17, 8.95),
-            (13.27, 9.42),
-            (6.17, 9.42),
-            (6.17, 7.09),
-        ],
-        vec![(24.3, 7.1), (13.14, 22.91), (5.7, 22.91), (16.86, 7.1)],
-        vec![
-            (14.53, 22.91),
-            (15.84, 21.05),
-            (16.74, 20.58),
-            (23.83, 20.58),
-            (23.83, 22.91),
-        ],
-    ];
-    let polys: Vec<Vec<(f32, f32)>> = polys
-        .into_iter()
-        .map(|p| p.into_iter().map(|(x, y)| (m(x), m(y))).collect())
-        .collect();
+    let [outer, inner, tail] = q_outline();
+    let mp = |p: Vec<(f32, f32)>| -> Vec<(f32, f32)> {
+        p.into_iter().map(|(x, y)| (m(x), m(y))).collect()
+    };
+    let (outer, inner, tail) = (mp(outer), mp(inner), mp(tail));
 
     for y in 0..px {
         for x in 0..px {
-            let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
-            let i = ((y * px + x) * 4) as usize;
-            let in_z = polys.iter().any(|p| in_polygon(fx, fy, p));
-            if in_z {
-                buf[i] = 0xFF;
-                buf[i + 1] = 0xFF;
-                buf[i + 2] = 0xFF;
-                buf[i + 3] = 0xFF;
-            } else if in_rounded_rect(fx, fy, ins, ins, side, rr) {
-                buf[i] = 0x2D;
-                buf[i + 1] = 0x2D;
-                buf[i + 2] = 0x2D;
-                buf[i + 3] = 0xFF;
+            // 4× 子采样取覆盖率做边缘抗锯齿，16 = 4×4 采样数
+            let mut hit = 0u32;
+            for sy in 0..4u32 {
+                for sx in 0..4u32 {
+                    let fx = x as f32 + (sx as f32 + 0.5) / 4.0;
+                    let fy = y as f32 + (sy as f32 + 0.5) / 4.0;
+                    let in_q = (in_polygon(fx, fy, &outer) && !in_polygon(fx, fy, &inner))
+                        || in_polygon(fx, fy, &tail);
+                    if in_q || in_rounded_rect(fx, fy, ins, ins, side, rr) {
+                        hit += 1;
+                    }
+                }
+            }
+            let a = (hit * 255 / 16) as u8;
+            if a > 0 {
+                // 颜色按像素中心单判，半透明边缘不混色；
+                // RGB 按覆盖率预乘——HICON 合成按预乘约定
+                let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+                let in_q = (in_polygon(cx, cy, &outer) && !in_polygon(cx, cy, &inner))
+                    || in_polygon(cx, cy, &tail);
+                let v = if in_q { 0xFF } else { 0x2D };
+                let cov = a as f32 / 255.0;
+                let i = ((y * px + x) * 4) as usize;
+                buf[i] = (v as f32 * cov) as u8;
+                buf[i + 1] = (v as f32 * cov) as u8;
+                buf[i + 2] = (v as f32 * cov) as u8;
+                buf[i + 3] = a;
             }
         }
     }
@@ -110,9 +153,11 @@ pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
         for x in 0..px {
             let (fx, fy) = (x as f32 + 0.5 - cx, y as f32 + 0.5 - cy);
             let d = (fx * fx + fy * fy).sqrt();
-            if (d - r_mid).abs() > stroke / 2.0 {
+            let edge = (d - r_mid).abs() - stroke / 2.0;
+            if edge > 0.5 {
                 continue;
             }
+            let cov = (0.5 - edge).clamp(0.0, 1.0);
             // 屏幕角度：12 点方向为 -90°，顺时针增加
             let mut a = fy.atan2(fx).to_degrees();
             if a < -90.0 {
@@ -122,17 +167,17 @@ pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
             // 余量不足 0.4% 视为耗尽，画灰轨道
             let on_arc = !failed && remain > 0.004 && a <= remain * 360.0;
             if on_arc {
-                // 档位色（BGRA）
-                buf[i] = tb;
-                buf[i + 1] = tg;
-                buf[i + 2] = tr;
-                buf[i + 3] = 0xFF;
+                // 档位色（BGRA），RGB 按覆盖率预乘——HICON 合成按预乘约定
+                buf[i] = (tb as f32 * cov) as u8;
+                buf[i + 1] = (tg as f32 * cov) as u8;
+                buf[i + 2] = (tr as f32 * cov) as u8;
+                buf[i + 3] = (0xFF as f32 * cov) as u8;
             } else {
                 // 半透明深灰轨道，深浅任务栏下均可见
-                buf[i] = 0x66;
-                buf[i + 1] = 0x66;
-                buf[i + 2] = 0x66;
-                buf[i + 3] = 0x88;
+                buf[i] = (0x66 as f32 * cov) as u8;
+                buf[i + 1] = (0x66 as f32 * cov) as u8;
+                buf[i + 2] = (0x66 as f32 * cov) as u8;
+                buf[i + 3] = (0x88 as f32 * cov) as u8;
             }
         }
     }

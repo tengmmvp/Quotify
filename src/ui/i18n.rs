@@ -80,6 +80,7 @@ pub struct Strings {
 
     // ── 托盘菜单 ──
     pub settings: &'static str,
+    pub about: &'static str,
     pub exit: &'static str,
 
     // ── 设置 · 当前账号 ──
@@ -152,6 +153,12 @@ pub struct Strings {
     pub version_label: &'static str,
     pub version_new: &'static str,
 
+    // ── 关于窗 ──
+    pub app_desc: &'static str,
+    pub link_repo: &'static str,
+    pub link_issues: &'static str,
+    pub whats_new_section: &'static str,
+
     // ── 系统通知标题 ──
     pub notify_threshold_title: &'static str,
     pub notify_reset_5h: &'static str,
@@ -203,6 +210,7 @@ const ZH: Strings = Strings {
 
     // ── 托盘菜单 ──
     settings: "设置",
+    about: "关于",
     exit: "退出",
 
     // ── 设置 · 当前账号 ──
@@ -275,6 +283,12 @@ const ZH: Strings = Strings {
     version_label: "当前版本：{v}",
     version_new: "当前版本：{cur} → {new}",
 
+    // ── 关于窗 ──
+    app_desc: "Windows 任务栏托盘的 GLM Coding Plan 用量小组件",
+    link_repo: "开源仓库",
+    link_issues: "问题反馈",
+    whats_new_section: "最新动态",
+
     // ── 系统通知标题 ──
     notify_threshold_title: "额度预警",
     notify_reset_5h: "5 小时窗口已重置",
@@ -326,6 +340,7 @@ const EN: Strings = Strings {
 
     // ── 托盘菜单 ──
     settings: "Settings",
+    about: "About",
     exit: "Exit",
 
     // ── 设置 · 当前账号 ──
@@ -397,6 +412,12 @@ const EN: Strings = Strings {
     go_download: "Download",
     version_label: "Version: {v}",
     version_new: "Version: {cur} → {new}",
+
+    // ── 关于窗 ──
+    app_desc: "A Windows tray widget for GLM Coding Plan usage",
+    link_repo: "Repository",
+    link_issues: "Feedback",
+    whats_new_section: "What's New",
 
     // ── 系统通知标题 ──
     notify_threshold_title: "Quota alert",
@@ -489,6 +510,7 @@ mod tests {
             err_update,
             // ── 托盘菜单 ──
             settings,
+            about,
             exit,
             // ── 设置 · 当前账号 ──
             accounts_section,
@@ -553,6 +575,11 @@ mod tests {
             go_download,
             version_label,
             version_new,
+            // ── 关于窗 ──
+            app_desc,
+            link_repo,
+            link_issues,
+            whats_new_section,
             // ── 系统通知标题 ──
             notify_threshold_title,
             notify_reset_5h,

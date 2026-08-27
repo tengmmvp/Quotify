@@ -31,6 +31,8 @@ pub mod msg {
     pub const WM_APP_WAKE_INSTANCE: u32 = WM_APP + 3;
     /// 检查更新结果回传
     pub const WM_APP_UPDATE_RESULT: u32 = WM_APP + 4;
+    /// 仓库动态拉取结果回传
+    pub const WM_APP_NEWS_RESULT: u32 = WM_APP + 5;
 }
 
 /// 用默认浏览器打开链接

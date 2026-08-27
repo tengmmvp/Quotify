@@ -31,6 +31,8 @@ pub struct General {
     pub peak_start: String,
     /// 高峰区间结束 HH:MM
     pub peak_end: String,
+    /// 已读动态的日期（YYYY-MM-DD）
+    pub last_news_read: Option<String>,
 }
 
 impl Default for General {
@@ -46,6 +48,7 @@ impl Default for General {
             notify_reset_weekly_enabled: false,
             peak_start: "14:00".into(),
             peak_end: "18:00".into(),
+            last_news_read: None,
         }
     }
 }
@@ -134,6 +137,8 @@ notify_reset_weekly_enabled = false
 # 高峰区间（工作日生效），HH:MM 格式
 peak_start = "14:00"
 peak_end = "18:00"
+# 已读仓库动态的日期
+last_news_read = ""
 
 # 受监控的账号（建议在设置页添加；此处仅为字段示例）
 # [[accounts]]
@@ -229,6 +234,13 @@ mod tests {
         assert!(!cfg.general.notify_reset_5h_enabled);
         assert!(cfg.accounts.is_empty());
         assert!(cfg.selected.as_deref().unwrap_or("").is_empty());
+        assert!(
+            cfg.general
+                .last_news_read
+                .as_deref()
+                .unwrap_or("")
+                .is_empty()
+        );
     }
 
     /// 损坏文本回退默认配置，不 panic、不部分采用

@@ -10,9 +10,10 @@ use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUn
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU,
-    MF_STRING, MSG, PostQuitMessage, RegisterClassW, SM_CXSMICON, SetWindowLongPtrW,
-    TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WNDCLASSW, WS_POPUP,
+    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
+    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_NULL, WNDCLASSW,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -20,7 +21,7 @@ use crate::api::{FetchError, UsageSnapshot};
 use crate::app::config::Config;
 use crate::platform::instance::TRAY_WND_CLASS;
 use crate::platform::msg::{
-    WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
+    WM_APP_NEWS_RESULT, WM_APP_POLL_RESULT, WM_APP_TRAY, WM_APP_UPDATE_RESULT, WM_APP_WAKE_INSTANCE,
 };
 use crate::platform::wide;
 use crate::service::poller::{
@@ -34,8 +35,10 @@ use crate::ui::panel::layout::INTERVAL_PRESETS;
 use crate::ui::tray::{self, TrayIcon};
 use notify::{NOTIFY_TITLE, check_reset, check_threshold};
 
+/// 菜单命令 ID，定义序与菜单项顺序一致
 const IDM_SETTINGS: u16 = 1001;
-const IDM_EXIT: u16 = 1002;
+const IDM_ABOUT: u16 = 1002;
+const IDM_EXIT: u16 = 1003;
 
 /// 导入配置文件大小上限
 const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
@@ -61,9 +64,13 @@ pub struct App {
     poll_interval: PollInterval,
     tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
     pub(crate) panel: Panel,
+    pub(crate) popup: crate::ui::popup::AccountPopup,
+    pub(crate) about: crate::ui::about::AboutWindow,
     hwnd: Option<HWND>,
     pub(crate) update_status: Option<Result<crate::service::update::ReleaseInfo, String>>,
     update_checking: bool,
+    pub(crate) news: Option<Vec<crate::service::whatsnew::NewsItem>>,
+    news_fetched: bool,
     pub(crate) autostart_enabled: bool,
     last_icon_key: Option<(i64, bool, bool)>,
     threshold_armed_5h: bool,
@@ -91,9 +98,13 @@ impl App {
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
             tray_icon: None,
             panel: Panel::new(),
+            popup: crate::ui::popup::AccountPopup::new(),
+            about: crate::ui::about::AboutWindow::new(),
             hwnd: None,
             update_status: None,
             update_checking: false,
+            news: None,
+            news_fetched: false,
             autostart_enabled: crate::platform::autostart::is_enabled(),
             last_icon_key: None,
             threshold_armed_5h: true,
@@ -140,11 +151,12 @@ impl App {
         if self.last_icon_key == Some(key) {
             return;
         }
-        let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16);
+        // 两倍尺寸给 Shell 缩小显示；无数据态资源优先、手绘兜底
+        let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) * 2;
         let new = match &self.data.snapshot {
             Some(_) => icon::ring_icon(px, used, failed),
             None if failed => icon::ring_icon(px, 0.0, true),
-            None => icon::logo_icon(px),
+            None => icon::resource_icon(px).or_else(|| icon::logo_icon(px)),
         };
         if let Some(new) = new {
             // 先换新再销毁旧：成功时 shell 全程不引用已销毁句柄；NIM_MODIFY
@@ -237,6 +249,7 @@ impl App {
         unsafe {
             let owner = self.hwnd();
             let settings = wide(self.strings.settings);
+            let about = wide(self.strings.about);
             let exit = wide(self.strings.exit);
             let menu: HMENU = CreatePopupMenu().unwrap_or_default();
             if menu.is_invalid() {
@@ -248,7 +261,10 @@ impl App {
                 IDM_SETTINGS as usize,
                 PCWSTR(settings.as_ptr()),
             );
+            let _ = AppendMenuW(menu, MF_STRING, IDM_ABOUT as usize, PCWSTR(about.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit.as_ptr()));
+            // 弹菜单前先激活前台，否则点菜单外不收起[Shell_NotifyIcon 文档要求]
+            let _ = SetForegroundWindow(owner);
             let _ = TrackPopupMenu(
                 menu,
                 TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
@@ -259,6 +275,9 @@ impl App {
                 None,
             );
             let _ = DestroyMenu(menu);
+            // 官方模板要求的收尾：让菜单模式正确归还激活，否则下次弹菜单可能
+            // 立即失焦收不起来
+            let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
         }
     }
 }
@@ -370,11 +389,21 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 })
             {
                 apply_appearance(app);
-                if let Some(p) = app.panel.hwnd {
-                    unsafe {
-                        let _ = InvalidateRect(Some(p), None, true);
-                    }
-                }
+                // 面板与打开中的弹窗、关于窗一并按新主题重绘
+                invalidate_ui(app);
+            }
+            LRESULT(0)
+        }
+        WM_APP_NEWS_RESULT => {
+            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
+            let boxed = wparam.0 as *mut Result<Vec<crate::service::whatsnew::NewsItem>, String>;
+            let result = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
+            if let Some(app) = app_from(hwnd)
+                && let Some(Ok(news)) = result.map(|b| *b)
+            {
+                app.news = Some(news);
+                // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
+                refit_about(app);
             }
             LRESULT(0)
         }
@@ -383,6 +412,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 && let Some(rect) = tray_rect(app)
             {
                 let n = app.config.accounts.len();
+                sync_main_height(app);
                 app.panel.toggle_pin(hwnd, rect, n);
             }
             LRESULT(0)
@@ -390,9 +420,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         WM_COMMAND => {
             let cmd = (wparam.0 & 0xFFFF) as u16;
             match cmd {
-                IDM_EXIT => unsafe {
-                    let _ = DestroyWindow(hwnd);
-                },
                 IDM_SETTINGS => {
                     if let Some(app) = app_from(hwnd)
                         && let Some(rect) = tray_rect(app)
@@ -406,6 +433,42 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         }
                     }
                 }
+                IDM_ABOUT => {
+                    if let Some(app) = app_from(hwnd) {
+                        // 首次开关于窗才拉；不随启动拉，弱网下 raw 域名
+                        // 慢解析会在进程内排队，拖住启动轮询、延后面板首屏
+                        if app.news.is_none() && !app.news_fetched {
+                            app.news_fetched = true;
+                            struct SendHwnd(HWND);
+                            unsafe impl Send for SendHwnd {}
+                            let tray = SendHwnd(hwnd);
+                            std::thread::spawn(move || {
+                                let tray = tray;
+                                let r = crate::service::whatsnew::fetch_latest();
+                                let boxed = Box::into_raw(Box::new(r));
+                                let posted = unsafe {
+                                    PostMessageW(
+                                        Some(tray.0),
+                                        WM_APP_NEWS_RESULT,
+                                        WPARAM(boxed as usize),
+                                        Default::default(),
+                                    )
+                                };
+                                if posted.is_err() {
+                                    drop(unsafe { Box::from_raw(boxed) });
+                                }
+                            });
+                        }
+                        let h = crate::ui::panel::render::about::about_height(
+                            app.news.as_deref(),
+                            app.about.news_expanded,
+                        );
+                        app.about.open(hwnd, h);
+                    }
+                }
+                IDM_EXIT => unsafe {
+                    let _ = DestroyWindow(hwnd);
+                },
                 _ => {}
             }
             LRESULT(0)
@@ -450,9 +513,11 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             relayout_panel(app, panel_hwnd);
         }
         Hit::AccountSwitch => {
+            // 弹窗与面板间有间隙，Preview 下离面防抖会连带误收；置 Pinned 锁定
             app.panel.mode = crate::ui::panel::PanelMode::Pinned;
-            app.panel.view = crate::ui::panel::PanelView::AccountPicker;
-            relayout_panel(app, panel_hwnd);
+            if let Some(p) = app.panel.hwnd {
+                app.popup.open(app.hwnd(), p, app.config.accounts.len());
+            }
         }
         // 悬停徽标无点击语义
         Hit::UsageInfo => {}
@@ -468,6 +533,9 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 app.panel.view = crate::ui::panel::PanelView::Main;
             }
             relayout_panel(app, panel_hwnd);
+        }
+        Hit::ClosePanel => {
+            app.panel.begin_hide(panel_hwnd);
         }
 
         // ── 设置 · 轮询间隔 ──
@@ -508,6 +576,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
+            invalidate_ui(app);
         }
         Hit::Appearance(choice) => {
             app.config.general.appearance = match choice {
@@ -517,11 +586,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             };
             crate::app::config::save(&app.config);
             apply_appearance(app);
-            if let Some(p) = app.panel.hwnd {
-                unsafe {
-                    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(p), None, true);
-                }
-            }
+            invalidate_ui(app);
         }
         Hit::ToggleAutostart => {
             let next = !crate::platform::autostart::is_enabled();
@@ -597,7 +662,10 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::PickAccount(i) => {
             if i < app.config.accounts.len() {
                 select_account(app, i);
+                app.popup.close();
                 app.panel.view = crate::ui::panel::PanelView::Main;
+                // 选完光标还停在弹窗原位（面板外），重起离面计时
+                app.panel.outside_since = None;
                 relayout_panel(app, panel_hwnd);
             }
         }
@@ -679,6 +747,37 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             if let Some(Ok(info)) = app.update_status.as_ref() {
                 crate::platform::open_url(&info.url);
             }
+        }
+
+        // ── 关于窗 ──
+        Hit::LinkRepo => {
+            crate::platform::open_url(crate::ui::panel::render::about::REPO_URL);
+        }
+        Hit::LinkIssues => {
+            crate::platform::open_url(crate::ui::panel::render::about::ISSUES_URL);
+        }
+        Hit::NewsItem(i) => {
+            // 展开/收起互斥；展开即视为已读，已读标记推进到该条日期并落盘
+            let Some(item) = app.news.as_ref().and_then(|n| n.get(i)) else {
+                return;
+            };
+            let need_read = app
+                .config
+                .general
+                .last_news_read
+                .as_deref()
+                .is_none_or(|r| item.date.as_str() > r);
+            if need_read {
+                app.config.general.last_news_read = Some(item.date.clone());
+                crate::app::config::save(&app.config);
+            }
+            app.about.news_expanded = if app.about.news_expanded == Some(i) {
+                None
+            } else {
+                Some(i)
+            };
+            // 展开改变窗高：重定位并重绘关于窗
+            refit_about(app);
         }
     }
     unsafe {
@@ -823,6 +922,56 @@ fn apply_peak(app: &mut App, panel_hwnd: HWND) {
         crate::platform::log("[Quotify] 高峰区间格式无效，应为 HH:MM 且两端不相等");
     }
     relayout_panel(app, panel_hwnd);
+}
+
+/// 面板与打开中的弹窗、关于窗一并失效重绘；外观、语言切换路径共用
+fn invalidate_ui(app: &App) {
+    let hwnds = [
+        app.panel.hwnd,
+        app.popup.hwnd.filter(|_| app.popup.is_open()),
+        app.about.hwnd.filter(|_| app.about.is_open()),
+    ];
+    for h in hwnds.into_iter().flatten() {
+        unsafe {
+            let _ = InvalidateRect(Some(h), None, true);
+        }
+    }
+}
+
+/// 关于窗按当前动态与展开态重排窗高并重绘；未打开时不动。
+/// 按新高重新居中——展开使窗体增长，钉在原顶会在矮屏越出工作区底边
+fn refit_about(app: &mut App) {
+    let Some(a) = app.about.hwnd.filter(|_| app.about.is_open()) else {
+        return;
+    };
+    let h =
+        crate::ui::panel::render::about::about_height(app.news.as_deref(), app.about.news_expanded);
+    unsafe {
+        let monitor = windows::Win32::Graphics::Gdi::MonitorFromWindow(
+            a,
+            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
+            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut mi);
+        let w = (crate::ui::panel::render::about::ABOUT_W * app.about.dpi).round() as i32;
+        let hgt = (h as f32 * app.about.dpi).round() as i32;
+        let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
+        // 矮屏窗高超出工作区时保顶弃底，头部信息不裁
+        let y = (mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - hgt) / 2).max(mi.rcWork.top);
+        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
+            a,
+            None,
+            x,
+            y,
+            w,
+            hgt,
+            windows::Win32::UI::WindowsAndMessaging::SWP_NOZORDER,
+        );
+        let _ = InvalidateRect(Some(a), None, true);
+    }
 }
 
 /// 应用网络代理；立即重建连接并触发一次拉取验证
@@ -1079,6 +1228,13 @@ fn apply_appearance(app: &mut App) {
     if let Some(r) = app.panel.renderer.as_mut() {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }
+    // 弹窗、关于窗与面板同步换肤
+    for r in [&mut app.popup.renderer, &mut app.about.renderer]
+        .into_iter()
+        .flatten()
+    {
+        r.theme = crate::ui::panel::theme::Theme::new(appearance);
+    }
 }
 
 fn sync_main_height(app: &mut App) {
@@ -1174,10 +1330,11 @@ pub fn run() -> i32 {
         app.hwnd = Some(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *app as *mut App as isize);
 
-        let px = GetSystemMetrics(SM_CXSMICON).max(16);
-        let initial = icon::logo_icon(px);
+        // 两倍尺寸给 Shell 缩小显示；资源优先，手绘兜底
+        let px = GetSystemMetrics(SM_CXSMICON).max(16) * 2;
+        let initial = icon::resource_icon(px).or_else(|| icon::logo_icon(px));
         if initial.is_none() {
-            crate::platform::log(&format!("[Quotify] 初始 logo 图标生成失败 (px={px})"));
+            crate::platform::log(&format!("[Quotify] 初始图标加载失败 (px={px})"));
         }
         let initial = initial.unwrap_or_default();
         app.tray_icon = Some(initial);

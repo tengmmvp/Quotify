@@ -28,11 +28,15 @@ use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::render::Renderer;
 use crate::ui::panel::text_edit::EditState;
 use crate::ui::panel::theme::PANEL_WIDTH;
+use crate::ui::{x_of, y_of};
 
 const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 
+/// 弹出/收起动画帧时钟
 const TIMER_ANIM: usize = 1;
+/// 预览失焦收回的去抖时钟
 const TIMER_CLOSE_DEBOUNCE: usize = 2;
+/// 预览/锁定态的光标离面巡检时钟
 pub(crate) const TIMER_OUTSIDE_CHECK: usize = 3;
 /// 分钟级重绘心跳
 const TIMER_MINUTE_TICK: usize = 4;
@@ -56,7 +60,6 @@ pub enum PanelMode {
 pub enum PanelView {
     Main,
     Settings,
-    AccountPicker,
 }
 
 /// 自绘输入的目标字段；设置页字段在前、添加页表单在后，各按所在分区顺序
@@ -273,12 +276,6 @@ impl Panel {
                     + 12; // 底部余量，同顶部留白
                 base + if self.customizing_interval { 38 } else { 0 }
             }
-            // 逐段对照 draw_account_picker 的 y 累加链（dy=0）
-            PanelView::AccountPicker => {
-                // 顶部留白 12 + 导航行 30，返回箭头 + 居中标题
-                42 + accounts as i32 * 44 // 账号行：名称 + 右侧徽标单行
-                    + 12 // 底部余量
-            }
         }
     }
 
@@ -363,8 +360,9 @@ impl Panel {
             self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
             let w = self.px(PANEL_WIDTH);
-            let hold = self.dragged || self.drag_offset.is_some();
-            let (x, y) = if hold {
+            // 拖动进行中（drag_offset）与拖过（dragged）都保持当前位置
+            let moved = self.dragged || self.drag_offset.is_some();
+            let (x, y) = if moved {
                 let mut wr = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut wr);
                 (wr.left, wr.top)
@@ -385,13 +383,14 @@ impl Panel {
             } else {
                 (0, 0)
             };
-            // 拖动后高度受当前位置到工作区底边的空间限制
-            let max_h = if hold {
-                (mi.rcWork.bottom - y - 8).max(self.px(200))
+            // 拖过（含拖动中）保持完整高、允许遮住任务栏——移动与重排交替
+            // 改高会闪跳；锚点弹出仍以工作区为界压扁，防矮屏出屏
+            let h = if moved {
+                self.px(logical_h)
             } else {
-                (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200))
+                let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
+                self.px(logical_h).min(max_h)
             };
-            let h = self.px(logical_h).min(max_h);
             let flags = if show {
                 SWP_SHOWWINDOW | SWP_NOCOPYBITS
             } else {
@@ -402,7 +401,10 @@ impl Panel {
             self.anim_w = w;
             self.anim_full_h = h;
             self.anim_bottom = y + h;
-            self.refresh_scroll(logical_h, h);
+            // 滚动按屏幕内真实可见高度计：面板浮于任务栏之上，遮住任务
+            // 栏的部分同样可见，仅视口越出屏幕底的部分不算可见
+            let visible = h.min((mi.rcMonitor.bottom - y).max(0));
+            self.refresh_scroll(logical_h, visible);
         }
     }
 
@@ -473,7 +475,7 @@ impl Panel {
             .unwrap_or(false)
     }
 
-    fn begin_hide(&mut self, hwnd: HWND) {
+    pub(crate) fn begin_hide(&mut self, hwnd: HWND) {
         self.mode = PanelMode::Hidden;
         self.hovered = false;
         self.adding_account = false;
@@ -807,8 +809,8 @@ impl Panel {
     }
 }
 
-/// 取显示器有效 DPI（百分比 / 96）。
-unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
+/// 取显示器有效 DPI（百分比 / 96）
+pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
     unsafe {
         let mut cx = 0u32;
         let mut cy = 0u32;
@@ -829,8 +831,8 @@ unsafe fn start_anim(hwnd: HWND) {
     }
 }
 
-/// 重挂 TME_LEAVE 离窗跟踪；一次性通知且会被捕获打断，靠反复挂载续命（重复挂载幂等）
-unsafe fn track_leave(hwnd: HWND) {
+/// 重挂 TME_LEAVE 离窗跟踪
+pub(crate) unsafe fn track_leave(hwnd: HWND) {
     unsafe {
         let mut tm = TRACKMOUSEEVENT {
             cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
@@ -927,8 +929,14 @@ pub extern "system" fn panel_wndproc(
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
-                                // 子控件同样算在面板内
-                                let in_panel = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
+                                // 子控件同样算在面板内；账号弹窗是面板的延伸，光标
+                                // 移入其中同样不能触发面板收起
+                                let in_popup = app
+                                    .popup
+                                    .hwnd
+                                    .is_some_and(|ph| w == ph || GetAncestor(w, GA_ROOT) == ph);
+                                let in_panel =
+                                    in_popup || w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                                 // 正在输入则绝不收起
                                 let focus_in_panel = app.panel.input.field.is_some()
                                     || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
@@ -971,15 +979,14 @@ pub extern "system" fn panel_wndproc(
                         ..Default::default()
                     };
                     let _ = GetMonitorInfoW(monitor, &mut mi);
-                    // 四方向都可越出屏幕，仅保留窗口一角在工作区内可抓回
+                    // 四方向都可越出屏幕，仅保留窗口一角（64 物理像素）
+                    // 在工作区内可抓回，上下左右对称
                     let x = (cursor.x - ox).clamp(
                         mi.rcWork.left - w + 64,
                         (mi.rcWork.right - 64).max(mi.rcWork.left - w + 64),
                     );
-                    let y = (cursor.y - oy).clamp(
-                        mi.rcWork.top - (wr.bottom - wr.top) + 64,
-                        mi.rcWork.bottom - 48,
-                    );
+                    let y_min = mi.rcWork.top - (wr.bottom - wr.top) + 64;
+                    let y = (cursor.y - oy).clamp(y_min, (mi.rcWork.bottom - 64).max(y_min));
                     let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
                     return LRESULT(0);
                 }
@@ -1039,7 +1046,7 @@ pub extern "system" fn panel_wndproc(
             }
             WM_MOUSEWHEEL => {
                 let app = app_from_tray(hwnd);
-                // 仅设置/账号选择页可滚；主视图内容恒短于视口，滚了也无内容可显
+                // 仅设置页可滚；主视图内容恒短于视口，滚了也无内容可显
                 if let Some(app) = app
                     && app.panel.view != PanelView::Main
                 {
@@ -1464,7 +1471,8 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
     }
 }
 
-fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
+/// 从子窗口 hwnd 回溯托盘窗口取 App
+pub(crate) fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
     unsafe {
         let parent = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
         if parent == 0 {
@@ -1555,16 +1563,8 @@ fn apply_edit(input: &mut PanelInput, f: impl FnOnce(&mut EditState, &mut String
     *input.active_buf() = t;
 }
 
-fn x_of(l: LPARAM) -> f32 {
-    (l.0 & 0xFFFF) as u16 as i16 as f32
-}
-
-fn y_of(l: LPARAM) -> f32 {
-    ((l.0 >> 16) & 0xFFFF) as u16 as i16 as f32
-}
-
-/// 高度链钉位回归：期望值由 draw_settings / draw_account_picker 的 y 累加链
-/// 推导而来，布局改动须同步更新
+/// 高度链钉位回归：期望值由 draw_settings 的 y 累加链推导而来，
+/// 布局改动须同步更新
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1580,13 +1580,5 @@ mod tests {
         assert_eq!(p.view_height(1), 883);
         p.account_error = true;
         assert_eq!(p.view_height(1), 901);
-    }
-
-    #[test]
-    fn picker_view_height_pinned() {
-        let mut p = Panel::new();
-        p.view = PanelView::AccountPicker;
-        assert_eq!(p.view_height(1), 98);
-        assert_eq!(p.view_height(3), 186);
     }
 }

@@ -16,12 +16,14 @@ use crate::ui::panel::theme::RADIUS;
 
 impl Renderer {
     /// 主视图：顶栏常驻；主体按「无快照、有错误、有数据」三态渲染
+    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn draw_main(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         model: &PanelModel,
         w: f32,
         h: f32,
+        content_h: f32,
         dy: f32,
         alpha: f32,
     ) {
@@ -371,8 +373,8 @@ impl Renderer {
                         );
                     }
                 }
-                // 页脚钉底：有错误时数据时间线、失败原因与重试并存，正常只报数据新鲜度
-                let footer_y = dy + h - 36.0;
+                // 页脚钉底；视口被压矮时装不下内容，钉内容底免叠数据区
+                let footer_y = dy + h.max(content_h) - 36.0;
                 if let Some(e) = model.error {
                     let msg = error_text(s, e);
                     let line = match model.snapshot {

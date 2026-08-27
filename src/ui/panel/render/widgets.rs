@@ -278,6 +278,7 @@ impl Renderer {
         ));
     }
 
+    /// 叉号钮：账号删除与面板关闭共用
     pub(super) unsafe fn x_button(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -446,10 +447,10 @@ impl Renderer {
         if self.logo_geo.is_none() {
             self.logo_geo = self.build_logo_glyph();
         }
-        let Some(geo) = self.logo_geo.clone() else {
+        let Some((ring, tail)) = self.logo_geo.clone() else {
             return;
         };
-        let zb = self.brush(target, [1.0, 1.0, 1.0, 1.0], alpha);
+        let qb = self.brush(target, [1.0, 1.0, 1.0, 1.0], alpha);
         let m = Matrix3x2 {
             M11: size / 30.0,
             M12: 0.0,
@@ -459,42 +460,36 @@ impl Renderer {
             M32: y,
         };
         target.SetTransform(&m);
-        target.FillGeometry(&geo, &zb, None);
+        target.FillGeometry(&ring, &qb, None);
+        target.FillGeometry(&tail, &qb, None);
         target.SetTransform(&Matrix3x2::identity());
     }
 
-    /// 构建白色 Z 字形路径
-    fn build_logo_glyph(&self) -> Option<ID2D1PathGeometry> {
+    /// 构建白色 Q 字路径。环与尾必须拆成两个 geometry：同一 geometry 内
+    /// 两 figure 相交在默认 evenodd 规则下会被挖空，分体两次填充才是并集
+    fn build_logo_glyph(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         unsafe {
-            let geo = self.factory.CreatePathGeometry().ok()?;
-            let sink = geo.Open().ok()?;
-            sink.BeginFigure(Vector2 { X: 15.47, Y: 7.10 }, D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(Vector2 { X: 14.17, Y: 8.95 });
-            sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                point1: Vector2 { X: 13.97, Y: 9.24 },
-                point2: Vector2 { X: 13.63, Y: 9.42 },
-                point3: Vector2 { X: 13.27, Y: 9.42 },
-            });
-            sink.AddLine(Vector2 { X: 6.17, Y: 9.42 });
-            sink.AddLine(Vector2 { X: 6.17, Y: 7.09 });
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.BeginFigure(Vector2 { X: 24.30, Y: 7.10 }, D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(Vector2 { X: 13.14, Y: 22.91 });
-            sink.AddLine(Vector2 { X: 5.70, Y: 22.91 });
-            sink.AddLine(Vector2 { X: 16.86, Y: 7.10 });
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.BeginFigure(Vector2 { X: 14.53, Y: 22.91 }, D2D1_FIGURE_BEGIN_FILLED);
-            sink.AddLine(Vector2 { X: 15.84, Y: 21.05 });
-            sink.AddBezier(&D2D1_BEZIER_SEGMENT {
-                point1: Vector2 { X: 16.04, Y: 20.76 },
-                point2: Vector2 { X: 16.38, Y: 20.58 },
-                point3: Vector2 { X: 16.74, Y: 20.58 },
-            });
-            sink.AddLine(Vector2 { X: 23.83, Y: 20.58 });
-            sink.AddLine(Vector2 { X: 23.83, Y: 22.91 });
-            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            sink.Close().ok()?;
-            Some(geo)
+            let build = |polys: Vec<Vec<(f32, f32)>>| -> Option<ID2D1PathGeometry> {
+                let geo = self.factory.CreatePathGeometry().ok()?;
+                let sink = geo.Open().ok()?;
+                for poly in polys {
+                    let mut pts = poly.into_iter();
+                    let Some((x0, y0)) = pts.next() else {
+                        continue;
+                    };
+                    sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
+                    for (x, y) in pts {
+                        sink.AddLine(Vector2 { X: x, Y: y });
+                    }
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                }
+                sink.Close().ok()?;
+                Some(geo)
+            };
+            let [outer, inner, tail] = crate::ui::icon::q_outline();
+            let ring = build(vec![outer, inner])?;
+            let tail = build(vec![tail])?;
+            Some((ring, tail))
         }
     }
 

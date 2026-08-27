@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 30 30">
+  <!-- Quotify 应用图标 -->
+  <rect x="0.3" y="0.3" width="29.4" height="29.4" rx="3.92" fill="#2D2D2D"/>
+  <circle cx="15" cy="14.4" r="9.2" fill="#FFFFFF"/>
+  <circle cx="15" cy="14.4" r="4.2" fill="#2D2D2D"/>
+  <polygon points="17.62,19.84 21.69,23.91 24.51,21.09 20.44,17.02" fill="#FFFFFF"/>
+</svg>

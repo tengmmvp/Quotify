@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::api::client::{MAX_BODY_BYTES, agent_long};
 
-pub const REPO: &str = "TengMMVP/quotify";
+pub const REPO: &str = "tengmmvp/Quotify";
 
 /// HTTP 错误消息携带的 body 前缀长度（字符数）上限
 const ERR_BODY_CHARS: usize = 120;

@@ -2,8 +2,9 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+pub mod about;
 mod main;
-mod picker;
+pub mod popup;
 mod settings;
 mod widgets;
 
@@ -68,6 +69,7 @@ pub enum Hit {
 
     // ── 导航 ──
     Back,
+    ClosePanel,
 
     // ── 设置 · 轮询间隔 ──
     IntervalPreset(u64),
@@ -111,6 +113,11 @@ pub enum Hit {
     ImportConfig,
     CheckUpdate,
     OpenDownload,
+
+    // ── 关于窗 ──
+    LinkRepo,
+    LinkIssues,
+    NewsItem(usize),
 }
 
 /// Hit 的谓词集中放在枚举旁维护；新增输入框类变体须同步收录
@@ -190,8 +197,6 @@ pub struct Renderer {
     black: ID2D1SolidColorBrush,
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: HashMap<(u32, u16, bool), IDWriteTextFormat>,
-    /// measure_ro 专用格式缓存：&self 上下文无法写 formats，
-    /// 经 RefCell 提供内部可变性
     ro_formats: std::cell::RefCell<HashMap<(&'static str, u32, u16), IDWriteTextFormat>>,
     pub theme: Theme,
     pub hits: Vec<(Hit, D2D_RECT_F)>,
@@ -201,7 +206,7 @@ pub struct Renderer {
     font_fallback: bool,
     target_dpi: f32,
     anim_allowed: bool,
-    logo_geo: Option<ID2D1PathGeometry>,
+    logo_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
     bolt_geo: Option<ID2D1PathGeometry>,
     eye_geo: Option<ID2D1PathGeometry>,
     dash_style: Option<ID2D1StrokeStyle>,
@@ -455,9 +460,11 @@ impl Renderer {
         target.FillRectangle(&bg_rect, &bg_brush);
 
         match view {
-            PanelView::Main => self.draw_main(target, model, w, h, dy, alpha),
+            PanelView::Main => {
+                let content_h = panel.main_h as f32;
+                self.draw_main(target, model, w, h, content_h, dy, alpha)
+            }
             PanelView::Settings => self.draw_settings(target, panel, model, w, dy, alpha),
-            PanelView::AccountPicker => self.draw_account_picker(target, model, w, dy, alpha),
         }
 
         // 峰谷说明卡片最后画，盖过数据行

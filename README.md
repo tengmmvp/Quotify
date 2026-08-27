@@ -13,15 +13,15 @@
 
 ## 预览
 
-|              |                        深色                        |                        浅色                         |
-| :----------: | :------------------------------------------------: | :-------------------------------------------------: |
-| **用量面板** |  ![用量面板深色](docs/screenshots/panelDark.png)   |  ![用量面板浅色](docs/screenshots/panelLight.png)   |
-| **设置面板** | ![设置面板深色](docs/screenshots/settingsDark.png) | ![设置面板浅色](docs/screenshots/settingsLight.png) |
+|              |                        浅色                         |                        深色                        |
+| :----------: | :-------------------------------------------------: | :------------------------------------------------: |
+| **用量面板** |  ![用量面板浅色](docs/screenshots/panelLight.png)   |  ![用量面板深色](docs/screenshots/panelDark.png)   |
+| **设置面板** | ![设置面板浅色](docs/screenshots/settingsLight.png) | ![设置面板深色](docs/screenshots/settingsDark.png) |
 
 ## 特性
 
 - **原生精致**：原生 UI 渲染，无 Electron、无运行时依赖
-- **极低开销**：单文件 exe 约 1.6MB；纯软件渲染不拉起显卡驱动栈，常驻内存约 30MB 以内、零 CPU 占用
+- **极低开销**：单文件 exe 约 1.7MB；纯软件渲染不拉起显卡驱动栈，常驻内存约 30MB 以内、零 CPU 占用
 - **绿色便携**：免安装，exe 放到任意目录即可运行，配置随行（同目录 `config.toml`），整体搬移不丢状态
 
 ## 功能

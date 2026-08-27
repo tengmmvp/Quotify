@@ -147,8 +147,16 @@ pub struct UsageSnapshot {
     pub five_hour: Option<QuotaBucket>,
     pub weekly: Option<QuotaBucket>,
     pub mcp: Option<McpUsage>,
+    pub token_stats: Option<TokenStats>,
     pub balance: Option<Balance>,
     pub queried_at: DateTime<Local>,
+}
+
+/// Token 消耗合计：今日（本地 0 点起）与近 7 天（7 天前 0 点起）
+#[derive(Debug, Clone, Copy)]
+pub struct TokenStats {
+    pub today: f64,
+    pub week: f64,
 }
 
 /// 账户余额，仅国内版
@@ -381,6 +389,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
         five_hour,
         weekly,
         mcp,
+        token_stats: None,
         balance: None,
         queried_at: Local::now(),
     }
@@ -440,6 +449,54 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
         return Err(FetchError::EmptyLimits);
     }
     Ok(parse_usage(data))
+}
+
+/// 解析 model-usage 响应取区间 token 总消耗：优先服务端合计
+/// `data.totalUsage.totalTokensUsage`，缺失时回退把所有模型所有时间点
+/// 的 tokensUsage 逐点相加。信封校验同 quota
+pub fn parse_token_total(body: &str) -> Result<f64, FetchError> {
+    let v: Value =
+        serde_json::from_str(body).map_err(|e| FetchError::Api(format!("parse failed: {e}")))?;
+    if v.get("success").and_then(Value::as_bool) == Some(false) {
+        let msg = v
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let code = v.get("code").and_then(Value::as_i64);
+        return Err(inband_error(code, msg));
+    }
+    if let Some(code) = v.get("code").and_then(Value::as_i64)
+        && code != 200
+    {
+        let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
+        return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
+    }
+    let data = v.get("data").unwrap_or(&Value::Null);
+    // 服务端合计为权威值，缺失时回退逐点求和
+    if let Some(total) = data
+        .get("totalUsage")
+        .and_then(|t| t.get("totalTokensUsage"))
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite())
+    {
+        return Ok(total);
+    }
+    let models = data
+        .get("modelDataList")
+        .and_then(Value::as_array)
+        .ok_or_else(|| FetchError::Api("missing modelDataList".into()))?;
+    let mut total = 0.0;
+    for model in models {
+        let Some(points) = model.get("tokensUsage").and_then(Value::as_array) else {
+            continue;
+        };
+        for p in points {
+            if let Some(n) = p.as_f64().filter(|v| *v > 0.0) {
+                total += n;
+            }
+        }
+    }
+    Ok(total)
 }
 
 #[cfg(test)]
@@ -773,5 +830,50 @@ mod tests {
         assert_eq!(mcp.details.len(), 3);
         assert_eq!(mcp.details[0].model_code, "search-prime");
         assert!(mcp.resets_at.is_some());
+    }
+
+    #[test]
+    fn token_total_sums_all_models_and_points() {
+        let body = r#"{
+            "success": true,
+            "code": 200,
+            "data": {
+                "x_time": ["08-27 10:00", "08-27 11:00"],
+                "modelDataList": [
+                    { "modelName": "GLM-5.3", "tokensUsage": [1200, 3400] },
+                    { "modelName": "GLM-5.3-Flash", "tokensUsage": [500, 0] },
+                    { "modelName": "broken", "tokensUsage": null }
+                ]
+            }
+        }"#;
+        assert!((parse_token_total(body).unwrap() - 5100.0).abs() < 1e-9);
+    }
+
+    /// 服务端合计字段为权威值，优先于点位求和
+    #[test]
+    fn token_total_prefers_server_side_summary() {
+        let body = r#"{
+            "success": true,
+            "code": 200,
+            "data": {
+                "totalUsage": { "totalTokensUsage": 9999, "totalModelCallCount": 42 },
+                "modelDataList": [
+                    { "modelName": "GLM-5.3", "tokensUsage": [100, 200] }
+                ]
+            }
+        }"#;
+        assert_eq!(parse_token_total(body).unwrap(), 9999.0);
+    }
+
+    #[test]
+    fn token_total_envelope_and_shape_errors() {
+        // 信封失败
+        let err = parse_token_total(r#"{ "success": false, "msg": "boom" }"#).unwrap_err();
+        assert!(matches!(err, FetchError::Api(_)));
+        // 缺 modelDataList
+        assert!(parse_token_total(r#"{ "success": true, "data": {} }"#).is_err());
+        // 空模型表合法，总和为 0
+        let body = r#"{ "success": true, "code": 200, "data": { "modelDataList": [] } }"#;
+        assert_eq!(parse_token_total(body).unwrap(), 0.0);
     }
 }

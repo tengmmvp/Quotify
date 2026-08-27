@@ -3,7 +3,7 @@ name = "quotify"
 version = "1.0.2"
 edition = "2024"
 description = "GLM Coding Plan usage widget for the Windows taskbar tray"
-license = "GPL-3.0-only"
+license = "Apache-2.0"
 
 [[bin]]
 name = "Quotify"

@@ -11,7 +11,7 @@ pub fn compact_number(v: f64) -> String {
         return format!("{}", v as i64);
     }
     let (scaled, suffix) = if abs >= 1e9 {
-        (v / 1e9, "G")
+        (v / 1e9, "B")
     } else if abs >= 1e6 {
         (v / 1e6, "M")
     } else {
@@ -118,7 +118,7 @@ mod tests {
         assert_eq!(compact_number(4233.0), "4.2k");
         assert_eq!(compact_number(10000.0), "10k");
         assert_eq!(compact_number(1_200_000.0), "1.2M");
-        assert_eq!(compact_number(3_400_000_000.0), "3.4G");
+        assert_eq!(compact_number(3_400_000_000.0), "3.4B");
         assert_eq!(compact_number(1200.0), "1.2k");
         assert_eq!(compact_number(999.0), "999");
     }

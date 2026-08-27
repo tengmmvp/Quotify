@@ -327,6 +327,51 @@ impl Renderer {
                         );
                     }
 
+                    if let Some(ts) = &snap.token_stats {
+                        y += 6.0;
+                        self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
+                        y += 14.0;
+                        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+                        target.FillRectangle(
+                            &D2D_RECT_F {
+                                left: pad,
+                                top: y + 1.0,
+                                right: pad + 3.0,
+                                bottom: y + 13.0,
+                            },
+                            &bar,
+                        );
+                        self.text(
+                            target,
+                            s.token_usage_section,
+                            pad + 7.0,
+                            y,
+                            w - pad * 2.0 - 7.0,
+                            17.0,
+                            12.0,
+                            600,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
+                        y += 22.0;
+                        y = self.leader_row(
+                            target,
+                            s.today_tokens,
+                            &fmt::compact_number(ts.today),
+                            y,
+                            w,
+                            alpha,
+                        );
+                        y = self.leader_row(
+                            target,
+                            s.week_tokens,
+                            &fmt::compact_number(ts.week),
+                            y,
+                            w,
+                            alpha,
+                        );
+                    }
+
                     if let Some(b) = &snap.balance {
                         y += 6.0;
                         self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
@@ -551,6 +596,61 @@ impl Renderer {
             );
         }
         y + 52.0
+    }
+
+    /// 票据合计行：左 label、右数值，中间引导点自动填满；返回下一行 y
+    unsafe fn leader_row(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &str,
+        value: &str,
+        y: f32,
+        w: f32,
+        alpha: f32,
+    ) -> f32 {
+        let pad = layout::CONTENT_PAD;
+        let row_h = 19.0;
+        self.text(
+            target,
+            label,
+            pad,
+            y + 1.0,
+            (w - pad * 2.0) * 0.4,
+            row_h,
+            12.0,
+            400,
+            self.theme.text_secondary,
+            alpha,
+        );
+        let vw = self.measure(value, 12.0, 500, true) + 6.0;
+        self.text_mono_r(
+            target,
+            value,
+            w - pad - vw,
+            y,
+            vw,
+            row_h,
+            12.0,
+            500,
+            self.theme.text_primary,
+            alpha,
+        );
+        // 引导点铺在 label 右端到数值左端之间的行视觉中心上
+        let label_w = self.measure(label, 12.0, 400, false);
+        let cy = y + 10.0;
+        let dot = self.brush(target, self.theme.text_tertiary, alpha * 0.55);
+        let mut x = pad + label_w + 8.0;
+        let end = w - pad - vw - 8.0;
+        while x <= end {
+            let e = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
+                point: windows_numerics::Vector2 { X: x, Y: cy },
+                radiusX: 0.75,
+                radiusY: 0.75,
+            };
+            target.FillEllipse(&e, &dot);
+            x += 5.0;
+        }
+        y + row_h
     }
 
     /// 「高峰」徽标：闪电 + 文字居标题行右侧，悬停命中登记 UsageInfo

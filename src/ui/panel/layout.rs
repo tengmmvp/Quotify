@@ -84,14 +84,15 @@ pub fn add_page_height(team: bool) -> i32 {
     338 + if team { 106 } else { 0 }
 }
 
-/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态随指标行数与余额块伸缩，
-/// 各段对照 draw_main 的 y 推进链（顶部留白 16 + 顶栏 52 + 刊头段 40 +
-/// 指标行 52×n + 余额块 40 + 尾段 42[内容底隙 6 + footer 36]）
-pub fn main_view_height(has_data: bool, rows: usize, has_balance: bool) -> i32 {
+/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态随指标行数与统计、
+/// 余额块伸缩，各段对照 draw_main 的 y 推进链（顶部留白 16 + 顶栏 52 +
+/// 刊头段 40 + 指标行 52×n + Token 消耗块 80[前隙 6 + 推进 14 + 标题 22
+/// + 两行 38] + 余额块 40 + 尾段 42[内容底隙 6 + footer 36]）
+pub fn main_view_height(has_data: bool, rows: usize, has_stats: bool, has_balance: bool) -> i32 {
     if !has_data {
         return 300;
     }
-    16 + 52 + 40 + rows as i32 * 52 + has_balance as i32 * 40 + 42
+    16 + 52 + 40 + rows as i32 * 52 + has_stats as i32 * 80 + has_balance as i32 * 40 + 42
 }
 
 /// 钉位回归：期望值由渲染 y 链推导而来，布局改动须同步更新
@@ -133,9 +134,11 @@ mod tests {
 
     #[test]
     fn main_view_height_pinned() {
-        assert_eq!(main_view_height(false, 0, false), 300);
-        assert_eq!(main_view_height(true, 0, false), 150);
-        assert_eq!(main_view_height(true, 1, false), 202);
-        assert_eq!(main_view_height(true, 3, true), 346);
+        assert_eq!(main_view_height(false, 0, false, false), 300);
+        assert_eq!(main_view_height(true, 0, false, false), 150);
+        assert_eq!(main_view_height(true, 1, false, false), 202);
+        assert_eq!(main_view_height(true, 3, false, true), 346);
+        assert_eq!(main_view_height(true, 3, true, true), 426);
+        assert_eq!(main_view_height(true, 2, true, false), 334);
     }
 }

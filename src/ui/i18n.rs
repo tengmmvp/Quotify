@@ -49,6 +49,9 @@ pub struct Strings {
     pub mcp_tools: &'static str,
     pub resets_line: &'static str,
     pub used_of: &'static str,
+    pub token_usage_section: &'static str,
+    pub today_tokens: &'static str,
+    pub week_tokens: &'static str,
     pub balance_label: &'static str,
 
     // ── 主视图 · 峰谷 ──
@@ -184,6 +187,9 @@ const ZH: Strings = Strings {
     mcp_tools: "MCP 工具",
     resets_line: "{t}后重置",
     used_of: "已用 {cur} / {tot}",
+    token_usage_section: "Token 消耗",
+    today_tokens: "今日",
+    week_tokens: "本周",
     balance_label: "账户余额",
 
     // ── 主视图 · 峰谷 ──
@@ -314,6 +320,9 @@ const EN: Strings = Strings {
     mcp_tools: "MCP tools",
     resets_line: "Resets in {t}",
     used_of: "{cur} of {tot} used",
+    token_usage_section: "TOKEN",
+    today_tokens: "Today",
+    week_tokens: "Week",
     balance_label: "BALANCE",
 
     // ── 主视图 · 峰谷 ──
@@ -488,6 +497,9 @@ mod tests {
             mcp_tools,
             resets_line,
             used_of,
+            token_usage_section,
+            today_tokens,
+            week_tokens,
             balance_label,
             // ── 主视图 · 峰谷 ──
             peak_badge,

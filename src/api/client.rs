@@ -3,10 +3,12 @@
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use chrono::Timelike;
 use serde_json::Value;
 
 use super::{
-    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, UsageSnapshot, parse_response,
+    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, TokenStats, UsageSnapshot,
+    parse_response, parse_token_total,
 };
 
 /// body 读取硬上限
@@ -109,11 +111,72 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         }
         other => other?,
     };
+    // Token 消耗合计与余额均为附加信息：端点失败只缺对应块，不拖垮主用量
+    snap.token_stats = fetch_token_stats(spec.platform, &spec.api_key, team)
+        .ok()
+        .flatten();
     if spec.platform == Platform::Cn {
-        // 余额是附加信息：端点失败只缺余额行，不拖垮主用量展示
         snap.balance = fetch_balance(&spec.api_key).ok().flatten();
     }
     Ok(snap)
+}
+
+/// Token 消耗合计：今日（本地 0 点起）与近 7 天（7 天前 0 点起）各一次
+/// 区间请求，合计优先取服务端 totalUsage。
+fn fetch_token_stats(
+    platform: Platform,
+    api_key: &str,
+    team: Option<(&str, &str)>,
+) -> Result<Option<TokenStats>, FetchError> {
+    let now = chrono::Local::now();
+    let end = stamp(
+        &now.with_minute(59)
+            .and_then(|t| t.with_second(59))
+            .unwrap_or(now),
+    );
+    let today_start = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).single());
+    let week_start = today_start.map(|t| t - chrono::Duration::days(7));
+    let (Some(today_start), Some(week_start)) = (today_start, week_start) else {
+        return Ok(None);
+    };
+
+    let mut extra = Vec::new();
+    if let Some((org, project)) = team {
+        extra.push(("Bigmodel-Organization", org));
+        extra.push(("Bigmodel-Project", project));
+    }
+    let query = |start: &str| {
+        let mut q = format!("?startTime={start}&endTime={end}");
+        if team.is_some() {
+            q.push_str("&type=3");
+        }
+        q
+    };
+    let url = |start: &str| {
+        format!(
+            "{}/api/monitor/usage/model-usage{}",
+            platform.base_url(),
+            query(start)
+        )
+    };
+    let get = |start: &str| -> Result<f64, FetchError> {
+        let body = http_get_text(&agent_short(), &url(start), api_key, &extra)?;
+        parse_token_total(&body)
+    };
+    Ok(Some(TokenStats {
+        today: get(&stamp(&today_start))?,
+        week: get(&stamp(&week_start))?,
+    }))
+}
+
+/// 时间戳 → `YYYY-MM-DD HH:mm:ss`，空格百分号编码后可直接拼 URL
+fn stamp(dt: &chrono::DateTime<chrono::Local>) -> String {
+    dt.format("%Y-%m-%d %H:%M:%S")
+        .to_string()
+        .replace(' ', "%20")
 }
 
 /// 账户余额[仅国内版]

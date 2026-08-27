@@ -2,10 +2,10 @@
 
 # Quotify
 
-<a href="https://github.com/TengMMVP/quotify/releases"><img src="https://img.shields.io/github/v/release/TengMMVP/quotify?style=for-the-badge&label=Release&color=2EA043" alt="Release"></a>
+<a href="https://github.com/tengmmvp/Quotify/releases"><img src="https://img.shields.io/github/v/release/tengmmvp/Quotify?style=for-the-badge&label=Release&color=2EA043" alt="Release"></a>
 <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.85%2B-DEA584?style=for-the-badge&logo=rust" alt="Rust 1.85+"></a>
-<a href="https://github.com/TengMMVP/quotify/releases"><img src="https://img.shields.io/badge/Platform-Windows_10%2F11-0078D4?style=for-the-badge&logo=windows11" alt="Platform"></a>
-<a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-6F42C1?style=for-the-badge" alt="License"></a>
+<a href="https://github.com/tengmmvp/Quotify/releases"><img src="https://img.shields.io/badge/Platform-Windows_10%2F11-0078D4?style=for-the-badge&logo=windows11" alt="Platform"></a>
+<a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache--2.0-6F42C1?style=for-the-badge" alt="License"></a>
 
 </div>
 
@@ -33,7 +33,7 @@
 
 ## 使用
 
-1. **下载运行**：从 [Releases](https://github.com/TengMMVP/quotify/releases) 下载 `Quotify.exe` 放到任意目录，双击即用
+1. **下载运行**：从 [Releases](https://github.com/tengmmvp/Quotify/releases) 下载 `Quotify.exe` 放到任意目录，双击即用
 2. **添加账号**：悬停托盘图标弹出用量面板 → 点击齿轮进入设置面板 → 填 API key、选择平台即可开始使用
 3. **日常查看**：环形图标常驻托盘，颜色即余量档位；悬停看详情，点击锁定面板
 4. **配置文件**：所有状态保存在 exe 同目录 `config.toml`，便携可迁移；内含明文 key，请勿分享该文件
@@ -50,4 +50,4 @@ cargo build --release    # 产物 target/release/Quotify.exe
 
 ## License
 
-本项目遵循 [GPL-3.0](LICENSE) 许可证。
+本项目遵循 [Apache-2.0](LICENSE) 许可证。

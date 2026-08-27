@@ -467,6 +467,10 @@ impl Panel {
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
         }
+        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_brush_cache();
+        }
         // 收起后到下次打开前不再绘制，归还工作集把静止内存压回托盘档；
         // 重开时的软缺页按次一次性发生，换常驻低占用
         crate::platform::trim_working_set();

@@ -750,6 +750,12 @@ impl Renderer {
         }
     }
 
+    /// 收起时清空画刷缓存：键含动画 alpha 的量化档位，淡入每帧一档，
+    /// 不清会随开合次数缓慢累积；下次打开首帧按需重建，成本可忽略
+    pub(crate) fn clear_brush_cache(&mut self) {
+        self.brushes.clear();
+    }
+
     /// 建立或复用 HwndRenderTarget；失败返回 None
     unsafe fn ensure_target(
         &mut self,

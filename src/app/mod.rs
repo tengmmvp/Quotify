@@ -405,11 +405,20 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let boxed = wparam.0 as *mut Result<Vec<crate::service::whatsnew::NewsItem>, String>;
             let result = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
             if let Some(app) = app_from(hwnd)
-                && let Some(Ok(news)) = result.map(|b| *b)
+                && let Some(result) = result.map(|b| *b)
             {
-                app.news = Some(news);
-                // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
-                refit_about(app);
+                match result {
+                    Ok(news) => {
+                        app.news = Some(news);
+                        // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
+                        refit_about(app);
+                    }
+                    Err(e) => {
+                        crate::platform::log(&format!("[Quotify] 动态拉取失败: {e}"));
+                        // 复位闸门，下次打开关于窗可重试
+                        app.news_fetched = false;
+                    }
+                }
             }
             LRESULT(0)
         }

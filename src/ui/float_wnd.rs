@@ -144,6 +144,10 @@ impl FloatWnd {
                 let _ = KillTimer(Some(h), TIMER_ANIM);
             }
         }
+        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_brush_cache();
+        }
     }
 }
 

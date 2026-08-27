@@ -198,8 +198,14 @@ impl App {
         if let Some(p) = self.panel.hwnd {
             relayout_panel(self, p);
         }
-        // UI 更新完毕即静止，归还工作集保持低内存
-        crate::platform::trim_working_set();
+        // UI 可见期间跳过修剪：刚用过的页面被立即换出、下轮再缺页换回，
+        // 往返纯亏；静止归还交给收起路径兜底
+        let ui_visible = self.panel.mode != crate::ui::panel::PanelMode::Hidden
+            || self.popup.is_open()
+            || self.about.is_open();
+        if !ui_visible {
+            crate::platform::trim_working_set();
+        }
     }
 
     fn check_notifications(&mut self, snap: &UsageSnapshot) {
@@ -928,8 +934,8 @@ fn apply_peak(app: &mut App, panel_hwnd: HWND) {
 fn invalidate_ui(app: &App) {
     let hwnds = [
         app.panel.hwnd,
-        app.popup.hwnd.filter(|_| app.popup.is_open()),
-        app.about.hwnd.filter(|_| app.about.is_open()),
+        app.popup.wnd.hwnd.filter(|_| app.popup.is_open()),
+        app.about.wnd.hwnd.filter(|_| app.about.is_open()),
     ];
     for h in hwnds.into_iter().flatten() {
         unsafe {
@@ -941,7 +947,7 @@ fn invalidate_ui(app: &App) {
 /// 关于窗按当前动态与展开态重排窗高并重绘；未打开时不动。
 /// 按新高重新居中——展开使窗体增长，钉在原顶会在矮屏越出工作区底边
 fn refit_about(app: &mut App) {
-    let Some(a) = app.about.hwnd.filter(|_| app.about.is_open()) else {
+    let Some(a) = app.about.wnd.hwnd.filter(|_| app.about.is_open()) else {
         return;
     };
     let h =
@@ -956,8 +962,8 @@ fn refit_about(app: &mut App) {
             ..Default::default()
         };
         let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut mi);
-        let w = (crate::ui::panel::render::about::ABOUT_W * app.about.dpi).round() as i32;
-        let hgt = (h as f32 * app.about.dpi).round() as i32;
+        let w = (crate::ui::panel::render::about::ABOUT_W * app.about.wnd.dpi).round() as i32;
+        let hgt = (h as f32 * app.about.wnd.dpi).round() as i32;
         let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
         // 矮屏窗高超出工作区时保顶弃底，头部信息不裁
         let y = (mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - hgt) / 2).max(mi.rcWork.top);
@@ -991,6 +997,22 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
+/// 警告级 OK/Cancel 确认框，取消返回 false；导出明文与导入清空共用
+fn confirm_box(app: &App, title: &str, body: &str) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW};
+    let title = wide(title);
+    let body = wide(body);
+    let r = unsafe {
+        MessageBoxW(
+            Some(app.hwnd()),
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OKCANCEL | MB_ICONWARNING,
+        )
+    };
+    r == IDOK
+}
+
 /// 导出配置为明文 JSON
 fn export_config(app: &App) {
     use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
@@ -1001,7 +1023,14 @@ fn export_config(app: &App) {
             let _ = KillTimer(Some(panel), crate::ui::panel::TIMER_OUTSIDE_CHECK);
         }
     }
-    let picked = crate::platform::save_dialog("quotify-config.json");
+    // 风险知情先于选位置：敏感内容的告知应前置；取消则连保存对话框
+    // 都不出，静默中止导出、无 toast
+    let confirmed = confirm_box(
+        app,
+        app.strings.export_confirm_title,
+        app.strings.export_confirm_body,
+    );
+    let picked = confirmed.then(|| crate::platform::save_dialog("quotify-config.json"));
     if let Some(panel) = app.panel.hwnd {
         unsafe {
             let _ = SetTimer(
@@ -1012,36 +1041,24 @@ fn export_config(app: &App) {
             );
         }
     }
-    let Some(path) = picked else {
+    let Some(path) = picked.flatten() else {
         return;
     };
     let body = match serde_json::to_string_pretty(&app.config)
         .map_err(|e| e.to_string())
         .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
     {
-        Ok(()) => app.strings.export_done.to_string(),
+        Ok(()) => {
+            // 导出文件同为明文 key 落盘，与 config 同标准收紧
+            crate::platform::secure_file_acl(&path);
+            app.strings.export_done.to_string()
+        }
         Err(e) => {
             crate::platform::log(&format!("[Quotify] 导出失败: {e}"));
             app.strings.export_failed.to_string()
         }
     };
     crate::platform::notify::show(NOTIFY_TITLE, &body);
-}
-
-/// 导入的文件不含账号时等于清空现有配置，弹框确认防误删
-fn confirm_import_wipe(app: &App) -> bool {
-    use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW};
-    let title = wide(app.strings.import_confirm_title);
-    let body = wide(app.strings.import_confirm_body);
-    let r = unsafe {
-        MessageBoxW(
-            Some(app.hwnd()),
-            PCWSTR(body.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            MB_OKCANCEL | MB_ICONWARNING,
-        )
-    };
-    r == IDOK
 }
 
 /// 导入配置 JSON；模态期间冻结面板巡检防止误收起
@@ -1095,7 +1112,11 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
         Some(cfg) => {
             if cfg.accounts.is_empty()
                 && !app.config.accounts.is_empty()
-                && !confirm_import_wipe(app)
+                && !confirm_box(
+                    app,
+                    app.strings.import_confirm_title,
+                    app.strings.import_confirm_body,
+                )
             {
                 return;
             }
@@ -1229,7 +1250,7 @@ fn apply_appearance(app: &mut App) {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }
     // 弹窗、关于窗与面板同步换肤
-    for r in [&mut app.popup.renderer, &mut app.about.renderer]
+    for r in [&mut app.popup.wnd.renderer, &mut app.about.wnd.renderer]
         .into_iter()
         .flatten()
     {

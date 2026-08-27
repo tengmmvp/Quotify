@@ -25,7 +25,7 @@ impl Renderer {
         let s = model.strings;
         let pad = layout::CONTENT_PAD;
         let cw = w - pad * 2.0;
-        let mut y = dy + 12.0;
+        let mut y = dy + layout::SETTINGS_EDGE_PAD;
 
         // ── 导航栏 ──
         if !panel.adding_account {
@@ -54,7 +54,7 @@ impl Renderer {
             Align::Center,
             false,
         );
-        y += 30.0;
+        y += layout::NAV_H;
 
         // ── 账号：设置页首项即数据来源；添加页此处标题用「账号信息」──
         let section = if panel.adding_account {
@@ -239,7 +239,7 @@ impl Renderer {
                 cw,
                 alpha,
             );
-            y += 40.0 + 8.0;
+            y += layout::ACCOUNT_CARD_H;
             if matches!(model.error, Some(crate::api::FetchError::Auth)) {
                 self.text(
                     target,
@@ -253,7 +253,7 @@ impl Renderer {
                     self.theme.danger,
                     alpha,
                 );
-                y += 18.0;
+                y += layout::AUTH_ERROR_H;
             }
         }
         // 添加账号独占一行：占满内容区，视觉对称
@@ -268,7 +268,7 @@ impl Renderer {
             alpha,
             false,
         );
-        y += 36.0;
+        y += layout::ADD_BTN_ROW_H;
 
         // ── 轮询间隔：分段第 5 段「自定义」，选中时下方展开输入行 ──
         y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
@@ -345,7 +345,7 @@ impl Renderer {
                 s.apply,
                 alpha,
             );
-            y = iy + 38.0;
+            y = iy + layout::CUSTOMIZE_EXTRA_H;
         }
 
         // ── 通知 ──
@@ -486,7 +486,7 @@ impl Renderer {
                 );
             }
         }
-        y = pky + layout::INPUT_H + 8.0;
+        y = pky + layout::INPUT_H + layout::PEAK_TAIL_GAP;
 
         // ── 通用：语言 / 外观 / 开机自启 ──
         y = self.section_label(target, s.settings_general, pad, y, w, alpha, true);
@@ -511,7 +511,7 @@ impl Renderer {
             cw,
             alpha,
         );
-        y += 2.0;
+        y += layout::CHOICE_ROW_TAIL;
         y = self.sub_label(target, s.appearance_section, pad, y, cw, alpha);
         let themes: [(Hit, &str); 3] = [
             (Hit::Appearance(AppearanceChoice::System), s.follow_system),
@@ -532,7 +532,7 @@ impl Renderer {
             cw,
             alpha,
         );
-        y += 2.0;
+        y += layout::CHOICE_ROW_TAIL;
         y = self.toggle_row(
             target,
             Hit::ToggleAutostart,
@@ -568,7 +568,7 @@ impl Renderer {
             panel.input.field == Some(InputField::Proxy),
             alpha,
         );
-        y = py + layout::INPUT_H + 6.0;
+        y = py + layout::INPUT_H + layout::PROXY_TAIL_GAP;
 
         // ── 配置管理：导出 / 导入，位于关于区之前 ──
         y = self.section_label(target, s.backup_section, pad, y, w, alpha, true);
@@ -594,7 +594,7 @@ impl Renderer {
             s.import_config,
             alpha,
         );
-        y += 28.0 + 9.0;
+        y += layout::BACKUP_ROW_H;
 
         // ── 关于：检查更新 + 版本，位于底部 ──
         let update_label = match model.update {
@@ -665,7 +665,7 @@ impl Renderer {
         let mut ny = y;
         if rule {
             self.divider(target, x, ny + 2.0, _w - x * 2.0, alpha);
-            ny += 12.0;
+            ny += layout::SECTION_RULE_GAP;
         }
         if !label.is_empty() {
             let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
@@ -690,7 +690,7 @@ impl Renderer {
                 self.theme.text_tertiary,
                 alpha,
             );
-            ny + 21.0
+            ny + layout::SECTION_LABEL_H
         } else {
             // 纯分隔无标题，只留少量空隙给紧随内容
             ny + 6.0
@@ -720,7 +720,7 @@ impl Renderer {
             self.theme.text_secondary,
             alpha,
         );
-        y + 21.0
+        y + layout::SECTION_LABEL_H
     }
 
     /// 自绘输入框：光标用系统 CreateCaret，IME 组合窗随光标定位。
@@ -980,7 +980,7 @@ impl Renderer {
         w: f32,
         alpha: f32,
     ) -> f32 {
-        let h = 30.0;
+        let h = layout::SEGMENTED_H;
         let n = items.len().max(1) as f32;
         let seg_w = w / n;
         let track = D2D1_ROUNDED_RECT {

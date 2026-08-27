@@ -19,7 +19,6 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DELETE, VK_END,
     VK_HOME, VK_LEFT, VK_RIGHT, VK_Y, VK_Z,
 };
-use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::PCWSTR;
 
@@ -247,35 +246,12 @@ impl Panel {
             PanelView::Settings if self.adding_account => {
                 layout::add_page_height(self.pending_team)
             }
-            // 逐段对照 draw_settings 的 y 累加链（dy=0）；间隔行展开 +38（输入框 26 + 尾隙 12）：
-            PanelView::Settings => {
-                // 有账号：卡片 48 + 常驻添加按钮行 36；无账号：仅添加按钮行 36
-                let account_block = if accounts > 0 { 84 } else { 36 };
-                // 鉴权失败提示行
-                let error_line = if self.account_error { 18 } else { 0 };
-                let base = 42 // 顶部留白 12 + 导航行 30，返回箭头 + 居中标题
-                    + 21 // 账号区标题，实绘不带分隔线
-                    + account_block
-                    + error_line
-                    + 33 // 轮询区标题：分隔线上隙 12 + 标题 21
-                    + 39 // 间隔分段控件：段体 30 + 段后间距 9
-                    + 33 // 通知区标题：分隔线上隙 12 + 标题 21
-                    + 126 // 三个通知开关行：标题 19 + 描述 14 + 行后 9 = 42 × 3
-                    + 67 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
-                    + 33 // 通用区标题
-                    + 62 // 语言行：sub_label 21 + segmented 39 + 行后 2
-                    + 62 // 外观行，同语言行
-                    + 28 // 开机自启开关行：标题 19 + 行后 9，无描述行
-                    + 33 // 网络代理区标题：同轮询区标题
-                    + 21 // 代理子标签
-                    + 26 // 代理输入框
-                    + 6 // 输入框后下隙，提示文字为框内占位
-                    + 70 // 配置管理区：标题 33 + 按钮 28 + 行后 9
-                    + 18 // 关于区纯分隔，无标题：上隙 12 + 下隙 6
-                    + 29 // 版本行：描边按钮顶偏移 1 + 高 28
-                    + 12; // 底部余量，同顶部留白
-                base + if self.customizing_interval { 38 } else { 0 }
-            }
+            // 整页高度由 layout 的段常量链求和，与 draw_settings 的 y 推进链同源
+            PanelView::Settings => layout::settings_view_height(
+                accounts > 0,
+                self.account_error,
+                self.customizing_interval,
+            ),
         }
     }
 
@@ -735,18 +711,34 @@ impl Panel {
         let (vis_start, _) = self.caret_layout(renderer);
         let (bx, _w, _tail) = field_geo(field);
         let base = bx + 6.0;
-        let mut best = vis_start;
-        let mut best_dist = f32::MAX;
-        for i in vis_start..=chars.len() {
-            let s: String = chars[vis_start..i].iter().collect();
-            let edge = base + unsafe { renderer.measure_ro(&s, 12.0, 400, true) };
-            let d = (edge - x).abs();
-            if d < best_dist {
-                best_dist = d;
-                best = i;
+        let seg = |a: usize, b: usize| -> f32 {
+            let s: String = chars[a..b].iter().collect();
+            unsafe { renderer.measure_ro(&s, 12.0, 400, true) }
+        };
+        // 前缀宽度随位次单调不减[caret_layout 二分所依赖的同一性质]：
+        // 最近边界只可能是最后一个宽度 <= x 的位次或其下一格，二分定位
+        // 即可。measure_ro 每次调用都新建 TextLayout，逐前缀线性扫在
+        // 128 字符缓冲 × 拖选高频移动下必然卡顿
+        let target = x - base;
+        let mut lo = vis_start;
+        let mut hi = chars.len();
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if seg(vis_start, mid) <= target {
+                lo = mid;
+            } else {
+                hi = mid - 1;
             }
         }
-        best
+        // 平局取较小位次；零宽字符等宽块内取末位[原线性取首位]，
+        // 光标 x 相同仅退格/删词的语义位置不同，可视等价
+        if lo < chars.len()
+            && (seg(vis_start, lo + 1) - target).abs() < (target - seg(vis_start, lo)).abs()
+        {
+            lo + 1
+        } else {
+            lo
+        }
     }
 
     /// 激活字段文本区命中判定：光标定位点击只认文本框范围
@@ -898,7 +890,9 @@ pub extern "system" fn panel_wndproc(
                 let id = wparam.0;
                 match id {
                     TIMER_ANIM => on_anim_tick(hwnd),
-                    // 心跳只请求重绘：无数据事件时相对时间文案也能推进
+                    // 心跳推进全部相对时间文案：页脚[X 分钟前]在底部、指标行
+                    // 重置倒计时在内容区中部，带状失效会让倒计时冻结；且
+                    // WM_PAINT 本就整窗重绘，收窄失效矩形省不下绘制开销
                     TIMER_MINUTE_TICK => {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         LRESULT(0)
@@ -933,6 +927,7 @@ pub extern "system" fn panel_wndproc(
                                 // 移入其中同样不能触发面板收起
                                 let in_popup = app
                                     .popup
+                                    .wnd
                                     .hwnd
                                     .is_some_and(|ph| w == ph || GetAncestor(w, GA_ROOT) == ph);
                                 let in_panel =
@@ -990,7 +985,8 @@ pub extern "system" fn panel_wndproc(
                     let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
                     return LRESULT(0);
                 }
-                let app = app_from_tray(hwnd);
+                // 拖动分支走 as_mut 的 reborrow 后提前返回；此处 move 同一
+                // 绑定——再取一次 app_from_tray 会构造两个活跃可变别名
                 if let Some(app) = app {
                     // 拖选中：光标随鼠标指针推进扩选区
                     if app.panel.selecting {
@@ -1112,6 +1108,16 @@ pub extern "system" fn panel_wndproc(
                         let refocus = hit.is_some_and(|h| h.is_input_hit());
                         if let Some(hit) = hit {
                             crate::app::handle_panel_hit(app, hit, hwnd);
+                            // start_spin 只置位不挂表：appear 结束时 TIMER_ANIM
+                            // 已被 on_anim_tick KillTimer，刷新/重试点击后须在
+                            // 此补挂，否则旋转不动且 spin 残留到下次开面板
+                            if matches!(
+                                hit,
+                                crate::ui::panel::render::Hit::Refresh
+                                    | crate::ui::panel::render::Hit::Retry
+                            ) {
+                                start_anim(hwnd);
+                            }
                         }
                         if !refocus && (app.panel.input.field.is_some() || app.panel.key_revealed) {
                             app.panel.clear_input(hwnd);

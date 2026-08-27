@@ -1,6 +1,7 @@
 //! UI 层
 
 pub mod about;
+pub mod float_wnd;
 pub mod fmt;
 pub mod i18n;
 pub mod icon;

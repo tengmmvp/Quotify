@@ -95,7 +95,9 @@ fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
     let mut builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .https_only(true)
-        .http_status_as_error(false);
+        .http_status_as_error(false)
+        // 空闲连接默认 15s 回收，短于轮询间隔致每轮重建连接；放宽让池子跨轮询存活
+        .max_idle_age(Duration::from_secs(86400));
     if let Some(p) = proxy {
         builder = builder.proxy(Some(p.clone()));
     }

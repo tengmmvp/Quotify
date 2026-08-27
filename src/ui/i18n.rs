@@ -29,7 +29,8 @@ pub fn resolve_lang(setting: Option<&str>) -> Lang {
 /// 全部界面文案
 ///
 /// 字段按「通用前置、视图专属按 UI 顺序」分组，同族成对相邻；
-/// ZH / EN / check! 与本定义同序，增改字段四处同步。
+/// ZH / EN 与本定义同序，增改字段三处同步，键集合与占位符一致性由测试自动比对。
+#[derive(serde::Serialize)]
 pub struct Strings {
     // ── 通用按钮 ──
     pub cancel: &'static str,
@@ -145,6 +146,8 @@ pub struct Strings {
     pub export_config: &'static str,
     pub export_done: &'static str,
     pub export_failed: &'static str,
+    pub export_confirm_title: &'static str,
+    pub export_confirm_body: &'static str,
     pub import_config: &'static str,
     pub import_done: &'static str,
     pub import_failed: &'static str,
@@ -278,6 +281,8 @@ const ZH: Strings = Strings {
     export_config: "导出配置",
     export_done: "配置已导出：含 API key，请妥善保管",
     export_failed: "导出失败：无法写入所选文件",
+    export_confirm_title: "导出配置",
+    export_confirm_body: "导出文件将包含明文 API key，请妥善保管。",
     import_config: "导入配置",
     import_done: "配置已导入",
     import_failed: "导入失败：文件不可读或格式无效",
@@ -411,6 +416,8 @@ const EN: Strings = Strings {
     export_config: "Export",
     export_done: "Exported: contains API keys — keep it safe",
     export_failed: "Export failed: cannot write to the chosen file",
+    export_confirm_title: "Export Config",
+    export_confirm_body: "The exported file will contain your API key in plain text. Keep it safe.",
     import_config: "Import",
     import_done: "Configuration imported",
     import_failed: "Import failed: unreadable or invalid file",
@@ -447,6 +454,7 @@ impl Lang {
 mod tests {
     use super::*;
 
+    /// 提取文本中 `{xxx}` 形态的占位符名，排序去重
     fn placeholder_set(s: &str) -> Vec<&str> {
         let mut names = Vec::new();
         let bytes = s.as_bytes();
@@ -466,136 +474,33 @@ mod tests {
         names
     }
 
+    /// ZH/EN 序列化后整体比对：无手抄字段清单可漏，逐字段占位符集合
+    /// 全自动纳入校验[键集合相等由同型结构天然保证，此处兜底防演化]
     #[test]
-    fn zh_en_placeholders_match() {
-        let (zh, en) = (&ZH, &EN);
-        macro_rules! check {
-            ($($field:ident),* $(,)?) => {
-                $(
-                    assert_eq!(
-                        placeholder_set(zh.$field),
-                        placeholder_set(en.$field),
-                        concat!("占位符集合不一致: ", stringify!($field)),
-                    );
-                )*
-            };
-        }
-        check!(
-            // ── 通用按钮 ──
-            cancel,
-            save,
-            apply,
-            // ── 时间单位 ──
-            unit_day,
-            unit_hour,
-            unit_minute,
-            unit_second,
-            // ── 主视图 · 指标 ──
-            usage_section,
-            five_hour,
-            weekly,
-            mcp_tools,
-            resets_line,
-            used_of,
-            token_usage_section,
-            today_tokens,
-            week_tokens,
-            balance_label,
-            // ── 主视图 · 峰谷 ──
-            peak_badge,
-            peak_tip,
-            // ── 主视图 · 状态 ──
-            updated_just_now,
-            updated_ago,
-            data_as_of,
-            loading,
-            fetch_failed,
-            retry,
-            not_configured_title,
-            not_configured_hint,
-            key_invalid,
-            // ── 错误前缀 ──
-            err_auth,
-            err_empty,
-            err_api,
-            err_network,
-            err_update,
-            // ── 托盘菜单 ──
-            settings,
-            about,
-            exit,
-            // ── 设置 · 当前账号 ──
-            accounts_section,
-            platform_section,
-            add_account,
-            account_name,
-            account_platform,
-            platform_cn,
-            platform_intl,
-            account_type_label,
-            type_personal,
-            type_team,
-            team_badge,
-            org_id_label,
-            project_id_label,
-            api_key_label,
-            switch_account,
-            // ── 设置 · 轮询间隔 ──
-            poll_interval,
-            interval_1m,
-            interval_5m,
-            interval_15m,
-            interval_30m,
-            interval_custom,
-            interval_custom_unit,
-            // ── 设置 · 通用 ──
-            settings_general,
-            language,
-            follow_system,
-            appearance_section,
-            theme_light,
-            theme_dark,
-            autostart,
-            // ── 设置 · 网络代理 ──
-            network_section,
-            proxy_label,
-            proxy_hint,
-            // ── 设置 · 用量通知 ──
-            notifications,
-            notify_threshold,
-            notify_threshold_desc,
-            notify_reset_5h_opt,
-            notify_reset_5h_desc,
-            notify_reset_weekly_opt,
-            notify_reset_weekly_desc,
-            // ── 设置 · 高峰区间 ──
-            peak_section,
-            peak_start_label,
-            peak_end_label,
-            // ── 设置 · 配置管理与关于 ──
-            backup_section,
-            export_config,
-            export_done,
-            export_failed,
-            import_config,
-            import_done,
-            import_failed,
-            import_confirm_title,
-            import_confirm_body,
-            check_update,
-            up_to_date,
-            go_download,
-            version_label,
-            version_new,
-            // ── 关于窗 ──
-            app_desc,
-            link_repo,
-            link_issues,
-            whats_new_section,
-            // ── 系统通知标题 ──
-            notify_threshold_title,
-            notify_reset_5h,
-            notify_reset_weekly,
+    fn zh_en_parity() {
+        let zh = serde_json::to_value(&ZH).unwrap();
+        let en = serde_json::to_value(&EN).unwrap();
+        let zh = zh.as_object().expect("Strings 序列化为对象");
+        let en = en.as_object().expect("Strings 序列化为对象");
+
+        let zh_only: Vec<_> = zh.keys().filter(|k| !en.contains_key(*k)).collect();
+        let en_only: Vec<_> = en.keys().filter(|k| !zh.contains_key(*k)).collect();
+        assert!(
+            zh_only.is_empty() && en_only.is_empty(),
+            "ZH/EN 键集合不一致，仅 ZH: {zh_only:?}，仅 EN: {en_only:?}"
         );
+
+        for (key, value) in zh {
+            let text = value.as_str().expect("文案字段皆为字符串");
+            let other = en
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .expect("文案字段皆为字符串");
+            assert_eq!(
+                placeholder_set(text),
+                placeholder_set(other),
+                "占位符集合不一致: {key}"
+            );
+        }
     }
 }

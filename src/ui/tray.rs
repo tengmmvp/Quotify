@@ -55,6 +55,13 @@ impl TrayIcon {
                 })
             } else {
                 log("[Quotify] 托盘 SETVERSION 失败");
+                // NIM_ADD 已成功：不撤销注册的话任务栏会残留幽灵图标
+                let mut icon = Self {
+                    hwnd,
+                    id: 1,
+                    registered: true,
+                };
+                icon.remove();
                 None
             }
         }

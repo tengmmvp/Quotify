@@ -8,7 +8,7 @@ use crate::api::Platform;
 use crate::service::poller::DEFAULT_INTERVAL_SECS;
 
 /// 全局偏好
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
     /// 轮询间隔（秒）
@@ -56,7 +56,7 @@ impl Default for General {
 /// 一个受监控的 GLM 账号
 /// 字段序同添加页表单（名称→平台→类型→组织→项目），凭据收尾；
 /// 此序即 config.toml 写出顺序
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Account {
     /// 稳定 id
     pub id: String,
@@ -78,7 +78,7 @@ pub struct Account {
 }
 
 /// 应用全量配置
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub general: General,
@@ -114,7 +114,7 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
-/// 首次启动写出的模板
+/// 首次启动写出的模板：可选项用注释示例，赋空串会与 Default 的 None 不等
 const TEMPLATE: &str = r#"# Quotify 配置文件
 # 通常通过面板内「设置」页管理，无需手动编辑；改完重启生效。
 # API key 明文保存在本机，请勿分享此文件。
@@ -123,11 +123,11 @@ const TEMPLATE: &str = r#"# Quotify 配置文件
 # 轮询间隔（秒）
 poll_interval_secs = 300
 # 界面语言：留空跟随系统，可设 "zh" 或 "en"
-language = ""
+# language = ""
 # 外观：留空跟随系统，可设 "light" / "dark"
-appearance = ""
+# appearance = ""
 # 网络代理：留空直连，可设 "http://host:port" 或 "socks5://host:port"
-proxy = ""
+# proxy = ""
 # 用量阈值预警（默认关闭）
 notify_threshold_enabled = false
 notify_threshold_percent = 80
@@ -138,7 +138,7 @@ notify_reset_weekly_enabled = false
 peak_start = "14:00"
 peak_end = "18:00"
 # 已读仓库动态的日期
-last_news_read = ""
+# last_news_read = ""
 
 # 受监控的账号（建议在设置页添加；此处仅为字段示例）
 # [[accounts]]
@@ -151,7 +151,7 @@ last_news_read = ""
 # api_key = "你的 API key"
 
 # 当前选中的账号 id
-selected = ""
+# selected = ""
 "#;
 
 /// 解析配置文本，损坏时坏文件改名留档并回退默认配置
@@ -170,7 +170,10 @@ fn parse_or_default(text: &str, path: &Path) -> Config {
                 format!("（第 {line} 行第 {col} 列）")
             })
             .unwrap_or_default();
-        crate::platform::log(&format!("config.toml 解析失败，使用默认配置{pos}: {e}"));
+        crate::platform::log(&format!(
+            "config.toml 解析失败，使用默认配置{pos}: {}",
+            e.message()
+        ));
         backup_broken(path);
         Config::default()
     })
@@ -182,7 +185,9 @@ fn backup_broken(path: &Path) {
         let bak = path.with_extension("toml.bak");
         if let Err(e) = std::fs::rename(path, &bak) {
             crate::platform::log(&format!("config.toml 改名 .bak 失败: {e}"));
+            return;
         }
+        crate::platform::secure_file_acl(&bak);
     }
 }
 
@@ -190,10 +195,23 @@ fn backup_broken(path: &Path) {
 /// 只回退默认不动磁盘。
 pub fn load() -> Config {
     let path = config_path();
+    // 清理上次进程在 write→rename 之间被杀时遗留的临时文件
+    let _ = std::fs::remove_file(path.with_extension("toml.tmp"));
     match std::fs::read_to_string(&path) {
-        Ok(text) => parse_or_default(&text, &path),
+        Ok(text) => {
+            // 旧版本写下的文件没有收紧过 ACL，启动时统一补一次[幂等]
+            crate::platform::secure_file_acl(&path);
+            parse_or_default(&text, &path)
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let _ = std::fs::write(&path, TEMPLATE);
+            // 模板本身不含 key，但用户可能直接手填，落盘即统一收紧；
+            // 写失败时无文件可加固，只记日志
+            match std::fs::write(&path, TEMPLATE) {
+                Ok(()) => crate::platform::secure_file_acl(&path),
+                Err(e) => {
+                    crate::platform::log(&format!("config.toml 模板写入失败: {e}"));
+                }
+            }
             Config::default()
         }
         Err(e) => {
@@ -215,32 +233,28 @@ pub fn save(config: &Config) {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
+    // tmp 先行收紧：改名会保留安全描述符，中途被杀也不留宽松 ACL 的
+    // 明文残留；rename 之后的收紧退化为幂等兜底
+    crate::platform::secure_file_acl(&tmp);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));
         let _ = std::fs::remove_file(&tmp);
+        return;
     }
+    crate::platform::secure_file_acl(&path);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 模板须能解析回 Config 且不产生实际账号
+    /// 模板解析结果与默认配置逐字段相等，TEMPLATE 与 Default 漂移在此全量报警；
+    /// 先断言可解析——parse_or_default 吞错回退默认，语法损坏时相等断言空真
     #[test]
     fn template_parses_back() {
+        toml::from_str::<Config>(TEMPLATE).expect("TEMPLATE 必须可解析");
         let cfg = parse_or_default(TEMPLATE, Path::new("no-such-config.toml"));
-        assert_eq!(cfg.general.poll_interval_secs, 300);
-        assert!(!cfg.general.notify_threshold_enabled);
-        assert!(!cfg.general.notify_reset_5h_enabled);
-        assert!(cfg.accounts.is_empty());
-        assert!(cfg.selected.as_deref().unwrap_or("").is_empty());
-        assert!(
-            cfg.general
-                .last_news_read
-                .as_deref()
-                .unwrap_or("")
-                .is_empty()
-        );
+        assert_eq!(cfg, Config::default());
     }
 
     /// 损坏文本回退默认配置，不 panic、不部分采用

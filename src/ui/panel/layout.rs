@@ -20,6 +20,41 @@ pub const INPUT_X: f32 = CONTENT_PAD;
 /// 输入框后到下一 sub_label 的间距
 pub const INPUT_GAP: f32 = 6.0;
 
+// ── 设置页区块段高：draw_settings 的 y 推进、下方 *_input_y 与 settings_view_height 三方共用 ──
+
+/// 设置页上下边距：nav 前顶部留白与版本行后底部余量
+pub const SETTINGS_EDGE_PAD: f32 = 12.0;
+/// section_label 带 rule 时分隔线到标题的上隙
+pub const SECTION_RULE_GAP: f32 = 12.0;
+/// 带 rule 的区块标题整段高[轮询/通知/高峰/通用/网络/配置管理区共用]
+pub const SECTION_RULE_H: f32 = SECTION_RULE_GAP + SECTION_LABEL_H;
+/// 账号卡片整行高：卡片 40 + 卡后隙 8
+pub const ACCOUNT_CARD_H: f32 = 48.0;
+/// 鉴权失败提示行高
+pub const AUTH_ERROR_H: f32 = 18.0;
+/// 常驻添加账号按钮行高：按钮 30 含上下余量
+pub const ADD_BTN_ROW_H: f32 = 36.0;
+/// 自定义间隔展开增量：输入框 26 + 框后尾隙 12[值同 rule 上隙，语义各自独立]
+pub const CUSTOMIZE_EXTRA_H: f32 = INPUT_H + 12.0;
+/// 开关行高（带描述）：标题 19 + 描述 14 + 行后 9
+pub const TOGGLE_ROW_H: f32 = 42.0;
+/// 开关行高（无描述）：标题 19 + 行后 9
+pub const TOGGLE_ROW_PLAIN_H: f32 = 28.0;
+/// 高峰输入行后的下隙
+pub const PEAK_TAIL_GAP: f32 = 8.0;
+/// 选择行（语言/外观）行后余隙
+pub const CHOICE_ROW_TAIL: f32 = 2.0;
+/// 选择行整段高（语言/外观）：子标签 + 分段控件 + 行后余隙
+pub const CHOICE_ROW_H: f32 = SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP + CHOICE_ROW_TAIL;
+/// 代理输入框后的下隙[提示文字为框内占位，不另占行]
+pub const PROXY_TAIL_GAP: f32 = 6.0;
+/// 配置管理按钮行高：按钮 28 + 行后 9
+pub const BACKUP_ROW_H: f32 = 37.0;
+/// 关于区纯分隔（空标题）：rule 上隙 + 尾隙 6
+pub const ABOUT_DIVIDER_H: f32 = SECTION_RULE_GAP + 6.0;
+/// 版本行高：按钮顶偏移 1 + 按钮 28
+pub const VERSION_ROW_H: f32 = 29.0;
+
 /// 添加页：名称输入框顶部 y
 pub const ADD_NAME_Y: f32 = 206.0;
 /// 添加页：API Key 输入框顶部 y
@@ -38,45 +73,50 @@ pub const PEAK_END_X: f32 = 148.0;
 
 /// 设置页自定义间隔输入框顶 y，随账号块与错误行伸缩
 pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
-    let mut y = 12.0 + NAV_H + SECTION_LABEL_H;
-    // 有账号：卡片 40 + 间距 8；随后常驻的添加按钮行再占 36
+    let mut y = SETTINGS_EDGE_PAD + NAV_H + SECTION_LABEL_H;
+    // 有账号：卡片 + 可选错误行；随后常驻的添加按钮行
     y += if has_account {
-        40.0 + 8.0 + if auth_error { 18.0 } else { 0.0 } + 36.0
+        ACCOUNT_CARD_H + if auth_error { AUTH_ERROR_H } else { 0.0 } + ADD_BTN_ROW_H
     } else {
-        36.0
+        ADD_BTN_ROW_H
     };
-    // 尾段：轮询区标题 rule 上隙 12 + 标题 + 分段体 + 段后隙
-    y + 12.0 + SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP
+    // 尾段：轮询区标题 + 分段体 + 段后隙
+    y + SECTION_RULE_H + SEGMENTED_H + SEGMENTED_GAP
 }
 
 /// 设置页高峰区间输入行顶 y，位于通知区之后
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走：38 = 输入框 26 + 尾隙 12；
+    // 展开自定义间隔时渲染链从 interval_input_y + CUSTOMIZE_EXTRA_H 续走；
     // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
-    let after_interval = if customizing { 38.0 } else { 0.0 };
+    let after_interval = if customizing { CUSTOMIZE_EXTRA_H } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
-        + 33.0 // 通知区标题
-        + 126.0 // 三个通知开关行
-        + 33.0 // 高峰区间区标题
+        + SECTION_RULE_H // 通知区标题
+        + 3.0 * TOGGLE_ROW_H // 三个通知开关行
+        + SECTION_RULE_H // 高峰区间区标题
 }
 
-/// 设置页代理输入框顶 y，与 draw_settings 的 y 推进链逐段对齐
+/// 设置页代理输入框顶 y：高峰区之后接通用区、网络区，续 peak_input_y 的链
 pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 展开自定义间隔时渲染链从 interval_input_y + 38 续走：38 = 输入框 26 + 尾隙 12；
-    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
-    let after_interval = if customizing { 38.0 } else { 0.0 };
-    interval_input_y(has_account, auth_error)
-        + after_interval
-        + 33.0 // 通知区标题
-        + 126.0 // 三个通知开关行
-        + 67.0 // 高峰区间区：标题 33 + 输入行 26 + 下隙 8
-        + 33.0 // 通用区标题
-        + 62.0 // 语言行：sub_label 21 + segmented 39 + 行后 2
-        + 62.0 // 外观行，同语言行
-        + 28.0 // 开机自启行
-        + 33.0 // 网络代理区标题
-        + 21.0 // 代理子标签
+    peak_input_y(has_account, auth_error, customizing)
+        + INPUT_H + PEAK_TAIL_GAP // 高峰输入行
+        + SECTION_RULE_H // 通用区标题
+        + CHOICE_ROW_H // 语言行
+        + CHOICE_ROW_H // 外观行
+        + TOGGLE_ROW_PLAIN_H // 开机自启行
+        + SECTION_RULE_H // 网络代理区标题
+        + SECTION_LABEL_H // 代理子标签
+}
+
+/// 设置页总高（逻辑像素）：从代理输入框续走配置管理、关于、版本行收尾，
+/// 消除 view_height 里独立的整页求和
+pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bool) -> i32 {
+    (proxy_input_y(has_account, auth_error, customizing)
+        + INPUT_H + PROXY_TAIL_GAP // 代理输入框
+        + SECTION_RULE_H + BACKUP_ROW_H // 配置管理区
+        + ABOUT_DIVIDER_H // 关于区纯分隔
+        + VERSION_ROW_H // 版本行
+        + SETTINGS_EDGE_PAD) as i32 // 底部余量
 }
 
 /// 添加页总高（逻辑像素），团队版追加组织/项目两行

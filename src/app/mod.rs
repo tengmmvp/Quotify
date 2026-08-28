@@ -1299,8 +1299,8 @@ fn apply_appearance(app: &mut App) {
 }
 
 fn sync_main_height(app: &mut App) {
-    let (rows, stats, bal) = match app.data.snapshot.as_ref() {
-        None => (0, false, false),
+    let (rows, comp, stats, bal) = match app.data.snapshot.as_ref() {
+        None => (0, false, false, false),
         Some(snap) => (
             [
                 snap.five_hour.is_some(),
@@ -1310,12 +1310,19 @@ fn sync_main_height(app: &mut App) {
             .iter()
             .filter(|b| **b)
             .count(),
+            // 明细非空才陈列构成区，与渲染侧判定同源
+            snap.mcp.as_ref().is_some_and(|m| !m.details.is_empty()),
             snap.token_stats.is_some(),
             snap.balance.is_some(),
         ),
     };
-    app.panel.main_h =
-        crate::ui::panel::layout::main_view_height(app.data.snapshot.is_some(), rows, stats, bal);
+    app.panel.main_h = crate::ui::panel::layout::main_view_height(
+        app.data.snapshot.is_some(),
+        rows,
+        comp,
+        stats,
+        bal,
+    );
 }
 
 /// 同步状态并重定位面板

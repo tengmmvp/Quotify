@@ -34,6 +34,24 @@ pub(crate) const MAIN_MASTHEAD_ROW_H: f32 = 26.0;
 pub(crate) const MAIN_MASTHEAD_H: f32 = MAIN_MASTHEAD_RULE_GAP + MAIN_MASTHEAD_ROW_H;
 /// 指标行高
 pub(crate) const MAIN_METRIC_ROW_H: f32 = 52.0;
+/// MCP 构成区：框顶到 MCP 指标行底的下隙
+pub(crate) const MAIN_MCP_COMP_TOP_GAP: f32 = 6.0;
+/// MCP 构成框内边距（左右 8 上下 6）
+pub(crate) const MAIN_MCP_COMP_PAD_X: f32 = 8.0;
+pub(crate) const MAIN_MCP_COMP_PAD_Y: f32 = 6.0;
+/// 能量格高（格宽 12、右斜切 4、缝 2 在渲染侧）
+pub(crate) const MAIN_MCP_CELL_H: f32 = 10.0;
+/// 能量条行到图例行的推进
+pub(crate) const MAIN_MCP_LEGEND_ADV: f32 = 4.0;
+/// 图例行高（11px 徽标文本所在行）
+pub(crate) const MAIN_MCP_LEGEND_H: f32 = 15.0;
+/// MCP 构成区整高：下隙 + 框线 2 + 上下边距 + 条 + 推进 + 图例行
+pub(crate) const MAIN_MCP_COMP_H: f32 = MAIN_MCP_COMP_TOP_GAP
+    + 2.0
+    + 2.0 * MAIN_MCP_COMP_PAD_Y
+    + MAIN_MCP_CELL_H
+    + MAIN_MCP_LEGEND_ADV
+    + MAIN_MCP_LEGEND_H;
 /// 数据段（Token/余额）段前隙：到虚线分隔线
 pub(crate) const MAIN_SECTION_GAP: f32 = 6.0;
 /// 数据段：虚线分隔线到段标题的推进
@@ -51,7 +69,7 @@ pub(crate) const MAIN_BALANCE_ROW_H: f32 = 18.0;
 pub(crate) const MAIN_BALANCE_BLOCK_H: f32 =
     MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_BALANCE_ROW_H + 2.0;
 /// 主视图内容底隙：最后一个数据块底到页脚顶
-pub(crate) const MAIN_CONTENT_BOTTOM_GAP: f32 = 6.0;
+pub(crate) const MAIN_CONTENT_BOTTOM_GAP: f32 = 2.0;
 /// 页脚区高（钉底）
 pub(crate) const MAIN_FOOTER_H: f32 = 36.0;
 /// 主视图尾段整高：内容底隙 + 页脚
@@ -164,7 +182,13 @@ pub fn add_page_height(team: bool) -> i32 {
 /// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态由上方主视图段
 /// 常量链求和，与 draw_main 的 y 推进同源——两侧同引一组常量，几何改动
 /// 不再可能出现绘制侧与高度公式各改一半的漂移
-pub fn main_view_height(has_data: bool, rows: usize, has_stats: bool, has_balance: bool) -> i32 {
+pub fn main_view_height(
+    has_data: bool,
+    rows: usize,
+    has_mcp_comp: bool,
+    has_stats: bool,
+    has_balance: bool,
+) -> i32 {
     if !has_data {
         return 300;
     }
@@ -172,6 +196,7 @@ pub fn main_view_height(has_data: bool, rows: usize, has_stats: bool, has_balanc
         + MAIN_TOPBAR_H
         + MAIN_MASTHEAD_H
         + rows as f32 * MAIN_METRIC_ROW_H
+        + has_mcp_comp as i32 as f32 * MAIN_MCP_COMP_H
         + has_stats as i32 as f32 * MAIN_TOKEN_BLOCK_H
         + has_balance as i32 as f32 * MAIN_BALANCE_BLOCK_H
         + MAIN_TAIL_H) as i32
@@ -216,11 +241,14 @@ mod tests {
 
     #[test]
     fn main_view_height_pinned() {
-        assert_eq!(main_view_height(false, 0, false, false), 300);
-        assert_eq!(main_view_height(true, 0, false, false), 150);
-        assert_eq!(main_view_height(true, 1, false, false), 202);
-        assert_eq!(main_view_height(true, 3, false, true), 346);
-        assert_eq!(main_view_height(true, 3, true, true), 426);
-        assert_eq!(main_view_height(true, 2, true, false), 334);
+        assert_eq!(main_view_height(false, 0, false, false, false), 300);
+        assert_eq!(main_view_height(true, 0, false, false, false), 146);
+        assert_eq!(main_view_height(true, 1, false, false, false), 198);
+        assert_eq!(main_view_height(true, 3, false, false, true), 342);
+        assert_eq!(main_view_height(true, 3, false, true, true), 422);
+        assert_eq!(main_view_height(true, 2, false, true, false), 330);
+        // MCP 构成区：无数据明细时零增量，有则 +49
+        assert_eq!(main_view_height(true, 3, true, false, false), 351);
+        assert_eq!(main_view_height(true, 1, true, false, false), 247);
     }
 }

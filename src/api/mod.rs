@@ -117,7 +117,6 @@ pub struct QuotaBucket {
 
 /// MCP 工具用量按模型明细
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct McpDetail {
     pub model_code: String,
     pub usage: f64,
@@ -134,7 +133,6 @@ pub struct McpUsage {
     /// 月度重置时刻
     pub resets_at: Option<DateTime<Utc>>,
     /// 按模型明细
-    #[allow(dead_code)]
     pub details: Vec<McpDetail>,
 }
 

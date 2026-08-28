@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct2D::{D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1H
 use windows_numerics::Vector2;
 
 use super::{Align, Hit, Renderer};
-use crate::service::whatsnew::NewsItem;
+use crate::service::whatsnew::{NEWS_MAX, NewsItem};
 use crate::ui::panel::anim::ease_out_cubic;
 use crate::ui::panel::model::PanelModel;
 
@@ -19,9 +19,6 @@ pub const ABOUT_W: f32 = 500.0;
 pub const REPO_URL: &str = "https://github.com/tengmmvp/Quotify";
 /// 仓库 Issue 区
 pub const ISSUES_URL: &str = "https://github.com/tengmmvp/Quotify/issues";
-
-/// 动态区最多陈列条数
-const NEWS_MAX: usize = 3;
 
 /// 折叠条目块高：标题行 18 + 摘要行 15 + 底隙 7
 const NEWS_FOLD_H: f32 = 40.0;
@@ -80,6 +77,7 @@ impl Renderer {
             let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
             let h = (rect_phys.bottom - rect_phys.top) as f32 / dpi;
             self.hits.clear();
+            self.frame_measures.clear();
             target.BeginDraw();
             self.draw_about(&target, model, expanded, w, h);
             match target.EndDraw(None, None) {
@@ -309,10 +307,15 @@ impl Renderer {
             target.DrawEllipse(&node, &b, 1.0, None);
         }
 
-        // 日期取 MM-DD
+        // 日期取 MM-DD；异常长度（非 YYYY-MM-DD）宽松回退整串，不 panic
+        let date_disp = item
+            .date
+            .get(5..)
+            .filter(|s| s.len() == 5)
+            .unwrap_or(&item.date);
         self.text(
             target,
-            &item.date[5..],
+            date_disp,
             NEWS_DATE_X,
             mid - 7.0,
             36.0,
@@ -334,11 +337,11 @@ impl Renderer {
         self.line(target, arrow_x - 3.0, ay, arrow_x, by, &stroke, 1.2);
         self.line(target, arrow_x, by, arrow_x + 3.0, ay, &stroke, 1.2);
 
-        // 标题；右端为箭头与 NEW 留位，截断宽随 NEW 有无伸缩
+        // 标题；右端为箭头与 NEW 留位，截断宽随 NEW 有无伸缩。
+        // 宽度直接取 ellipsize 返回值，NEW 徽标跟随不复测
         let new_w = if unread { 36.0 } else { 0.0 }; // NEW 徽标 30 + 左隙 6
         let title_w = (right - 14.0 - new_w - NEWS_BODY_X).max(40.0);
-        let title = self.ellipsize(&item.title, 13.0, title_w, 600, false);
-        let tw = self.measure(&title, 13.0, 600, false);
+        let (title, tw) = self.ellipsize(&item.title, 13.0, title_w, 600, false);
         self.text(
             target,
             &title,
@@ -384,7 +387,7 @@ impl Renderer {
         if expanded {
             let mut ly = y + 18.0;
             for line in &item.lines {
-                let t = self.ellipsize(line, 12.0, right - NEWS_BODY_X, 400, false);
+                let (t, _) = self.ellipsize(line, 12.0, right - NEWS_BODY_X, 400, false);
                 self.text(
                     target,
                     &t,
@@ -400,7 +403,7 @@ impl Renderer {
                 ly += NEWS_LINE_H;
             }
         } else if let Some(first) = item.lines.first() {
-            let t = self.ellipsize(first, 12.0, right - NEWS_BODY_X, 400, false);
+            let (t, _) = self.ellipsize(first, 12.0, right - NEWS_BODY_X, 400, false);
             self.text(
                 target,
                 &t,
@@ -424,5 +427,35 @@ impl Renderer {
                 bottom: y + block_h,
             },
         ));
+    }
+}
+
+/// 高度链钉位回归：期望值由 draw_about 的 y 推进链推导而来，
+/// 布局改动须同步更新
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(lines: usize) -> NewsItem {
+        NewsItem {
+            date: "2026-08-28".into(),
+            title: "t".into(),
+            lines: vec!["l".to_string(); lines],
+        }
+    }
+
+    #[test]
+    fn about_height_pinned() {
+        // 无动态档：链接行底 176 + 底部余量 24；空切片同档
+        assert_eq!(about_height(None, None), 200);
+        assert_eq!(about_height(Some(&[]), None), 200);
+        // 单条折叠：204 + (18+15+7) + 6 + 4 + 24
+        let one = vec![item(2)];
+        assert_eq!(about_height(Some(&one), None), 278);
+        // 单条展开（两行正文）：204 + (18+2*16+10) + 6 + 4 + 24
+        assert_eq!(about_height(Some(&one), Some(0)), 298);
+        // 多条截断：5 条只陈列 NEWS_MAX=3 条折叠
+        let many = vec![item(1); 5];
+        assert_eq!(about_height(Some(&many), None), 370);
     }
 }

@@ -37,6 +37,7 @@ impl Renderer {
             let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
             let h = (rect_phys.bottom - rect_phys.top) as f32 / dpi;
             self.hits.clear();
+            self.frame_measures.clear();
             target.BeginDraw();
             self.draw_account_popup(&target, model, w, h);
             match target.EndDraw(None, None) {
@@ -155,7 +156,7 @@ impl Renderer {
             );
             let name_right = px - 8.0;
             let name_w = (name_right - (pad + 6.0)).max(56.0);
-            let name = self.ellipsize(&acc.name, 13.5, name_w, 600, false);
+            let (name, _) = self.ellipsize(&acc.name, 13.5, name_w, 600, false);
             self.text(
                 target,
                 &name,

@@ -776,25 +776,18 @@ impl Renderer {
             );
         } else if active {
             let avail = (w - 6.0 - tail).max(1.0);
-            let (vis_start, _) = panel.caret_layout(self);
+            let cl = panel.caret_layout(self);
             let chars: Vec<char> = content.chars().collect();
-            let start = vis_start.min(chars.len());
-            let mut vis = String::new();
-            for c in &chars[start..] {
-                let cand: String = format!("{vis}{c}");
-                if self.measure(&cand, 12.0, 400, true) > avail {
-                    break;
-                }
-                vis = cand;
+            let start = cl.vis_start.min(chars.len());
+            let mut end = start;
+            while end < chars.len() && cl.seg(start, end + 1) <= avail {
+                end += 1;
             }
+            let vis: String = chars[start..end].iter().collect();
             if let Some((a, b)) = panel.input.edit.selection() {
                 let a = a.min(chars.len());
                 let b = b.min(chars.len());
-                let mut sx = |n: usize| -> f32 {
-                    let lo = start.min(n);
-                    let s: String = chars[lo..n].iter().collect();
-                    self.measure(&s, 12.0, 400, true)
-                };
+                let sx = |n: usize| cl.seg(start, n);
                 let sel_left = x + 6.0 + sx(a);
                 let sel_right = x + 6.0 + sx(b);
                 if sel_right > x + 6.0 && sel_left < x + w - tail {
@@ -822,24 +815,24 @@ impl Renderer {
                 true,
             );
         } else {
-            // 失焦态：尾部可视切片按真实测宽取最长可放入后缀
+            // 失焦态：尾部可视切片取最长可放入后缀；前缀宽表一次成型，
+            // 后缀宽 = 全宽 - 前缀宽，零逐候选测量
             let avail = (w - 6.0 - tail).max(1.0);
             let chars: Vec<char> = content.chars().collect();
             let mut vis = String::new();
             if !chars.is_empty() {
-                if self.measure(content, 12.0, 400, true) <= avail {
+                let widths = self.prefix_widths(&chars, 12.0, 400, true);
+                let n = chars.len();
+                if widths[n] <= avail {
                     vis = content.to_string();
                 } else {
-                    // 至少保尾 1 字符；前缀每扩一字符宽度单调增，
-                    // 首个溢出处的前一候选即最长可放入后缀
-                    vis = chars.last().map(|c| c.to_string()).unwrap_or_default();
-                    for k in (0..chars.len() - 1).rev() {
-                        let cand: String = chars[k..].iter().collect();
-                        if self.measure(&cand, 12.0, 400, true) > avail {
-                            break;
-                        }
-                        vis = cand;
+                    // 至少保尾 1 字符；找最小起点使后缀入宽[后缀宽随
+                    // 起点减小单调增，首个溢出前一位即最长可放入后缀]
+                    let mut k = 0usize;
+                    while k + 1 < n && widths[n] - widths[k] > avail {
+                        k += 1;
                     }
+                    vis = chars[k..].iter().collect();
                 }
             }
             self.text_rect_opts(
@@ -1117,7 +1110,7 @@ impl Renderer {
             false,
         );
         let name_max = (bx - 10.0 - (x + 12.0)).max(60.0);
-        let name_disp = self.ellipsize(name, 15.0, name_max, 500, false);
+        let (name_disp, _) = self.ellipsize(name, 15.0, name_max, 500, false);
         self.text_aligned_vc(
             target,
             &name_disp,
@@ -1232,5 +1225,36 @@ fn mask_key(key: &str, active: bool) -> String {
         let head: String = key.chars().take(4).collect();
         let tail: String = key.chars().skip(n - 4).collect();
         format!("{head}…{tail}")
+    }
+}
+
+/// 掩码规则回归：12 位阈值两侧、聚焦强制全显圆点、短串与中段不露明文
+#[cfg(test)]
+mod tests {
+    use super::mask_key;
+
+    #[test]
+    fn mask_key_threshold() {
+        // 不足 12 位：整串圆点，不截首尾
+        assert_eq!(mask_key("abc123", false), "••••••");
+        // 恰 12 位：露首尾各 4 位
+        assert_eq!(mask_key("abcd1234wxyz", false), "abcd…wxyz");
+        // 超 12 位：同样只露首尾 4 位
+        assert_eq!(mask_key("abcd1234wxyz9999", false), "abcd…9999");
+    }
+
+    #[test]
+    fn mask_key_active_full_dots() {
+        // 聚焦强制逐字符圆点，位数与原串一致，光标步宽可对
+        assert_eq!(mask_key("abcd1234wxyz9999", true), "•".repeat(16));
+        assert_eq!(mask_key("abc", true), "•••");
+    }
+
+    #[test]
+    fn mask_key_no_middle_plaintext() {
+        // 12 位以上中段不落屏
+        let m = mask_key("abcdefghijkl", false);
+        assert_eq!(m, "abcd…ijkl");
+        assert!(!m.contains('e') && !m.contains('h'));
     }
 }

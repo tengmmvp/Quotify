@@ -4,6 +4,7 @@ pub mod autostart;
 pub mod instance;
 pub mod menu_theme;
 pub mod notify;
+pub mod post;
 
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows::Win32::UI::WindowsAndMessaging::WM_APP;

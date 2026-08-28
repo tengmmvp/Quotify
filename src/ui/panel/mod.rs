@@ -148,15 +148,38 @@ fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<InputField> 
 }
 
 /// 激活字段的输入框几何（x、宽、右端让位）；与 settings.rs 各 input_field
-/// 调用点同源，眼睛让位 26、余量收边 4
+/// 调用点同源，眼睛让位 26、余量收边 4。臂穷尽无兜底：新增 InputField
+/// 变体即编译错误
 pub(crate) fn field_geo(field: InputField) -> (f32, f32, f32) {
     let cw = PANEL_WIDTH as f32 - 2.0 * layout::CONTENT_PAD;
     match field {
         InputField::Interval => (layout::INPUT_X, 96.0, 4.0),
+        InputField::Proxy => (layout::INPUT_X, cw, 4.0),
         InputField::PeakStart => (layout::PEAK_START_X, 64.0, 4.0),
         InputField::PeakEnd => (layout::PEAK_END_X, 64.0, 4.0),
+        InputField::Name => (layout::INPUT_X, cw, 4.0),
         InputField::Key => (layout::INPUT_X, cw, 26.0),
-        _ => (layout::INPUT_X, cw, 4.0),
+        InputField::Org => (layout::INPUT_X, cw, 4.0),
+        InputField::Project => (layout::INPUT_X, cw, 4.0),
+    }
+}
+
+/// 单次输入布局产物：可视窗口 + 光标 x + 整串前缀宽表。同一鼠标事件内
+/// 光标定位、命中换算与渲染切片共用一份，各处不再各自重建 TextLayout
+pub(crate) struct CaretLayout {
+    /// 可视窗口起点 char 位次
+    pub(crate) vis_start: usize,
+    /// 光标在窗口内的 x
+    pub(crate) cx: f32,
+    /// 前 i 字符的累计宽（field_display 串），表长 = 字符数 + 1
+    pub(crate) widths: Vec<f32>,
+}
+
+impl CaretLayout {
+    /// chars[a..b] 的宽；位次自动钳入表内，越界不 panic
+    pub(crate) fn seg(&self, a: usize, b: usize) -> f32 {
+        let n = self.widths.len() - 1;
+        self.widths[b.min(n)] - self.widths[a.min(n)]
     }
 }
 
@@ -551,10 +574,15 @@ impl Panel {
     pub fn focus_input(&mut self, hwnd: HWND, field: InputField) {
         let switched = self.input.field != Some(field);
         if switched {
-            if let Some(old) = self.input.field {
-                self.invalidate_field_line(hwnd, old);
+            if self.input.field.is_some() {
+                // 旧字段行含激活边框与选区高亮像素，重开面板前整窗重绘清掉
+                unsafe {
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                }
             }
             self.input.edit.reset();
+            // 陈旧高代理半区跨字段残留会与低半区错拼增补平面字符
+            self.input.surrogate = None;
             self.vis_start.set(0);
         }
         self.input.field = Some(field);
@@ -569,14 +597,21 @@ impl Panel {
             // 宽度随 DPI 放大：150% 缩放下 1 物理像素不足 1 逻辑像素，过细难辨
             let _ = CreateCaret(hwnd, None, self.px(1).max(1), caret_h);
             let _ = ShowCaret(Some(hwnd));
-            let r = self.renderer.as_ref();
-            self.update_caret(hwnd, r);
-            self.attach_ime(hwnd);
+            // 布局只算一次：光标落位与 IME 挂载后的组合窗定位共用同一产物；
+            // renderer 缺席（首帧前）以 0 兜底，下次 update_caret 补正
+            let cx = if let Some(r) = self.renderer.as_ref() {
+                let cx = self.caret_layout(r).cx;
+                self.place_caret(hwnd, cx);
+                cx
+            } else {
+                0.0
+            };
+            self.attach_ime(hwnd, cx);
         }
     }
 
-    /// 挂 IME 上下文并把组合窗定位到光标处。
-    unsafe fn attach_ime(&mut self, hwnd: HWND) {
+    /// 挂 IME 上下文并把组合窗定位到光标处；cx 由调用点的布局产物传入
+    unsafe fn attach_ime(&mut self, hwnd: HWND, cx: f32) {
         unsafe {
             use windows::Win32::UI::Input::Ime::{
                 ImmAssociateContext, ImmCreateContext, ImmDestroyContext,
@@ -587,12 +622,13 @@ impl Panel {
                 let _ = ImmDestroyContext(old);
             }
             self.ime_owned = true;
-            self.sync_ime_pos(hwnd);
+            self.sync_ime_pos(hwnd, cx);
         }
     }
 
-    /// 组合窗跟随光标移动；光标每次移动后调用，中文组合串贴住光标处
-    unsafe fn sync_ime_pos(&self, hwnd: HWND) {
+    /// 组合窗跟随光标移动；光标每次移动后调用，中文组合串贴住光标处。
+    /// cx 由调用点随同一布局传入，不再独立重算
+    unsafe fn sync_ime_pos(&self, hwnd: HWND, cx: f32) {
         unsafe {
             use windows::Win32::Foundation::POINT;
             use windows::Win32::UI::Input::Ime::{
@@ -602,10 +638,6 @@ impl Panel {
             let Some(field) = self.input.field else {
                 return;
             };
-            let Some(r) = self.renderer.as_ref() else {
-                return;
-            };
-            let (_vis_start, cx) = self.caret_layout(r);
             let bx = field_geo(field).0;
             let by = self.caret_line_y(field);
             let x = bx + 6.0 + cx;
@@ -627,49 +659,61 @@ impl Panel {
         }
     }
 
-    /// 光标可视布局：返回（可视窗口起点 char 位次，光标在窗口内的 x）。
-    /// 绘制与系统光标定位共用此函数，同一次计算同一结果，两侧位置
-    /// 恒一致。未超宽从 0 起；超宽时优先沿用上次起点（粘滞，避免每次
-    /// 取最小起点让点击处窗口回跳），光标出窗才二分调整。
+    /// 光标可视布局：一次 TextLayout 建成整串前缀宽表，可视窗口与光标
+    /// x 全部查表得出，附带宽表供命中换算与渲染切片复用。绘制与系统
+    /// 光标定位共用此函数，同一次计算同一结果，两侧位置恒一致。
+    /// 未超宽从 0 起；超宽时优先沿用上次起点（粘滞，避免每次取最小
+    /// 起点让点击处窗口回跳），光标出窗才二分调整。
     /// Key 掩码态圆点与字符一一对应，位次空间不变
-    pub(crate) fn caret_layout(&self, renderer: &Renderer) -> (usize, f32) {
+    pub(crate) fn caret_layout(&self, renderer: &Renderer) -> CaretLayout {
         let Some(field) = self.input.field else {
-            return (0, 0.0);
+            return CaretLayout {
+                vis_start: 0,
+                cx: 0.0,
+                widths: vec![0.0],
+            };
         };
         let buf = self.field_display();
-        let (_bx, w, tail) = field_geo(field);
-        let avail = (w - 6.0 - tail).max(1.0);
         let chars: Vec<char> = buf.chars().collect();
         let caret = self.input.edit.caret.min(chars.len());
-        let seg = |a: usize, b: usize| -> f32 {
-            let s: String = chars[a.min(chars.len())..b.min(chars.len())]
-                .iter()
-                .collect();
-            unsafe { renderer.measure_ro(&s, 12.0, 400, true) }
-        };
-        let full = seg(0, chars.len());
+        let (_bx, w, tail) = field_geo(field);
+        let avail = (w - 6.0 - tail).max(1.0);
+        let widths = unsafe { renderer.prefix_widths(&chars, 12.0, 400, true) };
+        let full = widths[chars.len()];
         if full <= avail {
             self.vis_start.set(0);
-            return (0, seg(0, caret));
+            return CaretLayout {
+                vis_start: 0,
+                cx: widths[caret],
+                widths,
+            };
         }
         let sticky = self.vis_start.get().min(caret);
-        if seg(sticky, caret) <= avail {
+        if widths[caret] - widths[sticky] <= avail {
             self.vis_start.set(sticky);
-            return (sticky, seg(sticky, caret));
+            return CaretLayout {
+                vis_start: sticky,
+                cx: widths[caret] - widths[sticky],
+                widths,
+            };
         }
         // 粘滞起点装不下光标才右移；宽度随起点单调不增，二分最小满足者
         let mut lo = sticky;
         let mut hi = caret;
         while lo < hi {
             let mid = (lo + hi) / 2;
-            if seg(mid, caret) <= avail {
+            if widths[caret] - widths[mid] <= avail {
                 hi = mid;
             } else {
                 lo = mid + 1;
             }
         }
         self.vis_start.set(lo);
-        (lo, seg(lo, caret))
+        CaretLayout {
+            vis_start: lo,
+            cx: widths[caret] - widths[lo],
+            widths,
+        }
     }
 
     /// 激活字段的显示串：Key 掩码态用等宽圆点（与渲染侧 mask 同规则），
@@ -683,7 +727,7 @@ impl Panel {
     }
 
     /// 光标行锚点 y（逻辑像素，含框内垂直偏移与滚动平移）；
-    /// 系统光标定位、IME 组合窗与行级失效共用
+    /// 系统光标定位、IME 组合窗与文本区命中判定共用
     fn caret_line_y(&self, field: InputField) -> f32 {
         let y = match field {
             InputField::Interval => {
@@ -708,27 +752,21 @@ impl Panel {
     }
 
     /// 文本区内 x（逻辑像素）→ char 位次：与 caret_layout 同一可视窗口，
-    /// 取最近字符边界（点击定位光标与拖选用）
-    pub(crate) fn caret_hit_test(&self, renderer: &Renderer, field: InputField, x: f32) -> usize {
-        let disp = self.field_display();
-        let chars: Vec<char> = disp.chars().collect();
-        let (vis_start, _) = self.caret_layout(renderer);
+    /// 取最近字符边界（点击定位光标与拖选用）；前缀宽全部查传入的宽表，
+    /// 零布局创建
+    pub(crate) fn caret_hit_test(&self, cl: &CaretLayout, field: InputField, x: f32) -> usize {
         let (bx, _w, _tail) = field_geo(field);
         let base = bx + 6.0;
-        let seg = |a: usize, b: usize| -> f32 {
-            let s: String = chars[a..b].iter().collect();
-            unsafe { renderer.measure_ro(&s, 12.0, 400, true) }
-        };
         // 前缀宽度随位次单调不减[caret_layout 二分所依赖的同一性质]：
-        // 最近边界只可能是最后一个宽度 <= x 的位次或其下一格，二分定位
-        // 即可。measure_ro 每次调用都新建 TextLayout，逐前缀线性扫在
-        // 128 字符缓冲 × 拖选高频移动下必然卡顿
+        // 最近边界只可能是最后一个宽度 <= x 的位次或其下一格，二分定位即可
         let target = x - base;
+        let n = cl.widths.len() - 1;
+        let vis_start = cl.vis_start;
         let mut lo = vis_start;
-        let mut hi = chars.len();
+        let mut hi = n;
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
-            if seg(vis_start, mid) <= target {
+            if cl.seg(vis_start, mid) <= target {
                 lo = mid;
             } else {
                 hi = mid - 1;
@@ -736,8 +774,8 @@ impl Panel {
         }
         // 平局取较小位次；零宽字符等宽块内取末位[原线性取首位]，
         // 光标 x 相同仅退格/删词的语义位置不同，可视等价
-        if lo < chars.len()
-            && (seg(vis_start, lo + 1) - target).abs() < (target - seg(vis_start, lo)).abs()
+        if lo < n
+            && (cl.seg(vis_start, lo + 1) - target).abs() < (target - cl.seg(vis_start, lo)).abs()
         {
             lo + 1
         } else {
@@ -756,41 +794,13 @@ impl Panel {
         }
     }
 
-    /// 输入行局部失效：编辑小动作只重画激活输入框所在行，
-    /// 软光栅代价最小，也避免全窗重绘的迟滞感
-    pub(crate) fn invalidate_input_line(&self, hwnd: HWND) {
-        if let Some(f) = self.input.field {
-            self.invalidate_field_line(hwnd, f);
-        }
-    }
-
-    /// 指定字段所在行的局部失效；字段切换时旧字段行（含激活边框与
-    /// 选区高亮像素）须一并失效，否则残留到下一次全窗重绘
-    fn invalidate_field_line(&self, hwnd: HWND, field: InputField) {
-        let (bx, w, _tail) = field_geo(field);
-        let line_y = self.caret_line_y(field) - layout::CARET_Y_OFFSET;
-        let rect = RECT {
-            left: self.px((bx - 2.0) as i32),
-            top: self.px((line_y - 2.0) as i32),
-            right: self.px((bx + w + 2.0) as i32),
-            bottom: self.px((line_y + layout::INPUT_H + 2.0) as i32),
-        };
-        unsafe {
-            let _ = InvalidateRect(Some(hwnd), Some(&rect), false);
-        }
-    }
-
-    /// 按字段内容计算光标位置，与 input_field 绘制对齐（同一 caret_layout）。
-    /// renderer 缺席（首帧前）时跳过定位，待下次调用补；组合窗随光标同步
-    pub fn update_caret(&self, hwnd: HWND, renderer: Option<&Renderer>) {
+    /// 按已算好的光标 x 落系统光标并同步 IME 组合窗；供同一事件内已持
+    /// 布局产物的调用点复用，不再重算
+    fn place_caret(&self, hwnd: HWND, cx: f32) {
         let Some(field) = self.input.field else {
             return;
         };
-        let Some(r) = renderer else {
-            return;
-        };
         let by = self.caret_line_y(field);
-        let (_vis_start, cx) = self.caret_layout(r);
         let bx = field_geo(field).0;
         let x = bx + 6.0 + cx;
         // by 已含 CARET_Y_OFFSET，框内垂直居中
@@ -800,8 +810,22 @@ impl Panel {
                 (by * self.dpi).round() as i32,
             );
             // 组合窗随光标重定位，中文组合串贴住光标
-            self.sync_ime_pos(hwnd);
+            self.sync_ime_pos(hwnd, cx);
         }
+    }
+
+    /// 按字段内容计算光标位置，与 input_field 绘制对齐（同一 caret_layout）。
+    /// 一次布局定光标与组合窗；renderer 缺席（首帧前）时跳过定位，待下
+    /// 次调用补
+    pub fn update_caret(&self, hwnd: HWND, renderer: Option<&Renderer>) {
+        if self.input.field.is_none() {
+            return;
+        }
+        let Some(r) = renderer else {
+            return;
+        };
+        let cx = self.caret_layout(r).cx;
+        self.place_caret(hwnd, cx);
     }
 }
 
@@ -850,7 +874,9 @@ pub extern "system" fn panel_wndproc(
     unsafe {
         match msg {
             WM_PAINT => {
-                // 不走 BeginPaint：验证客户区后直接渲染
+                // 不走 BeginPaint：验证客户区后直接渲染。失效一律整窗、不做
+                // 局部矩形收窄：HwndRenderTarget 呈现整窗后台缓冲，收窄省不
+                // 下绘制，编辑路径同样整窗 InvalidateRect
                 let _ = ValidateRect(Some(hwnd), None);
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
@@ -992,17 +1018,20 @@ pub extern "system" fn panel_wndproc(
                 // 拖动分支走 as_mut 的 reborrow 后提前返回；此处 move 同一
                 // 绑定——再取一次 app_from_tray 会构造两个活跃可变别名
                 if let Some(app) = app {
-                    // 拖选中：光标随鼠标指针推进扩选区
+                    // 拖选中：光标随鼠标指针推进扩选区。宽表一次成型供命中
+                    // 换算，扩选落定后 update_caret 按新位次重定可视窗口，
+                    // 每次鼠标移动共两次布局
                     if app.panel.selecting {
                         let x = x_of(lparam) / app.panel.dpi;
                         if let (Some(f), Some(r)) =
                             (app.panel.input.field, app.panel.renderer.as_ref())
                         {
-                            let pos = app.panel.caret_hit_test(r, f, x);
+                            let cl = app.panel.caret_layout(r);
+                            let pos = app.panel.caret_hit_test(&cl, f, x);
                             if pos != app.panel.input.edit.caret {
                                 app.panel.input.edit.place(pos, true);
                                 app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-                                app.panel.invalidate_input_line(hwnd);
+                                let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
                         return LRESULT(0);
@@ -1185,7 +1214,7 @@ pub extern "system" fn panel_wndproc(
                     };
                     if acted {
                         app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-                        app.panel.invalidate_input_line(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -1282,7 +1311,7 @@ pub extern "system" fn panel_wndproc(
                         crate::app::confirm_panel_input(app, hwnd);
                     }
                     app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-                    app.panel.invalidate_input_line(hwnd);
+                    let _ = InvalidateRect(Some(hwnd), None, false);
                 }
                 LRESULT(0)
             }
@@ -1350,7 +1379,9 @@ pub extern "system" fn panel_wndproc(
                             _ => 1,
                         };
                         app.panel.text_clicks = Some((now, px, py, count));
-                        let pos = app.panel.caret_hit_test(r, f, x);
+                        // 命中换算与光标定位共用一次宽表布局
+                        let cl = app.panel.caret_layout(r);
+                        let pos = app.panel.caret_hit_test(&cl, f, x);
                         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
                         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
                         match count {
@@ -1375,7 +1406,7 @@ pub extern "system" fn panel_wndproc(
                         }
                         app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
                         app.panel.selecting = true;
-                        app.panel.invalidate_input_line(hwnd);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                         let _ = SetCapture(hwnd);
                         return LRESULT(0);
                     }
@@ -1530,6 +1561,7 @@ fn read_clipboard_text() -> Option<String> {
 /// 写 Unicode 文本到剪贴板
 fn write_clipboard_text(text: &str) {
     unsafe {
+        use windows::Win32::Foundation::GlobalFree;
         use windows::Win32::System::DataExchange::{
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
@@ -1554,14 +1586,23 @@ fn write_clipboard_text(text: &str) {
             };
             let dst = GlobalLock(hg);
             if dst.is_null() {
+                // 所有权未转移给系统，须自释放防泄漏
+                let _ = GlobalFree(Some(hg));
                 return false;
             }
             std::ptr::copy_nonoverlapping(units.as_ptr(), dst as *mut u16, units.len());
             let _ = GlobalUnlock(hg);
-            SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0))).is_ok()
+            if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0))).is_err() {
+                // 同上：系统未接管句柄
+                let _ = GlobalFree(Some(hg));
+                return false;
+            }
+            true
         })();
         let _ = CloseClipboard();
-        let _ = ok;
+        if !ok {
+            crate::platform::log("[Quotify] 剪贴板写入失败");
+        }
     }
 }
 

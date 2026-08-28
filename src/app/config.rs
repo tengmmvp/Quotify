@@ -225,8 +225,12 @@ pub fn load() -> Config {
 pub fn save(config: &Config) {
     let path = config_path();
     let tmp = path.with_extension("toml.tmp");
-    let Ok(text) = toml::to_string_pretty(config) else {
-        return;
+    let text = match toml::to_string_pretty(config) {
+        Ok(text) => text,
+        Err(e) => {
+            crate::platform::log(&format!("config.toml 序列化失败: {e}"));
+            return;
+        }
     };
     if let Err(e) = std::fs::write(&tmp, &text) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));

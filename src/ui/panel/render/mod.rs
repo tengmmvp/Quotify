@@ -33,6 +33,7 @@ use super::anim::{Tween, animations_allowed, ease_out_cubic};
 use super::model::PanelModel;
 use super::theme::Theme;
 use super::{Panel, PanelView};
+use crate::platform::wide;
 
 /// 外观模式选择：System = 跟随系统
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,6 +199,10 @@ pub struct Renderer {
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: HashMap<(u32, u16, bool), IDWriteTextFormat>,
     ro_formats: std::cell::RefCell<HashMap<(&'static str, u32, u16), IDWriteTextFormat>>,
+    /// 帧内测宽缓存：键为 ('static 文本指针, 字节长, 字号位, 字重, mono)，
+    /// 只收编译期常量文本——堆串地址会被复用，同地址不同串将拿错宽；
+    /// 帧首 clear，不跨帧
+    frame_measures: HashMap<(usize, usize, u32, u16, bool), f32>,
     pub theme: Theme,
     pub hits: Vec<(Hit, D2D_RECT_F)>,
     pub hover: Option<Hit>,
@@ -230,6 +235,7 @@ impl Renderer {
                 brushes: HashMap::new(),
                 formats: HashMap::new(),
                 ro_formats: std::cell::RefCell::new(HashMap::new()),
+                frame_measures: HashMap::new(),
                 theme: Theme::new(Theme::system_appearance()),
                 hits: Vec::new(),
                 hover: None,
@@ -292,10 +298,10 @@ impl Renderer {
         self.measure_with(&fmt, s)
     }
 
-    /// 只读测宽：供 &self 上下文（光标定位与渲染共用 caret_layout）使用。
-    /// format 按 (字号,字重,字体族) 缓存——拖选高频路径上每次鼠标移动
-    /// 做多次测宽，逐次建 COM 对象纯属浪费
-    pub(crate) unsafe fn measure_ro(&self, s: &str, size: f32, weight: u16, mono: bool) -> f32 {
+    /// 只读上下文的 format 取用：按 (族,字号,字重) 缓存，缺席时建一次。
+    /// 供 &self 测宽路径（前缀宽表）共用——拖选高频路径上逐次建 COM
+    /// 对象纯属浪费
+    unsafe fn ro_format(&self, size: f32, weight: u16, mono: bool) -> Option<IDWriteTextFormat> {
         unsafe {
             let family = if mono {
                 "Consolas"
@@ -306,22 +312,112 @@ impl Renderer {
             };
             let key = (family, size.to_bits(), weight);
             if let Some(f) = self.ro_formats.borrow().get(&key) {
-                return self.measure_with(f, s);
+                return Some(f.clone());
             }
-            let Ok(fmt) = self.dwrite.CreateTextFormat(
-                PCWSTR(wide(family).as_ptr()),
-                None,
-                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT(weight as i32),
-                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
-                windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
-                size,
-                PCWSTR(wide("").as_ptr()),
-            ) else {
-                return 0.0;
-            };
+            let fmt = self
+                .dwrite
+                .CreateTextFormat(
+                    PCWSTR(wide(family).as_ptr()),
+                    None,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_WEIGHT(weight as i32),
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STYLE_NORMAL,
+                    windows::Win32::Graphics::DirectWrite::DWRITE_FONT_STRETCH_NORMAL,
+                    size,
+                    PCWSTR(wide("").as_ptr()),
+                )
+                .ok()?;
             self.ro_formats.borrow_mut().insert(key, fmt.clone());
-            self.measure_with(&fmt, s)
+            Some(fmt)
         }
+    }
+
+    /// 前缀宽表：整串一次 CreateTextLayout + GetClusterMetrics，按簇的
+    /// UTF-16 长度把簇宽摊到字符位次上累积——P[i] = 前 i 个字符的累计
+    /// 宽，表长 = 字符数 + 1。任何「前缀宽度查询」都改为查表（索引或
+    /// 二分），替代逐前缀新建 TextLayout 的测量；簇内字符边界（代理对/
+    /// 组合记号归并簇）取簇末累计宽，与可视切片/截断只在字符边界取宽
+    /// 的用法相容。DWrite 不可用时退化为全零表，与旧测量失败返 0 一致
+    pub(crate) unsafe fn prefix_widths(
+        &self,
+        chars: &[char],
+        size: f32,
+        weight: u16,
+        mono: bool,
+    ) -> Vec<f32> {
+        unsafe {
+            let n = chars.len();
+            let mut table = vec![0.0f32; n + 1];
+            if n == 0 {
+                return table;
+            }
+            let Some(fmt) = self.ro_format(size, weight, mono) else {
+                return table;
+            };
+            // encode_utf16 的 &mut [u16] 参数按切片长度校验容量，裸 Vec
+            // 长度恒 0 必 panic；栈上双字缓冲接住单字符再入列
+            let mut w16: Vec<u16> = Vec::with_capacity(n);
+            for c in chars {
+                let mut buf = [0u16; 2];
+                w16.extend_from_slice(c.encode_utf16(&mut buf));
+            }
+            let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
+                return table;
+            };
+            let mut cms = vec![
+                windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default();
+                w16.len()
+            ];
+            let mut count = 0u32;
+            if layout
+                .GetClusterMetrics(Some(&mut cms), &mut count)
+                .is_err()
+            {
+                return table;
+            }
+            // 每字符的 UTF-16 起始单位位次；簇宽记到簇末所在字符边界上
+            let mut starts: Vec<usize> = Vec::with_capacity(n + 1);
+            let mut off = 0usize;
+            for c in chars {
+                starts.push(off);
+                off += c.len_utf16();
+            }
+            starts.push(off);
+            let mut w = 0.0f32;
+            let mut units = 0usize;
+            let mut ci = 0usize;
+            for cm in &cms[..count as usize] {
+                w += cm.width;
+                units += cm.length as usize;
+                while ci < n && starts[ci + 1] <= units {
+                    table[ci + 1] = w;
+                    ci += 1;
+                }
+            }
+            // 度量覆不满串（异常短缺）时补平尾，保住单调不减
+            for t in table.iter_mut().skip(ci + 1) {
+                *t = w;
+            }
+            table
+        }
+    }
+
+    /// 帧内去重测宽：同帧内相同 ('static 文本, 字号, 字重, mono) 只建一次
+    /// layout[族由 mono 代理，实参族仅两三种]。ellipsize 的省略号、区块
+    /// 标题等每帧重复出现的常量文本走这里；收窄理由见 frame_measures 字段注释
+    unsafe fn measure_static(
+        &mut self,
+        s: &'static str,
+        size: f32,
+        weight: u16,
+        mono: bool,
+    ) -> f32 {
+        let key = (s.as_ptr() as usize, s.len(), size.to_bits(), weight, mono);
+        if let Some(&w) = self.frame_measures.get(&key) {
+            return w;
+        }
+        let w = self.measure(s, size, weight, mono);
+        self.frame_measures.insert(key, w);
+        w
     }
 
     /// 按 format 建 layout 取宽
@@ -343,7 +439,9 @@ impl Renderer {
         }
     }
 
-    /// 真实度量保头截断
+    /// 真实度量保头截断；返回 (截断串, 该串实际宽)——调用点排版紧随
+    /// 其后的元素（chevron、NEW 徽标）不必再 measure 复测。宽度取自
+    /// 簇宽累计：不截断即全串簇宽和，截断则补省略号宽
     unsafe fn ellipsize(
         &mut self,
         s: &str,
@@ -351,18 +449,21 @@ impl Renderer {
         max_w: f32,
         weight: u16,
         mono: bool,
-    ) -> String {
+    ) -> (String, f32) {
         if s.is_empty() {
-            return String::new();
+            return (String::new(), 0.0);
         }
-        let ell_w = self.measure("…", size, weight, mono);
+        // 省略号宽走帧内去重：同帧多次 ellipsize 同参时只建一次 layout
+        let ell_w = self.measure_static("…", size, weight, mono);
         let budget = (max_w - ell_w).max(0.0);
         let Some(fmt) = self.format(size, weight, mono) else {
-            return s.to_string();
+            return (s.to_string(), 0.0);
         };
         let w16: Vec<u16> = s.encode_utf16().collect();
         let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
-            return s.to_string();
+            // 退化路径按整串测量兜底，宽 0 会让跟随元素叠上文本头
+            let w = self.measure_with(&fmt, s);
+            return (s.to_string(), w);
         };
         let mut cms = vec![
             windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default();
@@ -370,7 +471,9 @@ impl Renderer {
         ];
         let mut n = 0u32;
         if layout.GetClusterMetrics(Some(&mut cms), &mut n).is_err() {
-            return s.to_string();
+            // 簇度量缺席时截断无从谈起，宽退回整串测量
+            let w = self.measure(s, size, weight, mono);
+            return (s.to_string(), w);
         }
         cms.truncate(n as usize);
         let mut w = 0.0f32;
@@ -383,11 +486,12 @@ impl Renderer {
             units += cm.length as usize;
         }
         if units >= w16.len() {
-            return s.to_string();
+            return (s.to_string(), w);
         }
         let mut out: Vec<u16> = w16[..units].to_vec();
         out.push(0x2026);
-        String::from_utf16_lossy(&out)
+        let disp = String::from_utf16_lossy(&out);
+        (disp, w + ell_w)
     }
 
     /// 绘制一帧；`rect_phys` 为物理像素，绘制全程用逻辑像素 DIP。
@@ -413,6 +517,7 @@ impl Renderer {
                 bottom: ((rect_phys.bottom - rect_phys.top) as f32 / dpi).round() as i32,
             };
             self.hits.clear();
+            self.frame_measures.clear();
             target.BeginDraw();
             self.draw(&target, panel, model, view, &rect_logical);
             match target.EndDraw(None, None) {
@@ -798,10 +903,6 @@ impl Renderer {
         }
         Some(self.target.clone())
     }
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 颜色各通道量化 8bit 打包作刷子缓存键——与显示色深一致，无视觉损失

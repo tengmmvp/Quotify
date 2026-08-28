@@ -4,16 +4,16 @@ pub mod config;
 mod notify;
 
 use chrono::{DateTime, Utc};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU,
-    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
-    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_NULL, WNDCLASSW,
-    WS_POPUP,
+    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics,
+    GetWindowLongPtrW, HMENU, KillTimer, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+    RegisterClassW, SM_CXSMICON, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN,
+    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND,
+    WM_DESTROY, WM_MOUSEMOVE, WM_NULL, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -30,8 +30,8 @@ use crate::service::poller::{
 };
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
-use crate::ui::panel::Panel;
 use crate::ui::panel::layout::INTERVAL_PRESETS;
+use crate::ui::panel::{Panel, PanelMode};
 use crate::ui::tray::{self, TrayIcon};
 use notify::{NOTIFY_TITLE, check_reset, check_threshold};
 
@@ -42,6 +42,11 @@ const IDM_EXIT: u16 = 1003;
 
 /// 导入配置文件大小上限
 const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
+
+/// 托盘悬停兜底计时器 id
+const TIMER_TRAY_HOVER: usize = 5;
+/// 兜底悬停判定时长
+const TRAY_HOVER_MS: u32 = 500;
 
 /// v4 回调的键盘激活通知码
 const NIN_KEYSELECT: u32 = 0x0401;
@@ -319,17 +324,33 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let app = app_from(hwnd);
             let (code, _) = tray::parse_callback(lparam);
             match code {
+                WM_MOUSEMOVE => {
+                    // 部分 Win11 任务栏重写后不再发 NIN_POPUPOPEN 悬停通知
+                    // [微软 Q&A 有案在录]，鼠标移动回调仍会到达：起计时器
+                    // 模拟悬停，重复移动自动重置计时；到点由 WM_TIMER 校验
+                    // 光标仍在图标上才弹，正常机器由系统通知先行并掐掉计时
+                    unsafe {
+                        let _ = SetTimer(Some(hwnd), TIMER_TRAY_HOVER, TRAY_HOVER_MS, None);
+                    }
+                }
                 tray::NIN_POPUPOPEN => {
+                    // 系统悬停通知已生效，掐掉兜底计时防稍后重复弹
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
+                    }
+                    // 与兜底同守卫：Pinned 态悬停不打断正在看的视图
                     if let Some(app) = app
+                        && app.panel.mode == PanelMode::Hidden
                         && let Some(rect) = tray_rect(app)
                     {
-                        let n = app.config.accounts.len();
-                        sync_main_height(app);
-                        app.panel.show_preview(hwnd, rect, n);
-                        apply_appearance(app);
+                        open_hover_preview(hwnd, app, rect);
                     }
                 }
                 tray::NIN_POPUPCLOSE => {
+                    // 悬停已结束，兜底计时一并作废
+                    unsafe {
+                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
+                    }
                     if let Some(app) = app {
                         app.panel.request_close();
                     }
@@ -350,6 +371,23 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     }
                 }
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            // 悬停兜底计时到点：面板已开[系统通知先到]则静默退场，仅光标
+            // 仍停在图标上且面板隐藏时才补弹
+            if wparam.0 == TIMER_TRAY_HOVER {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
+                }
+                if let Some(app) = app_from(hwnd)
+                    && app.panel.mode == PanelMode::Hidden
+                    && let Some(rect) = tray_rect(app)
+                    && cursor_in_tray(&rect)
+                {
+                    open_hover_preview(hwnd, app, rect);
+                }
             }
             LRESULT(0)
         }
@@ -454,24 +492,8 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         // 慢解析会在进程内排队，拖住启动轮询、延后面板首屏
                         if app.news.is_none() && !app.news_fetched {
                             app.news_fetched = true;
-                            struct SendHwnd(HWND);
-                            unsafe impl Send for SendHwnd {}
-                            let tray = SendHwnd(hwnd);
-                            std::thread::spawn(move || {
-                                let tray = tray;
-                                let r = crate::service::whatsnew::fetch_latest();
-                                let boxed = Box::into_raw(Box::new(r));
-                                let posted = unsafe {
-                                    PostMessageW(
-                                        Some(tray.0),
-                                        WM_APP_NEWS_RESULT,
-                                        WPARAM(boxed as usize),
-                                        Default::default(),
-                                    )
-                                };
-                                if posted.is_err() {
-                                    drop(unsafe { Box::from_raw(boxed) });
-                                }
+                            crate::platform::post::spawn_post(hwnd, WM_APP_NEWS_RESULT, || {
+                                crate::service::whatsnew::fetch_latest()
                             });
                         }
                         let h = crate::ui::panel::render::about::about_height(
@@ -498,6 +520,29 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 
 fn tray_rect(app: &App) -> Option<RECT> {
     app.tray.as_ref().and_then(|t| t.rect())
+}
+
+/// 悬停弹预览面板：系统通知与兜底计时两路共用同一打开序列
+fn open_hover_preview(hwnd: HWND, app: &mut App, rect: RECT) {
+    let n = app.config.accounts.len();
+    sync_main_height(app);
+    app.panel.show_preview(hwnd, rect, n);
+    apply_appearance(app);
+}
+
+/// 光标是否仍在托盘图标上，触发弹面板的判定。容差收紧到 ±8：explorer
+/// 只在光标压着图标矩形时发 WM_MOUSEMOVE，宽容差会让「扫过图标后停在
+/// 相邻托盘项上」误弹[移动已停、计时不再重置]。面板保持打开用的
+/// cursor_near_anchor 仍是 ±24，两处语义不同
+fn cursor_in_tray(rect: &RECT) -> bool {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    pt.x >= rect.left - 8
+        && pt.x <= rect.right + 8
+        && pt.y >= rect.top - 8
+        && pt.y <= rect.bottom + 8
 }
 
 /// App 装箱后存活到进程退出，GWLP_USERDATA 指针全程有效，可转写为
@@ -701,10 +746,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
         }
-        // key 明暗切换；点击不夺输入焦点，输入态保持
+        // key 明暗切换；点击不夺输入焦点，输入态保持。明暗切换改变显示串
+        // 宽度，系统光标与 IME 组合窗须按新宽度重定位
         Hit::RevealKey => {
             app.panel.key_revealed = !app.panel.key_revealed;
             if let Some(p) = app.panel.hwnd {
+                app.panel.update_caret(p, app.panel.renderer.as_ref());
                 unsafe {
                     let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(p), None, false);
                 }
@@ -737,24 +784,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 app.update_checking = true;
                 app.update_status = None;
                 app.panel.update_available = false;
-                struct SendHwnd(HWND);
-                unsafe impl Send for SendHwnd {}
-                let tray = SendHwnd(app.hwnd());
-                std::thread::spawn(move || {
-                    let tray = tray;
-                    let r = crate::service::update::check_latest();
-                    let boxed = Box::into_raw(Box::new(r));
-                    let posted = unsafe {
-                        windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                            Some(tray.0),
-                            WM_APP_UPDATE_RESULT,
-                            WPARAM(boxed as usize),
-                            Default::default(),
-                        )
-                    };
-                    if posted.is_err() {
-                        drop(unsafe { Box::from_raw(boxed) });
-                    }
+                crate::platform::post::spawn_post(app.hwnd(), WM_APP_UPDATE_RESULT, || {
+                    crate::service::update::check_latest()
                 });
             }
         }
@@ -885,19 +916,19 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 应用自定义轮询间隔（分钟）
-fn apply_interval(app: &mut App, panel_hwnd: HWND) {
-    let secs = app
-        .panel
-        .input
-        .interval
-        .trim()
+/// 自定义间隔文本（分钟）→ 秒：0/非数字/溢出拒绝，越界夹进合法区间
+fn parse_interval_secs(s: &str) -> Option<u64> {
+    s.trim()
         .parse::<u64>()
         .ok()
         .filter(|m| *m > 0)
         .and_then(|m| m.checked_mul(60))
-        .map(|s| s.clamp(MIN_POLL_SECS, MAX_POLL_SECS));
-    let Some(secs) = secs else {
+        .map(|s| s.clamp(MIN_POLL_SECS, MAX_POLL_SECS))
+}
+
+/// 应用自定义轮询间隔（分钟）
+fn apply_interval(app: &mut App, panel_hwnd: HWND) {
+    let Some(secs) = parse_interval_secs(&app.panel.input.interval) else {
         crate::platform::log("[Quotify] 自定义间隔无效");
         return;
     };
@@ -997,7 +1028,7 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
         crate::platform::log(&format!("[Quotify] 代理地址无效，保持原连接: {e}"));
     }
-    app.panel.input.field = None;
+    app.panel.clear_input(panel_hwnd);
     // 换代理后的拉取是新尝试轮次，同文案失败再现时也重记日志
     app.last_logged_error = None;
     if let Some(p) = &app.poller {
@@ -1147,7 +1178,7 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
             switch_poll_source(app);
             app.panel.adding_account = false;
             app.panel.key_revealed = false;
-            app.panel.input.field = None;
+            app.panel.clear_input(panel_hwnd);
             app.update_status = None;
             app.update_checking = false;
             app.panel.update_available = false;
@@ -1417,5 +1448,106 @@ pub fn run() -> i32 {
             CoUninitialize();
         }
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::peak::DEFAULT_PEAK;
+
+    #[test]
+    fn interval_minutes_parse_to_secs() {
+        assert_eq!(parse_interval_secs("5"), Some(300));
+        // trim 后再解析
+        assert_eq!(parse_interval_secs("  10 "), Some(600));
+    }
+
+    #[test]
+    fn interval_rejects_zero_and_non_numeric() {
+        assert_eq!(parse_interval_secs("0"), None);
+        assert_eq!(parse_interval_secs(""), None);
+        assert_eq!(parse_interval_secs("abc"), None);
+        // 间隔粒度是整分钟，小数不收
+        assert_eq!(parse_interval_secs("1.5"), None);
+    }
+
+    #[test]
+    fn interval_overflow_rejected() {
+        assert_eq!(parse_interval_secs(&u64::MAX.to_string()), None);
+    }
+
+    #[test]
+    fn interval_above_cap_clamped() {
+        // 1441 分钟 = 86460 秒，超一天上限
+        assert_eq!(parse_interval_secs("1441"), Some(MAX_POLL_SECS));
+    }
+
+    #[test]
+    fn peak_range_equal_or_invalid_falls_back() {
+        let mut c = Config::default();
+        c.general.peak_start = "09:00".into();
+        c.general.peak_end = "09:00".into();
+        assert_eq!(peak_range_of(&c), DEFAULT_PEAK);
+        // 格式非法同样回退官方默认
+        c.general.peak_start = "9am".into();
+        assert_eq!(peak_range_of(&c), DEFAULT_PEAK);
+    }
+
+    #[test]
+    fn peak_range_valid_window() {
+        let mut c = Config::default();
+        c.general.peak_start = "09:00".into();
+        c.general.peak_end = "18:00".into();
+        assert_eq!(peak_range_of(&c), (9 * 60, 18 * 60));
+    }
+
+    #[test]
+    fn peak_range_overnight_kept_verbatim() {
+        // start > end 表示跨午夜，原样保留不交换
+        let mut c = Config::default();
+        c.general.peak_start = "22:00".into();
+        c.general.peak_end = "06:00".into();
+        assert_eq!(peak_range_of(&c), (22 * 60, 6 * 60));
+    }
+
+    #[test]
+    fn normalize_clamps_out_of_range() {
+        let mut c = Config::default();
+        c.general.notify_threshold_percent = 0;
+        c.general.poll_interval_secs = 0;
+        normalize_config(&mut c);
+        assert_eq!(c.general.notify_threshold_percent, 1);
+        assert_eq!(c.general.poll_interval_secs, MIN_POLL_SECS);
+
+        c.general.notify_threshold_percent = 200;
+        c.general.poll_interval_secs = u64::MAX;
+        normalize_config(&mut c);
+        assert_eq!(c.general.notify_threshold_percent, 100);
+        assert_eq!(c.general.poll_interval_secs, MAX_POLL_SECS);
+    }
+
+    #[test]
+    fn normalize_keeps_valid_values() {
+        let mut c = Config::default();
+        c.general.notify_threshold_percent = 80;
+        c.general.poll_interval_secs = 300;
+        normalize_config(&mut c);
+        assert_eq!(c.general.notify_threshold_percent, 80);
+        assert_eq!(c.general.poll_interval_secs, 300);
+    }
+
+    #[test]
+    fn appearance_resolved_from_setting() {
+        use crate::ui::panel::theme::{Appearance, Theme};
+        assert_eq!(resolved_appearance(Some("light")), Appearance::Light);
+        // 大小写不敏感
+        assert_eq!(resolved_appearance(Some("DARK")), Appearance::Dark);
+        // 未知值与未设置同为跟随系统
+        assert_eq!(
+            resolved_appearance(Some("blue")),
+            Theme::system_appearance()
+        );
+        assert_eq!(resolved_appearance(None), Theme::system_appearance());
     }
 }

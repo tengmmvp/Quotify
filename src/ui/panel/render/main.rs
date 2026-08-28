@@ -29,7 +29,7 @@ impl Renderer {
     ) {
         let s = model.strings;
         let pad = layout::CONTENT_PAD;
-        let mut y = dy + 16.0;
+        let mut y = dy + layout::MAIN_TOP_PAD;
         let snap = model.snapshot;
 
         // ── 顶栏：账号名 + 套餐副标题 ──
@@ -58,7 +58,7 @@ impl Renderer {
         let tw = w - tx - 88.0 - chevron_w;
         let block_h = if meta.is_some() { 39.0 } else { 22.0 };
         let block_top = y + 26.0 - block_h / 2.0;
-        let title_disp = self.ellipsize(title, 16.0, tw, 500, false);
+        let (title_disp, title_disp_w) = self.ellipsize(title, 16.0, tw, 500, false);
         self.text(
             target,
             &title_disp,
@@ -72,7 +72,8 @@ impl Renderer {
             alpha,
         );
         if model.accounts_count > 1 {
-            let ax = tx + self.measure(&title_disp, 16.0, 500, false) + 6.0;
+            // chevron 紧跟标题尾：宽度直接用 ellipsize 的返回值，不再复测
+            let ax = tx + title_disp_w + 6.0;
             self.chevron(target, ax, y + 26.0, self.theme.text_secondary, alpha);
             self.hits.push((
                 Hit::AccountSwitch,
@@ -111,7 +112,7 @@ impl Renderer {
             self.anim.spin,
         );
         self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
-        y += 52.0;
+        y += layout::MAIN_TOPBAR_H;
 
         // ── 主体三态：空/加载、错误卡、数据区 ──
         match (snap, model.error) {
@@ -239,34 +240,20 @@ impl Renderer {
             // 有数据即以数据区为主体；同时带错误时旧数据照常展示，错误降级页脚
             _ => {
                 if let Some(snap) = snap {
-                    self.divider(target, pad, y + 2.0, w - pad * 2.0, alpha);
-                    y += 14.0;
-                    let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
-                    target.FillRectangle(
-                        &D2D_RECT_F {
-                            left: pad,
-                            top: y + 1.0,
-                            right: pad + 3.0,
-                            bottom: y + 13.0,
-                        },
-                        &bar,
-                    );
-                    self.text(
+                    let ty = self.section_header(
                         target,
                         s.usage_section,
-                        pad + 7.0,
+                        pad,
                         y,
+                        w,
                         w - pad * 2.0 - 7.0,
-                        17.0,
-                        12.0,
-                        600,
-                        self.theme.text_tertiary,
                         alpha,
+                        false,
                     );
                     if crate::ui::peak::is_peak_now(model.peak_range) {
-                        self.peak_badge(target, y, w, alpha, s);
+                        self.peak_badge(target, ty, w, alpha, s);
                     }
-                    y += 26.0;
+                    y = ty + layout::MAIN_MASTHEAD_ROW_H;
 
                     let detail_of = |cur: Option<f64>, tot: Option<f64>| -> Option<String> {
                         match (cur, tot) {
@@ -328,32 +315,18 @@ impl Renderer {
                     }
 
                     if let Some(ts) = &snap.token_stats {
-                        y += 6.0;
-                        self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
-                        y += 14.0;
-                        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
-                        target.FillRectangle(
-                            &D2D_RECT_F {
-                                left: pad,
-                                top: y + 1.0,
-                                right: pad + 3.0,
-                                bottom: y + 13.0,
-                            },
-                            &bar,
-                        );
-                        self.text(
+                        y += layout::MAIN_SECTION_GAP;
+                        let ty = self.section_header(
                             target,
                             s.token_usage_section,
-                            pad + 7.0,
+                            pad,
                             y,
+                            w,
                             w - pad * 2.0 - 7.0,
-                            17.0,
-                            12.0,
-                            600,
-                            self.theme.text_tertiary,
                             alpha,
+                            true,
                         );
-                        y += 22.0;
+                        y = ty + layout::MAIN_TOKEN_ROWS_ADV;
                         y = self.leader_row(
                             target,
                             s.today_tokens,
@@ -373,30 +346,16 @@ impl Renderer {
                     }
 
                     if let Some(b) = &snap.balance {
-                        y += 6.0;
-                        self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
-                        y += 14.0;
-                        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
-                        target.FillRectangle(
-                            &D2D_RECT_F {
-                                left: pad,
-                                top: y + 1.0,
-                                right: pad + 3.0,
-                                bottom: y + 13.0,
-                            },
-                            &bar,
-                        );
-                        self.text(
+                        y += layout::MAIN_SECTION_GAP;
+                        let ty = self.section_header(
                             target,
                             s.balance_label,
-                            pad + 7.0,
+                            pad,
                             y,
+                            w,
                             140.0,
-                            17.0,
-                            12.0,
-                            600,
-                            self.theme.text_tertiary,
                             alpha,
+                            true,
                         );
                         let amount = if b.available.abs() >= 1e6 {
                             fmt::compact_number(b.available)
@@ -408,9 +367,9 @@ impl Renderer {
                             target,
                             &line,
                             w - pad - 140.0,
-                            y,
+                            ty,
                             140.0,
-                            18.0,
+                            layout::MAIN_BALANCE_ROW_H,
                             12.0,
                             500,
                             self.theme.text_primary,
@@ -419,7 +378,7 @@ impl Renderer {
                     }
                 }
                 // 页脚钉底；视口被压矮时装不下内容，钉内容底免叠数据区
-                let footer_y = dy + h.max(content_h) - 36.0;
+                let footer_y = dy + h.max(content_h) - layout::MAIN_FOOTER_H;
                 if let Some(e) = model.error {
                     let msg = error_text(s, e);
                     let line = match model.snapshot {
@@ -480,6 +439,57 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// 数据段区块头：分隔线 + 强调条 + 标题；返回标题行顶 y，段内后续
+    /// 推进（usage 叠高峰徽标后走刊头行高、Token 接票据行、余额即文本
+    /// 行）由调用点自定。刊头用实线且低 2px 挂段起点，数据段虚线贴段起点
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn section_header(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &str,
+        pad: f32,
+        y: f32,
+        w: f32,
+        title_w: f32,
+        alpha: f32,
+        dashed: bool,
+    ) -> f32 {
+        if dashed {
+            self.dashed_divider(target, pad, y, w - pad * 2.0, alpha);
+        } else {
+            self.divider(target, pad, y + 2.0, w - pad * 2.0, alpha);
+        }
+        // 两种段的标题距段起点同为 14：刊头是段起点起算，数据段是分隔线起算
+        let ty = y + if dashed {
+            layout::MAIN_SECTION_HEAD
+        } else {
+            layout::MAIN_MASTHEAD_RULE_GAP
+        };
+        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+        target.FillRectangle(
+            &D2D_RECT_F {
+                left: pad,
+                top: ty + 1.0,
+                right: pad + 3.0,
+                bottom: ty + 13.0,
+            },
+            &bar,
+        );
+        self.text(
+            target,
+            label,
+            pad + 7.0,
+            ty,
+            title_w,
+            17.0,
+            12.0,
+            600,
+            self.theme.text_tertiary,
+            alpha,
+        );
+        ty
     }
 
     /// 指标行：标签 + 百分比 + 进度条，底行左倒计时右已用明细；返回下一行 y
@@ -595,7 +605,7 @@ impl Renderer {
                 false,
             );
         }
-        y + 52.0
+        y + layout::MAIN_METRIC_ROW_H
     }
 
     /// 票据合计行：左 label、右数值，中间引导点自动填满；返回下一行 y
@@ -609,7 +619,7 @@ impl Renderer {
         alpha: f32,
     ) -> f32 {
         let pad = layout::CONTENT_PAD;
-        let row_h = 19.0;
+        let row_h = layout::MAIN_LEADER_ROW_H;
         self.text(
             target,
             label,
@@ -665,7 +675,8 @@ impl Renderer {
         let pad = layout::CONTENT_PAD;
         let bh = 14.0;
         let bw = bh * (7.0 / 13.0);
-        let badge_w = bw + 4.0 + self.measure(s.peak_badge, 12.0, 600, false);
+        // 徽标文字是 i18n 常量文本，走帧内去重测宽
+        let badge_w = bw + 4.0 + self.measure_static(s.peak_badge, 12.0, 600, false);
         let bx = w - pad - badge_w;
         if self.bolt_geo.is_none() {
             self.bolt_geo = self.build_bolt_glyph();

@@ -3,6 +3,9 @@
 use crate::api::client::{MAX_BODY_BYTES, agent_long};
 use crate::service::update::REPO;
 
+/// 动态条数上限
+pub const NEWS_MAX: usize = 3;
+
 /// 单条动态
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewsItem {
@@ -36,7 +39,8 @@ pub fn fetch_latest() -> Result<Vec<NewsItem>, String> {
     Ok(parse_news(&body))
 }
 
-/// 解析 `## 日期 · 标题` 分节；无有效节的输入返回空表
+/// 解析 `## 日期 · 标题` 分节；无有效节的输入返回空表；仅保留最新
+/// NEWS_MAX 条常驻
 pub fn parse_news(text: &str) -> Vec<NewsItem> {
     let mut out: Vec<NewsItem> = Vec::new();
     for line in text.lines() {
@@ -64,6 +68,8 @@ pub fn parse_news(text: &str) -> Vec<NewsItem> {
             lines: Vec::new(),
         });
     }
+    // 解析吃全量，常驻只留最新 NEWS_MAX 条
+    out.truncate(NEWS_MAX);
     out
 }
 
@@ -114,5 +120,20 @@ mod tests {
         let items = parse_news(md);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].lines, vec!["正文一", "正文二"]);
+    }
+
+    /// 解析吃全量、常驻截断：超出 NEWS_MAX 的节只留文档最前（最新）的
+    #[test]
+    fn parse_news_truncates_to_news_max() {
+        let mut md = String::new();
+        for i in (1..=5).rev() {
+            md.push_str(&format!("## 2026-08-0{i} · 标题{i}\n\n正文{i}\n\n"));
+        }
+        let items = parse_news(&md);
+        assert_eq!(items.len(), NEWS_MAX);
+        assert_eq!(
+            items.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
+            vec!["标题5", "标题4", "标题3"]
+        );
     }
 }

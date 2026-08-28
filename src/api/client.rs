@@ -1,6 +1,9 @@
 //! 用量查询 HTTP 客户端
 
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
 use chrono::Timelike;
@@ -98,80 +101,148 @@ fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
         .http_status_as_error(false)
         // 空闲连接默认 15s 回收，短于轮询间隔致每轮重建连接；放宽让池子跨轮询存活
         .max_idle_age(Duration::from_secs(86400));
-    if let Some(p) = proxy {
-        builder = builder.proxy(Some(p.clone()));
-    }
+    builder = match proxy {
+        Some(p) => builder.proxy(Some(p.clone())),
+        None => builder.proxy(None),
+    };
     builder.build().into()
+}
+
+/// 需要 Bearer 前缀的 key 集合[进程内记忆，存 key 的稳定 hash]：
+/// 401 换形态重试成功后更新，下轮首轮即用对的凭证形态，免去每轮一次
+/// 注定 401 的白费请求；切账号后 hash 不同自然隔离，无需清理
+static NEEDS_BEARER: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// key → 稳定 hash。仅作进程内集合去重，无安全要求。
+fn key_hash(key: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    key.hash(&mut h);
+    h.finish()
+}
+
+fn needs_bearer(key: &str) -> bool {
+    NEEDS_BEARER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&key_hash(key))
+}
+
+/// 记忆/遗忘 key 的 Bearer 形态；锁中毒沿 AGENTS 惯例取内部数据继续用
+fn set_needs_bearer(key: &str, on: bool) {
+    let mut set = NEEDS_BEARER.lock().unwrap_or_else(|e| e.into_inner());
+    if on {
+        set.insert(key_hash(key));
+    } else {
+        set.remove(&key_hash(key));
+    }
+}
+
+/// join 作用域线程；线程 panic 原样上抛，等价于无线程时的直接传播
+fn join<T: Send>(handle: Option<std::thread::ScopedJoinHandle<'_, T>>) -> Option<T> {
+    handle.map(|h| match h.join() {
+        Ok(v) => v,
+        Err(p) => std::panic::resume_unwind(p),
+    })
 }
 
 /// 查询一次用量快照
 pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     let team = spec.team_scope();
-    let mut snap = match fetch_quota(spec.platform, &spec.api_key, team) {
+    // quota 是主数据，失败语义独立：Auth 换凭证形态重试，其余错误直接上抛
+    let plain = spec.api_key.as_str();
+    let bearer = format!("Bearer {plain}");
+    let remembered = needs_bearer(plain);
+    let (first, second) = if remembered {
+        (bearer.as_str(), plain)
+    } else {
+        (plain, bearer.as_str())
+    };
+    let mut snap = match fetch_quota(spec.platform, first, team) {
         Err(FetchError::Auth) => {
-            fetch_quota(spec.platform, &format!("Bearer {}", spec.api_key), team)?
+            let snap = fetch_quota(spec.platform, second, team)?;
+            // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用
+            set_needs_bearer(plain, !remembered);
+            snap
         }
         other => other?,
     };
-    // Token 消耗合计与余额均为附加信息：端点失败只缺对应块，不拖垮主用量
-    snap.token_stats = fetch_token_stats(spec.platform, &spec.api_key, team)
-        .ok()
-        .flatten();
-    if spec.platform == Platform::Cn {
-        snap.balance = fetch_balance(&spec.api_key).ok().flatten();
+    // 附加信息三路并行：token 今日/本周区间与余额各一请求，共享同一 Agent，
+    // 连接池天然支持并发；端点失败只缺对应块不拖垮主用量，失败各记一条日志
+    let params = token_params();
+    let (today, week, balance) = std::thread::scope(|scope| {
+        // 时间窗换算失败时两路区间请求都不发
+        let (today, week) = match params.as_ref() {
+            Some((today, week, end)) => (
+                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, today, end))),
+                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, week, end))),
+            ),
+            None => (None, None),
+        };
+        // 余额端点仅国内版有；附加三路同用 quota 的记忆感知形态，防需要
+        // Bearer 的 key 每轮白烧 401
+        let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
+        (join(today), join(week), join(balance))
+    });
+    // 两区间要么都有要么都没有
+    snap.token_stats = match (today, week) {
+        (Some(Ok(today)), Some(Ok(week))) => Some(TokenStats { today, week }),
+        (Some(Err(e)), _) | (_, Some(Err(e))) => {
+            crate::platform::log(&format!("[Quotify] Token 统计拉取失败: {e}"));
+            None
+        }
+        _ => None,
+    };
+    if let Some(balance) = balance {
+        match balance {
+            Ok(b) => snap.balance = b,
+            Err(e) => crate::platform::log(&format!("[Quotify] 余额拉取失败: {e}")),
+        }
     }
     Ok(snap)
 }
 
-/// Token 消耗合计：今日（本地 0 点起）与近 7 天（7 天前 0 点起）各一次
-/// 区间请求，合计优先取服务端 totalUsage。
-fn fetch_token_stats(
-    platform: Platform,
-    api_key: &str,
-    team: Option<(&str, &str)>,
-) -> Result<Option<TokenStats>, FetchError> {
+/// Token 统计的区间参数：今日[本地 0 点]与 7 天前 0 点两个起点，加当前
+/// 小时末终点，均已编码为 URL 参数；本地时间换算失败返回 None
+fn token_params() -> Option<(String, String, String)> {
     let now = chrono::Local::now();
-    let end = stamp(
-        &now.with_minute(59)
-            .and_then(|t| t.with_second(59))
-            .unwrap_or(now),
-    );
+    let end = now
+        .with_minute(59)
+        .and_then(|t| t.with_second(59))
+        .unwrap_or(now);
     let today_start = now
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).single());
     let week_start = today_start.map(|t| t - chrono::Duration::days(7));
     let (Some(today_start), Some(week_start)) = (today_start, week_start) else {
-        return Ok(None);
+        return None;
     };
+    Some((stamp(&today_start), stamp(&week_start), stamp(&end)))
+}
 
+/// 拉取单个区间的 token 总消耗，合计优先取服务端 totalUsage
+fn fetch_token_window(
+    platform: Platform,
+    api_key: &str,
+    team: Option<(&str, &str)>,
+    start: &str,
+    end: &str,
+) -> Result<f64, FetchError> {
+    let mut query = format!("?startTime={start}&endTime={end}");
+    if team.is_some() {
+        query.push_str("&type=3");
+    }
+    let url = format!(
+        "{}/api/monitor/usage/model-usage{query}",
+        platform.base_url()
+    );
     let mut extra = Vec::new();
     if let Some((org, project)) = team {
         extra.push(("Bigmodel-Organization", org));
         extra.push(("Bigmodel-Project", project));
     }
-    let query = |start: &str| {
-        let mut q = format!("?startTime={start}&endTime={end}");
-        if team.is_some() {
-            q.push_str("&type=3");
-        }
-        q
-    };
-    let url = |start: &str| {
-        format!(
-            "{}/api/monitor/usage/model-usage{}",
-            platform.base_url(),
-            query(start)
-        )
-    };
-    let get = |start: &str| -> Result<f64, FetchError> {
-        let body = http_get_text(&agent_short(), &url(start), api_key, &extra)?;
-        parse_token_total(&body)
-    };
-    Ok(Some(TokenStats {
-        today: get(&stamp(&today_start))?,
-        week: get(&stamp(&week_start))?,
-    }))
+    let body = http_get_text(&agent_short(), &url, api_key, &extra)?;
+    parse_token_total(&body)
 }
 
 /// 时间戳 → `YYYY-MM-DD HH:mm:ss`，空格百分号编码后可直接拼 URL

@@ -20,6 +20,43 @@ pub const INPUT_X: f32 = CONTENT_PAD;
 /// 输入框后到下一 sub_label 的间距
 pub const INPUT_GAP: f32 = 6.0;
 
+// ── 主视图段高：draw_main 的 y 推进链与 main_view_height 两方同引一组常量 ──
+
+/// 主视图顶部留白
+pub(crate) const MAIN_TOP_PAD: f32 = 16.0;
+/// 顶栏行高（账号刊头与右侧双钮所在行）
+pub(crate) const MAIN_TOPBAR_H: f32 = 52.0;
+/// 刊头：段起点到标题的上隙[实线分隔线低 2px 挂在段起点]
+pub(crate) const MAIN_MASTHEAD_RULE_GAP: f32 = 14.0;
+/// 刊头：标题行占高
+pub(crate) const MAIN_MASTHEAD_ROW_H: f32 = 26.0;
+/// 刊头段整高：段起点到首个指标行
+pub(crate) const MAIN_MASTHEAD_H: f32 = MAIN_MASTHEAD_RULE_GAP + MAIN_MASTHEAD_ROW_H;
+/// 指标行高
+pub(crate) const MAIN_METRIC_ROW_H: f32 = 52.0;
+/// 数据段（Token/余额）段前隙：到虚线分隔线
+pub(crate) const MAIN_SECTION_GAP: f32 = 6.0;
+/// 数据段：虚线分隔线到段标题的推进
+pub(crate) const MAIN_SECTION_HEAD: f32 = 14.0;
+/// Token 块：标题行到首条票据行的推进
+pub(crate) const MAIN_TOKEN_ROWS_ADV: f32 = 22.0;
+/// 票据合计行高
+pub(crate) const MAIN_LEADER_ROW_H: f32 = 19.0;
+/// Token 消耗块整高：段前隙 + 段头 + 标题推进 + 两行票据
+pub(crate) const MAIN_TOKEN_BLOCK_H: f32 =
+    MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_TOKEN_ROWS_ADV + 2.0 * MAIN_LEADER_ROW_H;
+/// 余额行文本占高
+pub(crate) const MAIN_BALANCE_ROW_H: f32 = 18.0;
+/// 余额块整高：可视为段前隙 + 段头 + 文本行，另含 2px 底部呼吸隙入高
+pub(crate) const MAIN_BALANCE_BLOCK_H: f32 =
+    MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_BALANCE_ROW_H + 2.0;
+/// 主视图内容底隙：最后一个数据块底到页脚顶
+pub(crate) const MAIN_CONTENT_BOTTOM_GAP: f32 = 6.0;
+/// 页脚区高（钉底）
+pub(crate) const MAIN_FOOTER_H: f32 = 36.0;
+/// 主视图尾段整高：内容底隙 + 页脚
+pub(crate) const MAIN_TAIL_H: f32 = MAIN_CONTENT_BOTTOM_GAP + MAIN_FOOTER_H;
+
 // ── 设置页区块段高：draw_settings 的 y 推进、下方 *_input_y 与 settings_view_height 三方共用 ──
 
 /// 设置页上下边距：nav 前顶部留白与版本行后底部余量
@@ -124,15 +161,20 @@ pub fn add_page_height(team: bool) -> i32 {
     338 + if team { 106 } else { 0 }
 }
 
-/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态随指标行数与统计、
-/// 余额块伸缩，各段对照 draw_main 的 y 推进链（顶部留白 16 + 顶栏 52 +
-/// 刊头段 40 + 指标行 52×n + Token 消耗块 80[前隙 6 + 推进 14 + 标题 22
-/// + 两行 38] + 余额块 40 + 尾段 42[内容底隙 6 + footer 36]）
+/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态由上方主视图段
+/// 常量链求和，与 draw_main 的 y 推进同源——两侧同引一组常量，几何改动
+/// 不再可能出现绘制侧与高度公式各改一半的漂移
 pub fn main_view_height(has_data: bool, rows: usize, has_stats: bool, has_balance: bool) -> i32 {
     if !has_data {
         return 300;
     }
-    16 + 52 + 40 + rows as i32 * 52 + has_stats as i32 * 80 + has_balance as i32 * 40 + 42
+    (MAIN_TOP_PAD
+        + MAIN_TOPBAR_H
+        + MAIN_MASTHEAD_H
+        + rows as f32 * MAIN_METRIC_ROW_H
+        + has_stats as i32 as f32 * MAIN_TOKEN_BLOCK_H
+        + has_balance as i32 as f32 * MAIN_BALANCE_BLOCK_H
+        + MAIN_TAIL_H) as i32
 }
 
 /// 钉位回归：期望值由渲染 y 链推导而来，布局改动须同步更新

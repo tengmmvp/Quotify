@@ -291,6 +291,7 @@ pub fn next_word_boundary(text: &str, caret: usize) -> usize {
 pub fn prev_word_boundary(text: &str, caret: usize) -> usize {
     let num_chars = text.chars().count();
     let reversed: String = text.chars().rev().collect();
+    let caret = caret.min(num_chars);
     let boundary = next_word_boundary(&reversed, num_chars - caret);
     num_chars - boundary.min(num_chars)
 }

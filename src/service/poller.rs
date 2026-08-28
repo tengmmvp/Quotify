@@ -4,9 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0, WPARAM};
+use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleObjects};
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::api::AccountSpec;
 use crate::platform::msg::WM_APP_POLL_RESULT;
@@ -167,19 +166,7 @@ fn poll_loop(
             Ok(s) => PollOutcome::Success(Box::new(s)),
             Err(e) => PollOutcome::Failure(Box::new(e)),
         };
-        let boxed = Box::into_raw(Box::new(outcome));
-        let posted = unsafe {
-            PostMessageW(
-                Some(hwnd),
-                WM_APP_POLL_RESULT,
-                WPARAM(boxed as usize),
-                Default::default(),
-            )
-        };
-        if posted.is_err() {
-            // 投递失败（窗口已销毁等）：主线程不会取回指针，立即释放防泄漏
-            drop(unsafe { Box::from_raw(boxed) });
-        }
+        crate::platform::post::post_boxed(hwnd, WM_APP_POLL_RESULT, outcome);
 
         let secs = clamp_interval(*borrow(&interval));
         last_secs = secs;

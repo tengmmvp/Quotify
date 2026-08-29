@@ -1,6 +1,6 @@
 //! 后台轮询线程
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,8 +28,15 @@ pub enum PollOutcome {
     Failure(Box<crate::api::FetchError>),
 }
 
+/// 轮询结果的回传信封
+pub struct PollMessage {
+    pub generation: u64,
+    pub outcome: PollOutcome,
+}
+
 pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
 pub type PollInterval = Arc<Mutex<u64>>;
+pub type PollGeneration = Arc<AtomicU64>;
 
 /// 后台轮询线程的所有者：发唤醒/停止信号，drop 时 join 回收。
 pub struct Poller {
@@ -45,6 +52,7 @@ impl Poller {
         hwnd: windows::Win32::Foundation::HWND,
         target: PollTarget,
         interval: PollInterval,
+        generation: PollGeneration,
     ) -> Option<Self> {
         unsafe {
             let wake = CreateEventW(None, false, false, None).ok()?;
@@ -62,11 +70,12 @@ impl Poller {
                 .spawn(move || {
                     // 先把 SendHandle 移入闭包局部，防 2021 精准捕获绕过包装破坏 Send
                     let (h, w, s) = (hwnd_s, wake_s, stop_s);
-                    poll_loop(h.0, target, interval, w.0, s.0, flag)
+                    poll_loop(h.0, target, interval, w.0, s.0, flag, generation)
                 }) {
                 Ok(t) => t,
-                Err(_) => {
+                Err(e) => {
                     // 线程未起：Poller 不会诞生，Drop 不再兜底，须在此关闭两事件句柄防泄漏
+                    crate::platform::log(&format!("[Quotify] 轮询线程创建失败，托盘将无数据: {e}"));
                     let _ = windows::Win32::Foundation::CloseHandle(wake);
                     let _ = windows::Win32::Foundation::CloseHandle(stop);
                     return None;
@@ -81,16 +90,9 @@ impl Poller {
         }
     }
 
-    /// 手动刷新：立即拉取一次。
+    /// 手动刷新入口：立即拉取一次；改间隔/代理/换账号后也调用它立即生效
     pub fn refresh_now(&self) {
         self.refresh_requested.store(true, Ordering::Release);
-        unsafe {
-            let _ = SetEvent(self.wake);
-        };
-    }
-
-    /// 间隔或账号变更：不立即拉取，仅按当前间隔重排计时。
-    pub fn reschedule(&self) {
         unsafe {
             let _ = SetEvent(self.wake);
         };
@@ -120,6 +122,7 @@ fn poll_loop(
     wake: HANDLE,
     stop: HANDLE,
     refresh_flag: Arc<AtomicBool>,
+    generation: PollGeneration,
 ) {
     let handles = [stop, wake];
     let mut next_due = Instant::now();
@@ -150,6 +153,9 @@ fn poll_loop(
             continue;
         }
 
+        // 取世代号须早于账号克隆：主线程先写 target 再 bump 世代，反序
+        // 会让旧账号数据带新号混入；先取号则见新号必见新 target（Acquire）
+        let gen_at_start = generation.load(Ordering::Acquire);
         let spec = {
             let guard = borrow(&target);
             match guard.clone() {
@@ -161,12 +167,18 @@ fn poll_loop(
                 }
             }
         };
-
         let outcome = match crate::api::client::fetch_usage(&spec) {
             Ok(s) => PollOutcome::Success(Box::new(s)),
             Err(e) => PollOutcome::Failure(Box::new(e)),
         };
-        crate::platform::post::post_boxed(hwnd, WM_APP_POLL_RESULT, outcome);
+        crate::platform::post::post_boxed(
+            hwnd,
+            WM_APP_POLL_RESULT,
+            PollMessage {
+                generation: gen_at_start,
+                outcome,
+            },
+        );
 
         let secs = clamp_interval(*borrow(&interval));
         last_secs = secs;

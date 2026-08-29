@@ -888,7 +888,7 @@ pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
     }
 }
 
-unsafe fn start_anim(hwnd: HWND) {
+pub(crate) unsafe fn start_anim(hwnd: HWND) {
     unsafe {
         SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
     }
@@ -1565,6 +1565,13 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             if let Some(t) = &r.anim.appear {
                 if t.finished() {
                     r.anim.appear = None;
+                } else {
+                    done = false;
+                }
+            }
+            if let Some(f) = &r.anim.footer {
+                if f.tween.finished() {
+                    r.anim.footer = None;
                 } else {
                     done = false;
                 }

@@ -25,8 +25,8 @@ use crate::platform::msg::{
 };
 use crate::platform::wide;
 use crate::service::poller::{
-    DEFAULT_INTERVAL_SECS, MAX_POLL_SECS, MIN_POLL_SECS, PollInterval, PollOutcome, PollTarget,
-    Poller,
+    DEFAULT_INTERVAL_SECS, MAX_POLL_SECS, MIN_POLL_SECS, PollGeneration, PollInterval, PollMessage,
+    PollOutcome, PollTarget, Poller,
 };
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
@@ -59,6 +59,7 @@ pub struct App {
     poller: Option<Poller>,
     poll_target: PollTarget,
     poll_interval: PollInterval,
+    poll_gen: PollGeneration,
     tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
     pub(crate) panel: Panel,
     pub(crate) popup: crate::ui::popup::AccountPopup,
@@ -93,6 +94,7 @@ impl App {
             poller: None,
             poll_target: std::sync::Arc::new(std::sync::Mutex::new(None)),
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
+            poll_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             tray_icon: None,
             panel: Panel::new(),
             popup: crate::ui::popup::AccountPopup::new(),
@@ -174,13 +176,51 @@ impl App {
         }
     }
 
-    fn handle_poll_result(&mut self, outcome: PollOutcome) {
-        match outcome {
+    fn handle_poll_result(&mut self, msg: PollMessage) {
+        // 迟到的旧世代结果直接丢弃：换源后旧账号数据不得冒充当前账号
+        if msg.generation != self.poll_gen.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        match msg.outcome {
             PollOutcome::Success(snap) => {
+                // 快照时间戳推进才播换装动画
+                let prev_at = self.data.snapshot.as_ref().map(|s| s.queried_at);
+                let anim_ok = prev_at.is_some_and(|t| t != snap.queried_at)
+                    && self.panel.mode == crate::ui::panel::PanelMode::Pinned
+                    && self.panel.view == crate::ui::panel::PanelView::Main;
+                let anim_texts = anim_ok.then(|| {
+                    let prev = prev_at.unwrap();
+                    let s = self.strings;
+                    let fresh = (chrono::Local::now() - prev).num_seconds() < 60;
+                    let old_text = if fresh {
+                        s.updated_just_now.to_string()
+                    } else {
+                        s.updated_ago
+                            .replace("{t}", &crate::ui::fmt::ago(prev, self.lang))
+                    };
+                    (old_text, s.updated_just_now.to_string())
+                });
                 self.check_notifications(&snap);
                 self.data.snapshot = Some(*snap);
                 self.data.last_error = None;
                 self.last_logged_error = None;
+                if let Some((old_text, new_text)) = anim_texts
+                    && old_text != new_text
+                {
+                    let ph = self.panel.hwnd;
+                    if let (Some(p), Some(r)) = (ph, self.panel.renderer.as_mut()) {
+                        // 动画开关用 renderer 的缓存判定，与 appear/spin
+                        // 一致；运行中切换系统减少动效不会两套标准
+                        if r.animations_on() {
+                            r.anim.footer = Some(crate::ui::panel::render::FooterAnim {
+                                tween: crate::ui::panel::anim::Tween::now(3600),
+                                old_text,
+                                new_text,
+                            });
+                            unsafe { crate::ui::panel::start_anim(p) };
+                        }
+                    }
+                }
             }
             PollOutcome::Failure(e) => {
                 // 文案与上次相同的失败只记一次，固定间隔重试不刷屏
@@ -375,10 +415,10 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
         }
         WM_APP_POLL_RESULT => {
             // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
-            let boxed = wparam.0 as *mut PollOutcome;
-            let outcome = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
-            if let (Some(app), Some(outcome)) = (app_from(hwnd), outcome) {
-                app.handle_poll_result(*outcome);
+            let boxed = wparam.0 as *mut PollMessage;
+            let msg = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
+            if let (Some(app), Some(msg)) = (app_from(hwnd), msg) {
+                app.handle_poll_result(*msg);
             }
             LRESULT(0)
         }
@@ -596,7 +636,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             crate::app::config::save(&app.config);
             app.sync_poll_context();
             if let Some(p) = &app.poller {
-                p.reschedule();
+                p.refresh_now();
             }
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
@@ -881,6 +921,8 @@ fn switch_poll_source(app: &mut App) {
     app.last_logged_error = None;
     reset_notify_state(app);
     app.sync_poll_context();
+    app.poll_gen
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
     app.update_tray_icon();
     if let Some(p) = &app.poller {
         p.refresh_now();
@@ -967,7 +1009,7 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     crate::app::config::save(&app.config);
     app.sync_poll_context();
     if let Some(p) = &app.poller {
-        p.reschedule();
+        p.refresh_now();
     }
     sync_customizing(app);
     app.panel.clear_input(panel_hwnd);
@@ -1453,7 +1495,12 @@ pub fn run() -> i32 {
         app.tray = TrayIcon::new(hwnd, initial);
 
         app.sync_poll_context();
-        app.poller = Poller::spawn(hwnd, app.poll_target.clone(), app.poll_interval.clone());
+        app.poller = Poller::spawn(
+            hwnd,
+            app.poll_target.clone(),
+            app.poll_interval.clone(),
+            app.poll_gen.clone(),
+        );
         if let Some(p) = &app.poller {
             p.refresh_now();
         }

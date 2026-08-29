@@ -148,6 +148,14 @@ enum Align {
 pub struct AnimState {
     pub appear: Option<Tween>,
     pub spin: f32,
+    pub footer: Option<FooterAnim>,
+}
+
+/// 页脚换装动画的单次状态
+pub struct FooterAnim {
+    pub tween: Tween,
+    pub old_text: String,
+    pub new_text: String,
 }
 
 impl AnimState {
@@ -155,6 +163,7 @@ impl AnimState {
         Self {
             appear: None,
             spin: 0.0,
+            footer: None,
         }
     }
 }
@@ -186,6 +195,11 @@ impl Renderer {
             .find(|(_, rc)| x >= rc.left && x <= rc.right && y >= rc.top && y <= rc.bottom)
             .map(|(h, _)| *h)
     }
+
+    /// 动画是否被允许
+    pub fn animations_on(&self) -> bool {
+        self.anim_allowed
+    }
 }
 
 /// D2D/DWrite 渲染器
@@ -209,6 +223,7 @@ pub struct Renderer {
     logo_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
     bolt_geo: Option<ID2D1PathGeometry>,
     eye_geo: Option<ID2D1PathGeometry>,
+    pacman_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
     dash_style: Option<ID2D1StrokeStyle>,
     mcp_cache: Option<main::McpCompCache>,
 }
@@ -243,6 +258,7 @@ impl Renderer {
                 logo_geo: None,
                 bolt_geo: None,
                 eye_geo: None,
+                pacman_geo: None,
                 dash_style: None,
                 mcp_cache: None,
             })

@@ -6,10 +6,11 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget, ID2D1PathGeometry,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
+use super::widgets::PACMAN_R;
 use super::{Align, Hit, Renderer};
 use crate::api::FetchError;
 use crate::ui::fmt;
@@ -465,6 +466,100 @@ impl Renderer {
                         26.0,
                         s.retry,
                         alpha,
+                    );
+                } else if let Some(fa) = self.anim.footer.as_ref().filter(|f| !f.tween.finished()) {
+                    // 吃豆人换装
+                    let (old_text, new_text, tween) =
+                        (fa.old_text.clone(), fa.new_text.clone(), fa.tween);
+                    let old_w = self.measure(&old_text, 12.0, 400, false);
+                    let new_w = self.measure(&new_text, 12.0, 400, false);
+                    let old_home = w / 2.0 - old_w / 2.0;
+                    let new_home = w / 2.0 - new_w / 2.0;
+                    let raw = tween.progress();
+                    let travel = w + 2.0 * PACMAN_R + 8.0;
+                    let start = -PACMAN_R - 4.0;
+                    let eat_end = old_home + old_w + PACMAN_R;
+                    let frac_eat = ((eat_end - start) / travel).clamp(0.3, 0.85);
+                    let p = if raw < 0.72 {
+                        (raw / 0.72) * frac_eat
+                    } else {
+                        let t = (raw - 0.72) / 0.28;
+                        frac_eat + t * t * (1.0 - frac_eat)
+                    };
+                    let cy = footer_y + 16.5;
+                    let cx = start + p * travel;
+                    let clip = D2D_RECT_F {
+                        left: cx,
+                        top: footer_y,
+                        right: w,
+                        bottom: footer_y + 34.0,
+                    };
+                    unsafe {
+                        target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    }
+                    self.text_aligned(
+                        target,
+                        &old_text,
+                        &D2D_RECT_F {
+                            left: old_home,
+                            top: footer_y + 8.0,
+                            right: old_home + old_w,
+                            bottom: footer_y + 25.0,
+                        },
+                        12.0,
+                        400,
+                        self.theme.text_tertiary,
+                        alpha,
+                        Align::Left,
+                        false,
+                    );
+                    unsafe {
+                        target.PopAxisAlignedClip();
+                    }
+                    self.pacman(target, cx, cy, raw, alpha);
+                    let bite = raw * 8.0;
+                    let (phase, idx) = (bite.fract(), bite.floor() as u32);
+                    let age = (phase - 0.8 + 1.0) % 1.0;
+                    if p < frac_eat && age < 0.5 {
+                        let t = age / 0.5;
+                        let fall = t * t * 14.0;
+                        let cb =
+                            self.brush(target, self.theme.text_tertiary, alpha * (1.0 - t * t));
+                        let born = if phase >= 0.8 {
+                            idx
+                        } else {
+                            idx.saturating_sub(1)
+                        };
+                        let mid = ((born * 31) % 5) as f32 - 2.0;
+                        for (base, dir) in
+                            [(mid, 0.0f32), (mid - 3.0, -1.0f32), (mid + 3.5, 1.0f32)]
+                        {
+                            let dx = base + dir * t * 5.0;
+                            let cr = D2D_RECT_F {
+                                left: cx + PACMAN_R * 0.45 + dx,
+                                top: cy + 3.0 + fall,
+                                right: cx + PACMAN_R * 0.45 + dx + 4.2,
+                                bottom: cy + 3.0 + fall + 4.2,
+                            };
+                            target.FillRectangle(&cr, &cb);
+                        }
+                    }
+                    let nx = (cx - PACMAN_R - new_w - 10.0).min(new_home);
+                    self.text_aligned(
+                        target,
+                        &new_text,
+                        &D2D_RECT_F {
+                            left: nx,
+                            top: footer_y + 8.0,
+                            right: nx + new_w,
+                            bottom: footer_y + 25.0,
+                        },
+                        12.0,
+                        400,
+                        self.theme.text_tertiary,
+                        alpha,
+                        Align::Left,
+                        false,
                     );
                 } else if let Some(snap) = model.snapshot {
                     let fresh = (chrono::Local::now() - snap.queried_at).num_seconds() < 60;

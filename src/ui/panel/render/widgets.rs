@@ -3,12 +3,13 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_BEZIER_SEGMENT, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
-    D2D1_FIGURE_END_CLOSED,
+    D2D_RECT_F, D2D_SIZE_F, D2D1_BEZIER_SEGMENT, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_ELLIPSE, D2D1_ROUNDED_RECT,
-    D2D1_STROKE_STYLE_PROPERTIES, ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_ELLIPSE,
+    D2D1_ROUNDED_RECT, D2D1_STROKE_STYLE_PROPERTIES, D2D1_SWEEP_DIRECTION_CLOCKWISE,
+    D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE, ID2D1HwndRenderTarget, ID2D1PathGeometry,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -465,32 +466,34 @@ impl Renderer {
         target.SetTransform(&Matrix3x2::identity());
     }
 
+    /// 多组封闭折线 → 单份填充几何；不相交轮廓为并集
+    fn build_polys(&self, polys: Vec<Vec<(f32, f32)>>) -> Option<ID2D1PathGeometry> {
+        unsafe {
+            let geo = self.factory.CreatePathGeometry().ok()?;
+            let sink = geo.Open().ok()?;
+            for poly in polys {
+                let mut pts = poly.into_iter();
+                let Some((x0, y0)) = pts.next() else {
+                    continue;
+                };
+                sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
+                for (x, y) in pts {
+                    sink.AddLine(Vector2 { X: x, Y: y });
+                }
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            }
+            sink.Close().ok()?;
+            Some(geo)
+        }
+    }
+
     /// 构建白色 Q 字路径。环与尾必须拆成两个 geometry：同一 geometry 内
     /// 两 figure 相交在默认 evenodd 规则下会被挖空，分体两次填充才是并集
     fn build_logo_glyph(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
-        unsafe {
-            let build = |polys: Vec<Vec<(f32, f32)>>| -> Option<ID2D1PathGeometry> {
-                let geo = self.factory.CreatePathGeometry().ok()?;
-                let sink = geo.Open().ok()?;
-                for poly in polys {
-                    let mut pts = poly.into_iter();
-                    let Some((x0, y0)) = pts.next() else {
-                        continue;
-                    };
-                    sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
-                    for (x, y) in pts {
-                        sink.AddLine(Vector2 { X: x, Y: y });
-                    }
-                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                }
-                sink.Close().ok()?;
-                Some(geo)
-            };
-            let [outer, inner, tail] = crate::ui::icon::q_outline();
-            let ring = build(vec![outer, inner])?;
-            let tail = build(vec![tail])?;
-            Some((ring, tail))
-        }
+        let [outer, inner, tail] = crate::ui::icon::q_outline();
+        let ring = self.build_polys(vec![outer, inner])?;
+        let tail = self.build_polys(vec![tail])?;
+        Some((ring, tail))
     }
 
     /// 构建闪电图标路径
@@ -531,4 +534,93 @@ impl Renderer {
             Some(geo)
         }
     }
+
+    /// 页脚换装的吃豆人：cx/cy 为圆心，p 为动画进度 0..1。嘴朝右
+    /// 一张一合边走边啃。开合用上下两半圆绕圆心反向旋转拼出——
+    /// 几何恒定缓存，每帧只改变换矩阵
+    pub(super) unsafe fn pacman(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        cx: f32,
+        cy: f32,
+        p: f32,
+        alpha: f32,
+    ) {
+        if self.pacman_geo.is_none() {
+            self.pacman_geo = self.build_pacman_geo();
+        }
+        let Some((upper, lower)) = self.pacman_geo.clone() else {
+            return;
+        };
+        let smooth =
+            |t: f32| t.clamp(0.0, 1.0) * t.clamp(0.0, 1.0) * (3.0 - 2.0 * t.clamp(0.0, 1.0));
+        let phase = (p * 8.0).fract();
+        let ratio = if phase < 0.65 {
+            smooth(phase / 0.65)
+        } else {
+            1.0 - smooth((phase - 0.65) / 0.35)
+        };
+        let mouth = 0.02 + ratio * 0.94;
+        let b = self.brush(target, self.theme.logo_tile, alpha);
+        for (geo, ang) in [(upper, -mouth), (lower, mouth)] {
+            let (s, c) = ang.sin_cos();
+            target.SetTransform(&Matrix3x2 {
+                M11: c,
+                M12: s,
+                M21: -s,
+                M22: c,
+                M31: cx,
+                M32: cy,
+            });
+            target.FillGeometry(&geo, &b, None);
+            target.DrawGeometry(&geo, &b, 1.0, None);
+        }
+        target.SetTransform(&Matrix3x2::identity());
+    }
+
+    /// 构建吃豆人上下两半圆几何（半径 PACMAN_R，局部原点即圆心）。
+    /// 半圆的直径边经过圆心，绕圆心旋转即可张合出嘴
+    fn build_pacman_geo(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
+        unsafe {
+            let build_half = |clockwise: bool| -> Option<ID2D1PathGeometry> {
+                let geo = self.factory.CreatePathGeometry().ok()?;
+                let sink = geo.Open().ok()?;
+                sink.BeginFigure(
+                    Vector2 {
+                        X: -PACMAN_R,
+                        Y: 0.0,
+                    },
+                    D2D1_FIGURE_BEGIN_FILLED,
+                );
+                sink.AddArc(&D2D1_ARC_SEGMENT {
+                    point: Vector2 {
+                        X: PACMAN_R,
+                        Y: 0.0,
+                    },
+                    size: D2D_SIZE_F {
+                        width: PACMAN_R,
+                        height: PACMAN_R,
+                    },
+                    rotationAngle: 0.0,
+                    sweepDirection: if clockwise {
+                        D2D1_SWEEP_DIRECTION_CLOCKWISE
+                    } else {
+                        D2D1_SWEEP_DIRECTION_COUNTER_CLOCKWISE
+                    },
+                    arcSize: D2D1_ARC_SIZE_SMALL,
+                });
+                sink.AddLine(Vector2 { X: 0.0, Y: 0.0 });
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                sink.Close().ok()?;
+                Some(geo)
+            };
+            // 屏幕坐标 y 向下：上半圆走顺时针小弧（经顶部），下半圆对称
+            let upper = build_half(true)?;
+            let lower = build_half(false)?;
+            Some((upper, lower))
+        }
+    }
 }
+
+/// 吃豆人半径
+pub(super) const PACMAN_R: f32 = 8.0;

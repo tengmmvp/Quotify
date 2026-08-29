@@ -156,6 +156,8 @@ pub struct FooterAnim {
     pub tween: Tween,
     pub old_text: String,
     pub new_text: String,
+    pub old_w: f32,
+    pub new_w: f32,
 }
 
 impl AnimState {
@@ -224,6 +226,8 @@ pub struct Renderer {
     bolt_geo: Option<ID2D1PathGeometry>,
     eye_geo: Option<ID2D1PathGeometry>,
     pacman_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
+    refresh_geo: Option<ID2D1PathGeometry>,
+    dots_geos: HashMap<u32, ID2D1PathGeometry>,
     dash_style: Option<ID2D1StrokeStyle>,
     mcp_cache: Option<main::McpCompCache>,
 }
@@ -259,6 +263,8 @@ impl Renderer {
                 bolt_geo: None,
                 eye_geo: None,
                 pacman_geo: None,
+                refresh_geo: None,
+                dots_geos: HashMap::new(),
                 dash_style: None,
                 mcp_cache: None,
             })
@@ -304,7 +310,7 @@ impl Renderer {
     }
 
     /// DWrite 真实测宽
-    unsafe fn measure(&mut self, s: &str, size: f32, weight: u16, mono: bool) -> f32 {
+    pub(crate) unsafe fn measure(&mut self, s: &str, size: f32, weight: u16, mono: bool) -> f32 {
         let Some(fmt) = self.format(size, weight, mono) else {
             return 0.0;
         };

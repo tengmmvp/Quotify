@@ -243,6 +243,7 @@ pub struct Panel {
     class_registered: bool,
     pub(crate) main_h: i32,
     pub(crate) account_error: bool,
+    pub(crate) anim_period: u32,
     pub(crate) outside_since: Option<u64>,
     painted: bool,
     caret_cache: std::cell::RefCell<Option<CaretCacheEntry>>,
@@ -266,6 +267,7 @@ impl Panel {
             customizing_interval: false,
             main_h: 300,
             account_error: false,
+            anim_period: 0,
             caret_ctx: (false, false),
             selecting: false,
             text_clicks: None,
@@ -891,6 +893,9 @@ pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
 pub(crate) unsafe fn start_anim(hwnd: HWND) {
     unsafe {
         SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
+    }
+    if let Some(app) = app_from_tray(hwnd) {
+        app.panel.anim_period = 16;
     }
 }
 
@@ -1561,7 +1566,9 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             return LRESULT(0);
         };
         let mut done = true;
+        let mut footer_only = false;
         if let Some(r) = app.panel.renderer.as_mut() {
+            let appear_active = r.anim.appear.is_some();
             if let Some(t) = &r.anim.appear {
                 if t.finished() {
                     r.anim.appear = None;
@@ -1569,6 +1576,7 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                     done = false;
                 }
             }
+            let footer_active = r.anim.footer.as_ref().is_some_and(|f| !f.tween.finished());
             if let Some(f) = &r.anim.footer {
                 if f.tween.finished() {
                     r.anim.footer = None;
@@ -1576,14 +1584,26 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                     done = false;
                 }
             }
-            if r.spin_remaining() {
+            let spin_active = r.spin_remaining();
+            if spin_active {
                 done = false;
             }
+            // 页脚换装独占时帧率减半：文字滑动 30fps 足够，整窗重绘的
+            // CPU 砍半；淡入/旋转在场维持满帧
+            footer_only = footer_active && !appear_active && !spin_active;
         }
         let _ = InvalidateRect(Some(hwnd), None, false);
 
         if done {
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            app.panel.anim_period = 0;
+        } else {
+            let want = if footer_only { 33 } else { 16 };
+            if app.panel.anim_period != want {
+                // 仅周期变化时重设：SetTimer 会重置计时起点
+                SetTimer(Some(hwnd), TIMER_ANIM, want, None);
+                app.panel.anim_period = want;
+            }
         }
         LRESULT(0)
     }

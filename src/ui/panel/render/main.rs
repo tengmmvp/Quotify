@@ -33,6 +33,24 @@ const MCP_CELL_W: f32 = 12.0;
 const MCP_CELL_GAP: f32 = 2.0;
 const MCP_CELL_SKEW: f32 = 4.0;
 
+/// 能量条的待填区间序列（段序即绘制序）：数据段间未覆盖格位补
+/// 轨道空格段；颜色由调用侧配对——数据段用段色、空格段用轨道色。
+fn mcp_job_ranges(segs: &[(usize, usize, [f32; 4])]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut cursor = 0usize;
+    for (start, end, _) in segs {
+        if *start > cursor {
+            ranges.push((cursor, *start));
+        }
+        ranges.push((*start, *end));
+        cursor = *end;
+    }
+    if cursor < MCP_CELLS {
+        ranges.push((cursor, MCP_CELLS));
+    }
+    ranges
+}
+
 /// 图例徽标几何
 const MCP_BADGE_SIZE: f32 = 11.0;
 const MCP_SWATCH: f32 = 8.0;
@@ -47,11 +65,12 @@ struct McpBadge {
 }
 
 /// MCP 构成区按 (快照时间, 内宽) 缓存的数据侧产物，命中时跳过排序、
-/// 分段与全部测宽。段几何与轨道空格色依赖逐帧位置/主题，绘制时现算
+/// 分段与全部测宽。待填几何随缓存建好，仅空格色与落位平移绘制时现算。
 pub(super) struct McpCompCache {
     key: chrono::DateTime<chrono::Local>,
     inner_w: f32,
     segs: Vec<(usize, usize, [f32; 4])>,
+    geos: Vec<((usize, usize), ID2D1PathGeometry)>,
     badges: Vec<McpBadge>,
     shown: usize,
     plus_w: f32,
@@ -146,14 +165,7 @@ impl Renderer {
         let refresh_cx = w - pad - btn_r - 30.0;
         let settings_cx = w - pad - btn_r;
         let btn_cy = y + 26.0;
-        self.icon_button(
-            target,
-            Hit::Refresh,
-            refresh_cx,
-            btn_cy,
-            btn_r,
-            self.anim.spin,
-        );
+        self.icon_button(target, Hit::Refresh, refresh_cx, btn_cy, self.anim.spin);
         self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
         y += layout::MAIN_TOPBAR_H;
 
@@ -471,8 +483,7 @@ impl Renderer {
                     // 吃豆人换装
                     let (old_text, new_text, tween) =
                         (fa.old_text.clone(), fa.new_text.clone(), fa.tween);
-                    let old_w = self.measure(&old_text, 12.0, 400, false);
-                    let new_w = self.measure(&new_text, 12.0, 400, false);
+                    let (old_w, new_w) = (fa.old_w, fa.new_w);
                     let old_home = w / 2.0 - old_w / 2.0;
                     let new_home = w / 2.0 - new_w / 2.0;
                     let raw = tween.progress();
@@ -523,8 +534,10 @@ impl Renderer {
                     if p < frac_eat && age < 0.5 {
                         let t = age / 0.5;
                         let fall = t * t * 14.0;
-                        let cb =
-                            self.brush(target, self.theme.text_tertiary, alpha * (1.0 - t * t));
+                        // alpha 量化 32 档：档位跨轮复用，刷子缓存
+                        // 不随动画膨胀。
+                        let a = (alpha * (1.0 - t * t) * 32.0).round() / 32.0;
+                        let cb = self.brush(target, self.theme.text_tertiary, a);
                         let born = if phase >= 0.8 {
                             idx
                         } else {
@@ -805,23 +818,27 @@ impl Renderer {
         let bar_y = top + 1.0 + layout::MAIN_MCP_COMP_PAD_Y;
         let bar_w = MCP_CELLS as f32 * MCP_CELL_W + (MCP_CELLS - 1) as f32 * MCP_CELL_GAP;
         let x0 = inner_x + (inner_w - bar_w) / 2.0;
-        // 待填段队列：明细合计可小于总消耗，未覆盖格位画轨道空格
-        let mut jobs: Vec<(usize, usize, [f32; 4])> = Vec::new();
-        let mut cursor = 0usize;
-        for (start, end, color) in segs {
-            if *start > cursor {
-                jobs.push((cursor, *start, self.theme.track));
-            }
-            jobs.push((*start, *end, *color));
-            cursor = *end;
-        }
-        if cursor < MCP_CELLS {
-            jobs.push((cursor, MCP_CELLS, self.theme.track));
-        }
-        for (from, to, color) in jobs {
-            if let Some(geo) = self.build_mcp_cells(from, to, x0, bar_y) {
+        // 待填段：区间序列与缓存建时同源（mcp_job_ranges），数据段取
+        // 段色、空格段取轨道色；几何查缓存平移绘制，帧内零重建。
+        let track = self.theme.track;
+        for r in mcp_job_ranges(segs) {
+            let color = segs
+                .iter()
+                .find(|(s, e, _)| (*s, *e) == r)
+                .map_or(track, |(_, _, c)| *c);
+            if let Some((_, geo)) = c.geos.iter().find(|(k, _)| *k == r) {
                 let b = self.brush(target, color, alpha);
-                target.FillGeometry(&geo, &b, None);
+                let m = Matrix3x2 {
+                    M11: 1.0,
+                    M12: 0.0,
+                    M21: 0.0,
+                    M22: 1.0,
+                    M31: x0,
+                    M32: bar_y,
+                };
+                target.SetTransform(&m);
+                target.FillGeometry(geo, &b, None);
+                target.SetTransform(&Matrix3x2::identity());
             }
         }
 
@@ -984,10 +1001,16 @@ impl Renderer {
         } else {
             0.0
         };
+        // 段几何随缓存建好（原点系，绘制时平移），帧内不再重建
+        let geos = mcp_job_ranges(&segs)
+            .into_iter()
+            .filter_map(|r| self.build_mcp_cells(r.0, r.1).map(|g| (r, g)))
+            .collect();
         McpCompCache {
             key: queried_at,
             inner_w,
             segs,
+            geos,
             badges,
             shown,
             plus_w,
@@ -1033,35 +1056,29 @@ impl Renderer {
     }
 
     /// 一段能量格的合成路径
-    fn build_mcp_cells(
-        &self,
-        from: usize,
-        to: usize,
-        x0: f32,
-        bar_y: f32,
-    ) -> Option<ID2D1PathGeometry> {
+    fn build_mcp_cells(&self, from: usize, to: usize) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
             let sink = geo.Open().ok()?;
             for i in from..to {
-                let s = x0 + i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
+                let s = i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
                 let h = layout::MAIN_MCP_CELL_H;
                 sink.BeginFigure(
                     Vector2 {
                         X: s + MCP_CELL_SKEW,
-                        Y: bar_y,
+                        Y: 0.0,
                     },
                     D2D1_FIGURE_BEGIN_FILLED,
                 );
                 sink.AddLine(Vector2 {
                     X: s + MCP_CELL_SKEW + MCP_CELL_W,
-                    Y: bar_y,
+                    Y: 0.0,
                 });
                 sink.AddLine(Vector2 {
                     X: s + MCP_CELL_W,
-                    Y: bar_y + h,
+                    Y: h,
                 });
-                sink.AddLine(Vector2 { X: s, Y: bar_y + h });
+                sink.AddLine(Vector2 { X: s, Y: h });
                 sink.EndFigure(D2D1_FIGURE_END_CLOSED);
             }
             sink.Close().ok()?;
@@ -1110,16 +1127,24 @@ impl Renderer {
         let label_w = self.measure(label, 12.0, 400, false);
         let cy = y + 10.0;
         let dot = self.brush(target, self.theme.text_tertiary, alpha * 0.55);
-        let mut x = pad + label_w + 8.0;
+        let x = pad + label_w + 8.0;
         let end = w - pad - vw - 8.0;
-        while x <= end {
-            let e = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
-                point: windows_numerics::Vector2 { X: x, Y: cy },
-                radiusX: 0.75,
-                radiusY: 0.75,
+        let span = end - x;
+        if span >= 0.0
+            && let Some(geo) = self.dots_geo((span / 5.0).floor() as u32 + 1)
+        {
+            // 点带整条一次填充，几何按点数缓存
+            let m = Matrix3x2 {
+                M11: 1.0,
+                M12: 0.0,
+                M21: 0.0,
+                M22: 1.0,
+                M31: x,
+                M32: cy,
             };
-            target.FillEllipse(&e, &dot);
-            x += 5.0;
+            target.SetTransform(&m);
+            target.FillGeometry(&geo, &dot, None);
+            target.SetTransform(&Matrix3x2::identity());
         }
         y + row_h
     }
@@ -1247,5 +1272,29 @@ fn with_detail(prefix: &str, detail: &str) -> String {
         prefix.to_string()
     } else {
         format!("{prefix}: {detail}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const C: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    /// 能量条待填区间：数据段原样保留，未覆盖格位补轨道段，
+    /// 首尾按需补齐，段序即绘制序
+    #[test]
+    fn mcp_ranges_cover_track_gaps() {
+        // 无数据：整条都是轨道
+        assert_eq!(mcp_job_ranges(&[]), vec![(0, MCP_CELLS)]);
+        // 单段吃满：无轨道
+        assert_eq!(mcp_job_ranges(&[(0, 20, C)]), vec![(0, 20)]);
+        // 头部缺口
+        assert_eq!(mcp_job_ranges(&[(5, 20, C)]), vec![(0, 5), (5, 20)]);
+        // 中段缺口，数据段连续衔接
+        assert_eq!(
+            mcp_job_ranges(&[(2, 6, C), (6, 10, C), (14, 20, C)]),
+            vec![(0, 2), (2, 6), (6, 10), (10, 14), (14, 20)]
+        );
     }
 }

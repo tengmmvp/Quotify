@@ -212,10 +212,18 @@ impl App {
                         // 动画开关用 renderer 的缓存判定，与 appear/spin
                         // 一致；运行中切换系统减少动效不会两套标准
                         if r.animations_on() {
+                            let (ow, nw) = unsafe {
+                                (
+                                    r.measure(&old_text, 12.0, 400, false),
+                                    r.measure(&new_text, 12.0, 400, false),
+                                )
+                            };
                             r.anim.footer = Some(crate::ui::panel::render::FooterAnim {
                                 tween: crate::ui::panel::anim::Tween::now(3600),
                                 old_text,
                                 new_text,
+                                old_w: ow,
+                                new_w: nw,
                             });
                             unsafe { crate::ui::panel::start_anim(p) };
                         }

@@ -157,36 +157,37 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     } else {
         (plain, bearer.as_str())
     };
-    let (mut snap, effective) = match fetch_quota(spec.platform, first, team) {
-        Ok(snap) => (snap, first),
-        Err(FetchError::Auth) => {
-            let snap = fetch_quota(spec.platform, second, team)?;
-            // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用
-            set_needs_bearer(plain, !remembered);
-            (snap, second)
-        }
-        Err(e) => return Err(e),
-    };
-    // 附加信息三路并行：token 今日/本周区间与余额各一请求，共享同一 Agent，
-    // 连接池天然支持并发；端点失败只缺对应块不拖垮主用量，失败各记一条日志
     let params = token_params();
-    let (today, week, balance) = std::thread::scope(|scope| {
+    // 四路全并行：主数据不被慢附加端点拖住。附加三路用记忆形态首发：
+    // 切换轮可能 401 丢块（下轮即对）、主路失败轮照发白费（可忽略）、
+    // 端点失败只缺块不拖垮主用量
+    let (quota, today, week, balance) = std::thread::scope(|scope| {
+        let quota = scope.spawn(|| match fetch_quota(spec.platform, first, team) {
+            Ok(snap) => Ok(snap),
+            Err(FetchError::Auth) => {
+                let snap = fetch_quota(spec.platform, second, team)?;
+                // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用
+                set_needs_bearer(plain, !remembered);
+                Ok(snap)
+            }
+            Err(e) => Err(e),
+        });
         // 时间窗换算失败时两路区间请求都不发
         let (today, week) = match params.as_ref() {
             Some((today, week, end)) => (
-                Some(
-                    scope.spawn(|| fetch_token_window(spec.platform, effective, team, today, end)),
-                ),
-                Some(scope.spawn(|| fetch_token_window(spec.platform, effective, team, week, end))),
+                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, today, end))),
+                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, week, end))),
             ),
             None => (None, None),
         };
-        // 附加三路沿用 quota 最终成功的凭证形态，防切换轮全数 401；
         // 余额端点仅国内版有
-        let balance =
-            (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(effective)));
-        (join(today), join(week), join(balance))
+        let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
+        let quota = quota
+            .join()
+            .unwrap_or_else(|p| std::panic::resume_unwind(p));
+        (quota, join(today), join(week), join(balance))
     });
+    let mut snap = quota?;
     // 两区间要么都有要么都没有
     snap.token_stats = match (today, week) {
         (Some(Ok(today)), Some(Ok(week))) => Some(TokenStats { today, week }),

@@ -4,7 +4,7 @@
 
 use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_F, D2D1_BEZIER_SEGMENT, D2D1_FIGURE_BEGIN_FILLED,
-    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED,
+    D2D1_FIGURE_BEGIN_HOLLOW, D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN,
 };
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ARC_SEGMENT, D2D1_ARC_SIZE_SMALL, D2D1_CAP_STYLE_FLAT, D2D1_DASH_STYLE_DASH, D2D1_ELLIPSE,
@@ -132,14 +132,14 @@ impl Renderer {
         hit: Hit,
         cx: f32,
         cy: f32,
-        r: f32,
         spin: f32,
     ) {
+        const R: f32 = 16.0;
         let hovered = self.hover == Some(hit);
         let ellipse = windows::Win32::Graphics::Direct2D::D2D1_ELLIPSE {
             point: Vector2 { X: cx, Y: cy },
-            radiusX: r,
-            radiusY: r,
+            radiusX: R,
+            radiusY: R,
         };
         let base = if hovered {
             self.theme.track
@@ -150,42 +150,22 @@ impl Renderer {
             let b = self.brush(target, base, 1.0);
             target.FillEllipse(&ellipse, &b);
         }
-        let rot = |px: f32, py: f32| -> (f32, f32) {
-            let (sin, cos) = spin.sin_cos();
-            (cx + px * cos - py * sin, cy + px * sin + py * cos)
-        };
         let stroke = self.brush(target, self.theme.text_secondary, 1.0);
-        let rr = r * 0.47;
-        let mut segs: Vec<(f32, f32, f32, f32)> = Vec::new();
-        for (a0, a1) in [(-150f32, -20f32), (30f32, 160f32)] {
-            let (r0, r1) = (a0.to_radians(), a1.to_radians());
-            let steps = 12;
-            for i in 0..steps {
-                let t0 = r0 + (r1 - r0) * i as f32 / steps as f32;
-                let t1 = r0 + (r1 - r0) * (i + 1) as f32 / steps as f32;
-                segs.push((rr * t0.cos(), rr * t0.sin(), rr * t1.cos(), rr * t1.sin()));
-            }
-            let (fx, fy) = (-r1.sin(), r1.cos());
-            let (px, py) = (rr * r1.cos(), rr * r1.sin());
-            let al = 4.0;
-            let (fs, fc) = 150f32.to_radians().sin_cos();
-            segs.push((
-                px,
-                py,
-                px + (fx * fc - fy * fs) * al,
-                py + (fx * fs + fy * fc) * al,
-            ));
-            segs.push((
-                px,
-                py,
-                px + (fx * fc + fy * fs) * al,
-                py + (-fx * fs + fy * fc) * al,
-            ));
+        if self.refresh_geo.is_none() {
+            self.refresh_geo = self.build_refresh_glyph();
         }
-        for (x0, y0, x1, y1) in segs {
-            let (ax, ay) = rot(x0, y0);
-            let (bx, by) = rot(x1, y1);
-            self.line(target, ax, ay, bx, by, &stroke, 1.6);
+        if let Some(geo) = self.refresh_geo.clone() {
+            let (s, c) = spin.sin_cos();
+            target.SetTransform(&Matrix3x2 {
+                M11: c,
+                M12: s,
+                M21: -s,
+                M22: c,
+                M31: cx,
+                M32: cy,
+            });
+            target.DrawGeometry(&geo, &stroke, 1.6, None);
+            target.SetTransform(&Matrix3x2::identity());
         }
         self.hits.push((
             hit,
@@ -196,6 +176,47 @@ impl Renderer {
                 bottom: cy + 15.0,
             },
         ));
+    }
+
+    /// 刷新按钮的圆弧双段加尾箭头折线
+    fn build_refresh_glyph(&self) -> Option<ID2D1PathGeometry> {
+        unsafe {
+            let geo = self.factory.CreatePathGeometry().ok()?;
+            let sink = geo.Open().ok()?;
+            let rr = 16.0 * 0.47;
+            let add = |x0: f32, y0: f32, x1: f32, y1: f32| {
+                sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_HOLLOW);
+                sink.AddLine(Vector2 { X: x1, Y: y1 });
+                sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            };
+            for (a0, a1) in [(-150f32, -20f32), (30f32, 160f32)] {
+                let (r0, r1) = (a0.to_radians(), a1.to_radians());
+                let steps = 12;
+                for i in 0..steps {
+                    let t0 = r0 + (r1 - r0) * i as f32 / steps as f32;
+                    let t1 = r0 + (r1 - r0) * (i + 1) as f32 / steps as f32;
+                    add(rr * t0.cos(), rr * t0.sin(), rr * t1.cos(), rr * t1.sin());
+                }
+                let (fx, fy) = (-r1.sin(), r1.cos());
+                let (px, py) = (rr * r1.cos(), rr * r1.sin());
+                let al = 4.0;
+                let (fs, fc) = 150f32.to_radians().sin_cos();
+                add(
+                    px,
+                    py,
+                    px + (fx * fc - fy * fs) * al,
+                    py + (fx * fs + fy * fc) * al,
+                );
+                add(
+                    px,
+                    py,
+                    px + (fx * fc + fy * fs) * al,
+                    py + (-fx * fs + fy * fc) * al,
+                );
+            }
+            sink.Close().ok()?;
+            Some(geo)
+        }
     }
 
     /// 设置入口滑杆图标
@@ -466,6 +487,37 @@ impl Renderer {
         target.SetTransform(&Matrix3x2::identity());
     }
 
+    /// 圆点带几何
+    pub(super) fn dots_geo(&mut self, n: u32) -> Option<ID2D1PathGeometry> {
+        if let Some(g) = self.dots_geos.get(&n) {
+            return Some(g.clone());
+        }
+        let geo = unsafe {
+            let geo = self.factory.CreatePathGeometry().ok()?;
+            let sink = geo.Open().ok()?;
+            const R: f32 = 0.75;
+            for i in 0..n {
+                let cx = i as f32 * 5.0;
+                let mut pts = (0..8).map(|k| {
+                    let a = k as f32 / 8.0 * std::f32::consts::TAU;
+                    (cx + R * a.cos(), R * a.sin())
+                });
+                let Some((x0, y0)) = pts.next() else {
+                    continue;
+                };
+                sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
+                for (x, y) in pts {
+                    sink.AddLine(Vector2 { X: x, Y: y });
+                }
+                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            }
+            sink.Close().ok()?;
+            geo
+        };
+        self.dots_geos.insert(n, geo.clone());
+        Some(geo)
+    }
+
     /// 多组封闭折线 → 单份填充几何；不相交轮廓为并集
     fn build_polys(&self, polys: Vec<Vec<(f32, f32)>>) -> Option<ID2D1PathGeometry> {
         unsafe {
@@ -561,7 +613,7 @@ impl Renderer {
             1.0 - smooth((phase - 0.65) / 0.35)
         };
         let mouth = 0.02 + ratio * 0.94;
-        let b = self.brush(target, self.theme.logo_tile, alpha);
+        let b = self.brush(target, self.theme.text_tertiary, alpha);
         for (geo, ang) in [(upper, -mouth), (lower, mouth)] {
             let (s, c) = ang.sin_cos();
             target.SetTransform(&Matrix3x2 {

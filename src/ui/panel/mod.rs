@@ -58,6 +58,7 @@ pub enum PanelMode {
 pub enum PanelView {
     Main,
     Settings,
+    AddForm,
 }
 
 /// 自绘输入的目标字段；设置页字段在前、添加页表单在后，各按所在分区顺序
@@ -129,9 +130,9 @@ impl PanelInput {
     }
 }
 
-/// 输入框槽位命中 → 对应编辑字段；眼睛（RevealKey）与「自定义」按钮
-/// 不属文本区，不映射
-fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<InputField> {
+/// 输入框槽位命中 → 对应编辑字段；非输入变体显式列出，新增 Hit 变体
+/// 漏登记即编译错误。眼睛（RevealKey）与「自定义」按钮不属文本区，不映射
+pub(crate) fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<InputField> {
     use crate::ui::panel::render::Hit;
     match hit {
         Hit::InputInterval => Some(InputField::Interval),
@@ -142,7 +143,39 @@ fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<InputField> 
         Hit::InputKey => Some(InputField::Key),
         Hit::InputOrg => Some(InputField::Org),
         Hit::InputProject => Some(InputField::Project),
-        _ => None,
+        // 文本区之外的命中一概不映射输入字段
+        Hit::Refresh
+        | Hit::Settings
+        | Hit::AccountSwitch
+        | Hit::Retry
+        | Hit::UsageInfo
+        | Hit::Back
+        | Hit::ClosePanel
+        | Hit::IntervalPreset(_)
+        | Hit::CustomizeInterval
+        | Hit::ApplyInterval
+        | Hit::Language(_)
+        | Hit::Appearance(_)
+        | Hit::ToggleAutostart
+        | Hit::ToggleThreshold
+        | Hit::ToggleReset5h
+        | Hit::ToggleResetWeekly
+        | Hit::ApplyPeak
+        | Hit::AddAccount
+        | Hit::RemoveAccount(_)
+        | Hit::PickAccount(_)
+        | Hit::AccountType(_)
+        | Hit::RevealKey
+        | Hit::SaveAccount
+        | Hit::Platform(_)
+        | Hit::ExportConfig
+        | Hit::ImportConfig
+        | Hit::CheckUpdate
+        | Hit::OpenDownload
+        | Hit::LinkRepo
+        | Hit::LinkIssues
+        | Hit::CopyDiagnostics
+        | Hit::NewsItem(_) => None,
     }
 }
 
@@ -165,6 +198,7 @@ pub(crate) fn field_geo(field: InputField) -> (f32, f32, f32) {
 
 /// 单次输入布局产物：可视窗口 + 光标 x + 整串前缀宽表。同一鼠标事件内
 /// 光标定位、命中换算与渲染切片共用一份，各处不再各自重建 TextLayout
+#[derive(Clone)]
 pub(crate) struct CaretLayout {
     /// 可视窗口起点 char 位次
     pub(crate) vis_start: usize,
@@ -173,6 +207,9 @@ pub(crate) struct CaretLayout {
     /// 前 i 字符的累计宽（field_display 串），表长 = 字符数 + 1
     pub(crate) widths: Vec<f32>,
 }
+
+/// 光标宽表缓存条目：键 (字段, 显示串, 光标位次, 粘滞起点) + 产物
+type CaretCacheEntry = (InputField, String, usize, usize, CaretLayout);
 
 impl CaretLayout {
     /// chars[a..b] 的宽；位次自动钳入表内，越界不 panic
@@ -190,7 +227,6 @@ pub struct Panel {
     pub(crate) scroll_max: f32,
     pub(crate) anchor: Option<RECT>,
     pub renderer: Option<Renderer>,
-    pub adding_account: bool,
     pub pending_platform: crate::api::Platform,
     pub pending_team: bool,
     pub input: PanelInput,
@@ -207,9 +243,9 @@ pub struct Panel {
     class_registered: bool,
     pub(crate) main_h: i32,
     pub(crate) account_error: bool,
-    pub update_available: bool,
     pub(crate) outside_since: Option<u64>,
     painted: bool,
+    caret_cache: std::cell::RefCell<Option<CaretCacheEntry>>,
     dpi: f32,
 }
 
@@ -223,7 +259,6 @@ impl Panel {
             scroll_max: 0.0,
             anchor: None,
             renderer: None,
-            adding_account: false,
             pending_platform: crate::api::Platform::Cn,
             pending_team: false,
             input: PanelInput::default(),
@@ -231,7 +266,6 @@ impl Panel {
             customizing_interval: false,
             main_h: 300,
             account_error: false,
-            update_available: false,
             caret_ctx: (false, false),
             selecting: false,
             text_clicks: None,
@@ -243,6 +277,7 @@ impl Panel {
             class_registered: false,
             outside_since: None,
             painted: false,
+            caret_cache: std::cell::RefCell::new(None),
             dpi: FALLBACK_DPI,
         }
     }
@@ -257,9 +292,7 @@ impl Panel {
         match self.view {
             // 动态：随指标行数 / 余额 / 副标题伸缩，由 sync_main_height 维护
             PanelView::Main => self.main_h,
-            PanelView::Settings if self.adding_account => {
-                layout::add_page_height(self.pending_team)
-            }
+            PanelView::AddForm => layout::add_page_height(self.pending_team),
             // 整页高度由 layout 的段常量链求和，与 draw_settings 的 y 推进链同源
             PanelView::Settings => layout::settings_view_height(
                 accounts > 0,
@@ -467,7 +500,6 @@ impl Panel {
 
     pub(crate) fn begin_hide(&mut self, hwnd: HWND) {
         self.mode = PanelMode::Hidden;
-        self.adding_account = false;
         self.key_revealed = false;
         self.outside_since = None;
         self.drag_offset = None;
@@ -524,7 +556,6 @@ impl Panel {
     fn reset_to_main(&mut self) {
         self.view = PanelView::Main;
         self.scroll_dy = 0.0;
-        self.adding_account = false;
         self.key_revealed = false;
         self.input.interval.clear();
         self.input.proxy.clear();
@@ -664,6 +695,28 @@ impl Panel {
             };
         };
         let buf = self.field_display();
+        let caret = self.input.edit.caret;
+        let sticky = self.vis_start.get();
+        if let Some((f, b, c, s, cl)) = self.caret_cache.borrow().as_ref()
+            && *f == field
+            && b == &buf
+            && *c == caret
+            && *s == sticky
+        {
+            return cl.clone();
+        }
+        let cl = self.compute_caret_layout(field, &buf, renderer);
+        *self.caret_cache.borrow_mut() = Some((field, buf, caret, cl.vis_start, cl.clone()));
+        cl
+    }
+
+    /// 宽表实算：缓存未命中时跑一次完整布局
+    fn compute_caret_layout(
+        &self,
+        field: InputField,
+        buf: &str,
+        renderer: &Renderer,
+    ) -> CaretLayout {
         let chars: Vec<char> = buf.chars().collect();
         let caret = self.input.edit.caret.min(chars.len());
         let (_bx, w, tail) = field_geo(field);
@@ -841,6 +894,23 @@ unsafe fn start_anim(hwnd: HWND) {
     }
 }
 
+/// 离面巡检的单步判定：present 为四路保活（在面板/弹窗、输入中、
+/// 托盘锚区、拖动中）任一命中。在场即清计时；离面从首拍起算，超时
+/// 返回 true（应收起）并清计时。纯函数，Win32 侧只负责采集布尔与时钟
+fn outside_step(present: bool, now: u64, since: &mut Option<u64>) -> bool {
+    if present {
+        *since = None;
+        return false;
+    }
+    since.get_or_insert(now);
+    if now - since.unwrap() > OUTSIDE_HIDE_MS {
+        *since = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// 重挂 TME_LEAVE 离窗跟踪
 pub(crate) unsafe fn track_leave(hwnd: HWND) {
     unsafe {
@@ -957,16 +1027,11 @@ pub extern "system" fn panel_wndproc(
                                 // 拖动中视为在场：窗口被钳在工作区边缘时光标
                                 // 可能已滑出面板外，按住不放不该被收起
                                 let dragging = app.panel.drag_offset.is_some();
-                                if in_panel || typing || near_tray || dragging {
-                                    app.panel.outside_since = None;
-                                } else {
-                                    let now =
-                                        windows::Win32::System::SystemInformation::GetTickCount64();
-                                    let since = *app.panel.outside_since.get_or_insert(now);
-                                    if now - since > OUTSIDE_HIDE_MS {
-                                        app.panel.outside_since = None;
-                                        app.panel.begin_hide(hwnd);
-                                    }
+                                let now =
+                                    windows::Win32::System::SystemInformation::GetTickCount64();
+                                let present = in_panel || typing || near_tray || dragging;
+                                if outside_step(present, now, &mut app.panel.outside_since) {
+                                    app.panel.begin_hide(hwnd);
                                 }
                             }
                         }
@@ -1006,9 +1071,8 @@ pub extern "system" fn panel_wndproc(
                 // 拖动分支走 as_mut 的 reborrow 后提前返回；此处 move 同一
                 // 绑定——再取一次 app_from_tray 会构造两个活跃可变别名
                 if let Some(app) = app {
-                    // 拖选中：光标随鼠标指针推进扩选区。宽表一次成型供命中
-                    // 换算，扩选落定后 update_caret 按新位次重定可视窗口，
-                    // 每次鼠标移动共两次布局
+                    // 拖选中：光标随鼠标指针推进扩选区。宽表查缓存命中（缓冲
+                    // 与粘滞起点均不变），新光标 x 直接查表，不再二次布局
                     if app.panel.selecting {
                         let x = x_of(lparam) / app.panel.dpi;
                         if let (Some(f), Some(r)) =
@@ -1018,7 +1082,16 @@ pub extern "system" fn panel_wndproc(
                             let pos = app.panel.caret_hit_test(&cl, f, x);
                             if pos != app.panel.input.edit.caret {
                                 app.panel.input.edit.place(pos, true);
-                                app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
+                                // 窗内查表定位；越出可视窗（捕获使框外坐标可达）
+                                // 须完整重排让窗口滚动，否则光标画出框外不自愈
+                                let (_bx, fw, tail) = field_geo(f);
+                                let avail = (fw - 6.0 - tail).max(1.0);
+                                let cx = cl.seg(cl.vis_start, pos);
+                                if cx <= avail {
+                                    app.panel.place_caret(hwnd, cx);
+                                } else {
+                                    app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
+                                }
                                 let _ = InvalidateRect(Some(hwnd), None, false);
                             }
                         }
@@ -1555,8 +1628,8 @@ fn read_clipboard_text() -> Option<String> {
     }
 }
 
-/// 写 Unicode 文本到剪贴板
-fn write_clipboard_text(text: &str) {
+/// 写 Unicode 文本到剪贴板；全链成功才返回 true，调用方据此反馈
+pub(crate) fn write_clipboard_text(text: &str) -> bool {
     unsafe {
         use windows::Win32::Foundation::GlobalFree;
         use windows::Win32::System::DataExchange::{
@@ -1568,7 +1641,8 @@ fn write_clipboard_text(text: &str) {
 
         const CF_UNICODETEXT: u32 = 13;
         let Ok(()) = OpenClipboard(None) else {
-            return;
+            crate::platform::log("[Quotify] 剪贴板打开失败");
+            return false;
         };
         let ok = (|| {
             use windows::Win32::Foundation::HANDLE;
@@ -1600,6 +1674,7 @@ fn write_clipboard_text(text: &str) {
         if !ok {
             crate::platform::log("[Quotify] 剪贴板写入失败");
         }
+        ok
     }
 }
 
@@ -1628,5 +1703,29 @@ mod tests {
         assert_eq!(p.view_height(1), 883);
         p.account_error = true;
         assert_eq!(p.view_height(1), 901);
+    }
+
+    /// 巡检判定：在场清计时、离面首拍起算、严格大于才收、收后重开
+    /// 重新起算（不沿用旧时间戳）
+    #[test]
+    fn outside_step_timing() {
+        let mut since = None;
+        // 在场：永不收起且清计时
+        assert!(!outside_step(true, 100, &mut since));
+        assert_eq!(since, None);
+        // 离面首拍：起算不收
+        assert!(!outside_step(false, 200, &mut since));
+        assert_eq!(since, Some(200));
+        // 恰到 2000ms：严格大于才收
+        assert!(!outside_step(false, 2200, &mut since));
+        // 超时：收起并清计时
+        assert!(outside_step(false, 2201, &mut since));
+        assert_eq!(since, None);
+        // 中途回访清零后，再次离面从新时刻起算
+        assert!(!outside_step(true, 3000, &mut since));
+        assert!(!outside_step(false, 3100, &mut since));
+        assert_eq!(since, Some(3100));
+        assert!(!outside_step(false, 5100, &mut since));
+        assert!(outside_step(false, 5101, &mut since));
     }
 }

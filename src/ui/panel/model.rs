@@ -70,7 +70,9 @@ impl<'a> PanelModel<'a> {
             threshold_percent: g.notify_threshold_percent,
             reset_5h_enabled: g.notify_reset_5h_enabled,
             reset_weekly_enabled: g.notify_reset_weekly_enabled,
-            update_available: app.panel.update_available,
+            update_available: app.update_status.as_ref().is_some_and(|r| {
+                matches!(r, Ok(info) if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")))
+            }),
             peak_range: crate::app::peak_range_of(&app.config),
             peak_start_raw: &app.config.general.peak_start,
             peak_end_raw: &app.config.general.peak_end,

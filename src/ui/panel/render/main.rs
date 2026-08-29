@@ -6,8 +6,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_ROUNDED_RECT,
-    ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget, ID2D1PathGeometry,
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -28,9 +27,34 @@ const MCP_PALETTE: [[f32; 4]; 4] = [
 ];
 
 /// 能量格几何
+const MCP_CELLS: usize = 20;
 const MCP_CELL_W: f32 = 12.0;
 const MCP_CELL_GAP: f32 = 2.0;
 const MCP_CELL_SKEW: f32 = 4.0;
+
+/// 图例徽标几何
+const MCP_BADGE_SIZE: f32 = 11.0;
+const MCP_SWATCH: f32 = 8.0;
+const MCP_SWATCH_GAP: f32 = 3.0;
+const MCP_BADGE_GAP: f32 = 6.0;
+
+/// 图例徽标
+struct McpBadge {
+    color: [f32; 4],
+    text: String,
+    text_w: f32,
+}
+
+/// MCP 构成区按 (快照时间, 内宽) 缓存的数据侧产物，命中时跳过排序、
+/// 分段与全部测宽。段几何与轨道空格色依赖逐帧位置/主题，绘制时现算
+pub(super) struct McpCompCache {
+    key: chrono::DateTime<chrono::Local>,
+    inner_w: f32,
+    segs: Vec<(usize, usize, [f32; 4])>,
+    badges: Vec<McpBadge>,
+    shown: usize,
+    plus_w: f32,
+}
 
 impl Renderer {
     /// 主视图：顶栏常驻；主体按「无快照、有错误、有数据」三态渲染
@@ -339,7 +363,7 @@ impl Renderer {
                         );
                         // 明细非空才陈列构成区，与 sync_main_height 判定同源
                         if !m.details.is_empty() {
-                            y = self.mcp_composition(target, m, y, w, alpha);
+                            y = self.mcp_composition(target, m, snap.queried_at, y, w, alpha);
                         }
                     }
 
@@ -641,17 +665,17 @@ impl Renderer {
     /// MCP 工具构成区：直角外框内一条右斜平行四边形能量格条[满串 = 工具
     /// 消耗合计]加一行三格徽标图例[色块|名称|次数]。格段与徽标色块按用量
     /// 降序取低饱和四色板，第 5+ 工具并入第四色；图例装不下整枚徽标截尾
-    /// +N、首枚超宽截名称。返回下一行 y
+    /// +N、首枚超宽截名称。数据只随轮询变化，分段/徽标/装填结果按
+    /// (快照时间, 内宽) 缓存，动画帧不重算。返回下一行 y
     unsafe fn mcp_composition(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         m: &crate::api::McpUsage,
+        queried_at: chrono::DateTime<chrono::Local>,
         y: f32,
         w: f32,
         alpha: f32,
     ) -> f32 {
-        const CELLS: usize = 20;
-
         let pad = layout::CONTENT_PAD;
         let top = y + layout::MAIN_MCP_COMP_TOP_GAP;
         let frame_h = layout::MAIN_MCP_COMP_H - layout::MAIN_MCP_COMP_TOP_GAP;
@@ -666,6 +690,126 @@ impl Renderer {
         let stroke = self.brush(target, self.theme.border, alpha);
         target.DrawRectangle(&frame, &stroke, 1.0, None);
 
+        // 数据侧产物按 (快照时间, 内宽) 缓存：命中时跳过排序、分段与全部
+        // 测宽；宽度入键因装填结果随面板宽变化（跨 DPI 显示器）。take
+        // 取走所有权，绘制段才能自由调用 &mut self 的绘制方法；本函数
+        // 单一出口，函数尾放回
+        let mut cache = self.mcp_cache.take();
+        if cache
+            .as_ref()
+            .is_none_or(|c| c.key != queried_at || c.inner_w != inner_w)
+        {
+            cache = Some(self.build_mcp_cache(m, queried_at, inner_w));
+        }
+        let c = cache.unwrap();
+        let segs = &c.segs;
+        let badges = &c.badges;
+        let shown = c.shown;
+
+        let cell_h = layout::MAIN_MCP_CELL_H;
+        let bar_y = top + 1.0 + layout::MAIN_MCP_COMP_PAD_Y;
+        let bar_w = MCP_CELLS as f32 * MCP_CELL_W + (MCP_CELLS - 1) as f32 * MCP_CELL_GAP;
+        let x0 = inner_x + (inner_w - bar_w) / 2.0;
+        // 待填段队列：明细合计可小于总消耗，未覆盖格位画轨道空格
+        let mut jobs: Vec<(usize, usize, [f32; 4])> = Vec::new();
+        let mut cursor = 0usize;
+        for (start, end, color) in segs {
+            if *start > cursor {
+                jobs.push((cursor, *start, self.theme.track));
+            }
+            jobs.push((*start, *end, *color));
+            cursor = *end;
+        }
+        if cursor < MCP_CELLS {
+            jobs.push((cursor, MCP_CELLS, self.theme.track));
+        }
+        for (from, to, color) in jobs {
+            if let Some(geo) = self.build_mcp_cells(from, to, x0, bar_y) {
+                let b = self.brush(target, color, alpha);
+                target.FillGeometry(&geo, &b, None);
+            }
+        }
+
+        let leg_y = bar_y + cell_h + layout::MAIN_MCP_LEGEND_ADV;
+        let leg_h = layout::MAIN_MCP_LEGEND_H;
+        let sw_top = leg_y + 3.5;
+        let swatch_rect = |x: f32| D2D_RECT_F {
+            left: x,
+            top: sw_top,
+            right: x + MCP_SWATCH,
+            bottom: sw_top + MCP_SWATCH,
+        };
+        let mut x = inner_x;
+        if shown == 0 && !badges.is_empty() {
+            // 首枚即超宽：截文本兜底，最大工具保底可见
+            let b = &badges[0];
+            let sw = self.brush(target, b.color, alpha);
+            target.FillRectangle(&swatch_rect(x), &sw);
+            let avail = inner_w - MCP_SWATCH - MCP_SWATCH_GAP;
+            let (t, _) = self.ellipsize(&b.text, MCP_BADGE_SIZE, avail, 400, true);
+            self.text_nosnap(
+                target,
+                &t,
+                x + MCP_SWATCH + MCP_SWATCH_GAP,
+                leg_y,
+                avail,
+                leg_h,
+                MCP_BADGE_SIZE,
+                400,
+                self.theme.text_secondary,
+                alpha,
+            );
+        } else {
+            for (i, b) in badges.iter().take(shown).enumerate() {
+                if i > 0 {
+                    x += MCP_BADGE_GAP;
+                }
+                let sw = self.brush(target, b.color, alpha);
+                target.FillRectangle(&swatch_rect(x), &sw);
+                x += MCP_SWATCH + MCP_SWATCH_GAP;
+                self.text_nosnap(
+                    target,
+                    &b.text,
+                    x,
+                    leg_y,
+                    b.text_w + 2.0,
+                    leg_h,
+                    MCP_BADGE_SIZE,
+                    400,
+                    self.theme.text_secondary,
+                    alpha,
+                );
+                x += b.text_w;
+            }
+            if shown < badges.len() {
+                let t = format!("+{}", badges.len() - shown);
+                let tw = c.plus_w;
+                x += MCP_BADGE_GAP;
+                self.text_nosnap(
+                    target,
+                    &t,
+                    x,
+                    leg_y,
+                    tw + 2.0,
+                    leg_h,
+                    MCP_BADGE_SIZE,
+                    400,
+                    self.theme.text_tertiary,
+                    alpha,
+                );
+            }
+        }
+        self.mcp_cache = Some(c);
+        y + layout::MAIN_MCP_COMP_H
+    }
+
+    /// 重建 MCP 构成区缓存：工具排序、能量条分段与徽标测宽装填
+    unsafe fn build_mcp_cache(
+        &mut self,
+        m: &crate::api::McpUsage,
+        queried_at: chrono::DateTime<chrono::Local>,
+        inner_w: f32,
+    ) -> McpCompCache {
         // 工具降序；段界累计取整，段间无缝不重叠，末段吃满整串
         let mut items: Vec<&crate::api::McpDetail> = m.details.iter().collect();
         items.sort_by(|a, b| {
@@ -680,9 +824,11 @@ impl Renderer {
             for (i, d) in items.iter().enumerate() {
                 cum += d.usage;
                 let end = if i + 1 == items.len() {
-                    CELLS
+                    MCP_CELLS
                 } else {
-                    (cum / sum * CELLS as f64).round().clamp(0.0, CELLS as f64) as usize
+                    (cum / sum * MCP_CELLS as f64)
+                        .round()
+                        .clamp(0.0, MCP_CELLS as f64) as usize
                 };
                 let start = segs.last().map_or(0, |s| s.1);
                 if end > start {
@@ -690,44 +836,10 @@ impl Renderer {
                 }
             }
         }
-        let cell_h = layout::MAIN_MCP_CELL_H;
-        let bar_y = top + 1.0 + layout::MAIN_MCP_COMP_PAD_Y;
-        let bar_w = CELLS as f32 * MCP_CELL_W + (CELLS - 1) as f32 * MCP_CELL_GAP;
-        let x0 = inner_x + (inner_w - bar_w) / 2.0;
-        // 待填段队列：明细合计可小于总消耗，未覆盖格位画轨道空格
-        let mut jobs: Vec<(usize, usize, [f32; 4])> = Vec::new();
-        let mut cursor = 0usize;
-        for (start, end, color) in &segs {
-            if *start > cursor {
-                jobs.push((cursor, *start, self.theme.track));
-            }
-            jobs.push((*start, *end, *color));
-            cursor = *end;
-        }
-        if cursor < CELLS {
-            jobs.push((cursor, CELLS, self.theme.track));
-        }
-        for (from, to, color) in jobs {
-            if let Some(geo) = self.build_mcp_cells(from, to, x0, bar_y) {
-                let b = self.brush(target, color, alpha);
-                target.FillGeometry(&geo, &b, None);
-            }
-        }
-
         // 图例为徽标串[色块|名称·次数]：色块与能量条分段同色，名称首字母
         // 大写仅动显示层。装填按宽度驱动：装下当前枚后若仍有剩余，须再
         // 容得下徽标间空隙 + 「+N」才继续装，尾部概括数即剩余工具数
-        let leg_y = bar_y + cell_h + layout::MAIN_MCP_LEGEND_ADV;
-        let size = 11.0;
-        let swatch = 8.0;
-        let inner_gap = 3.0;
-        let badge_gap = 6.0;
-        struct Badge {
-            color: [f32; 4],
-            text: String,
-            text_w: f32,
-        }
-        let badges: Vec<Badge> = items
+        let badges: Vec<McpBadge> = items
             .iter()
             .enumerate()
             .map(|(i, d)| {
@@ -737,21 +849,27 @@ impl Renderer {
                     None => String::new(),
                 };
                 let text = format!("{name} {}", fmt::compact_number(d.usage));
-                let text_w = self.measure(&text, size, 400, true);
-                Badge {
+                let text_w = self.measure(&text, MCP_BADGE_SIZE, 400, true);
+                McpBadge {
                     color: MCP_PALETTE[i.min(MCP_PALETTE.len() - 1)],
                     text,
                     text_w,
                 }
             })
             .collect();
-        let badge_w = |b: &Badge| swatch + inner_gap + b.text_w;
+        let badge_w = |b: &McpBadge| MCP_SWATCH + MCP_SWATCH_GAP + b.text_w;
         let mut shown = 0usize;
         let mut cur = 0.0f32;
         for (i, b) in badges.iter().enumerate() {
-            let add = if i == 0 { 0.0 } else { badge_gap } + badge_w(b);
+            let add = if i == 0 { 0.0 } else { MCP_BADGE_GAP } + badge_w(b);
             let tail = if badges.len() - i > 1 {
-                badge_gap + self.measure(&format!("+{}", badges.len() - i - 1), size, 400, true)
+                MCP_BADGE_GAP
+                    + self.measure(
+                        &format!("+{}", badges.len() - i - 1),
+                        MCP_BADGE_SIZE,
+                        400,
+                        true,
+                    )
             } else {
                 0.0
             };
@@ -761,79 +879,28 @@ impl Renderer {
             cur += add;
             shown = i + 1;
         }
-        let leg_h = layout::MAIN_MCP_LEGEND_H;
-        let sw_top = leg_y + 3.5;
-        let swatch_rect = |x: f32| D2D_RECT_F {
-            left: x,
-            top: sw_top,
-            right: x + swatch,
-            bottom: sw_top + swatch,
-        };
-        let mut x = inner_x;
-        if shown == 0 && !badges.is_empty() {
-            // 首枚即超宽：截文本兜底，最大工具保底可见
-            let b = &badges[0];
-            let sw = self.brush(target, b.color, alpha);
-            target.FillRectangle(&swatch_rect(x), &sw);
-            let avail = inner_w - swatch - inner_gap;
-            let (t, _) = self.ellipsize(&b.text, size, avail, 400, true);
-            self.text_nosnap(
-                target,
-                &t,
-                x + swatch + inner_gap,
-                leg_y,
-                avail,
-                leg_h,
-                size,
+        let plus_w = if shown < badges.len() {
+            self.measure(
+                &format!("+{}", badges.len() - shown),
+                MCP_BADGE_SIZE,
                 400,
-                self.theme.text_secondary,
-                alpha,
-            );
+                true,
+            )
         } else {
-            for (i, b) in badges.iter().take(shown).enumerate() {
-                if i > 0 {
-                    x += badge_gap;
-                }
-                let sw = self.brush(target, b.color, alpha);
-                target.FillRectangle(&swatch_rect(x), &sw);
-                x += swatch + inner_gap;
-                self.text_nosnap(
-                    target,
-                    &b.text,
-                    x,
-                    leg_y,
-                    b.text_w + 2.0,
-                    leg_h,
-                    size,
-                    400,
-                    self.theme.text_secondary,
-                    alpha,
-                );
-                x += b.text_w;
-            }
-            if shown < badges.len() {
-                let t = format!("+{}", badges.len() - shown);
-                let tw = self.measure(&t, size, 400, true);
-                x += badge_gap;
-                self.text_nosnap(
-                    target,
-                    &t,
-                    x,
-                    leg_y,
-                    tw + 2.0,
-                    leg_h,
-                    size,
-                    400,
-                    self.theme.text_tertiary,
-                    alpha,
-                );
-            }
+            0.0
+        };
+        McpCompCache {
+            key: queried_at,
+            inner_w,
+            segs,
+            badges,
+            shown,
+            plus_w,
         }
-        y + layout::MAIN_MCP_COMP_H
     }
 
     /// 禁用像素吸附的文本绘制：吸附偏移随位置独立抖动，会拉花链式
-    /// 推进的徽标间距；仅徽标图例使用
+    /// 推进的徽标间距；仅徽标图例使用。mono + 垂直居中，走 text_raw
     #[allow(clippy::too_many_arguments)]
     unsafe fn text_nosnap(
         &mut self,
@@ -848,33 +915,25 @@ impl Renderer {
         color: [f32; 4],
         alpha: f32,
     ) {
-        let Some(fmt) = self.format(size, weight, true) else {
-            return;
-        };
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        if w16.is_empty() {
-            return;
-        }
-        let _ = fmt.SetParagraphAlignment(
-            windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_CENTER,
-        );
         let rect = D2D_RECT_F {
             left: x,
             top: y,
             right: x + w,
             bottom: y + h,
         };
-        let b = self.brush(target, color, alpha);
-        target.DrawText(
-            &w16,
-            &fmt,
+        self.text_raw(
+            target,
+            s,
             &rect,
-            &b,
-            D2D1_DRAW_TEXT_OPTIONS_CLIP | D2D1_DRAW_TEXT_OPTIONS_NO_SNAP,
-            windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
-        );
-        let _ = fmt.SetParagraphAlignment(
-            windows::Win32::Graphics::DirectWrite::DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
+            size,
+            weight,
+            color,
+            alpha,
+            Align::Left,
+            true,
+            false,
+            true,
+            true,
         );
     }
 

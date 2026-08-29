@@ -154,29 +154,31 @@ peak_end = "18:00"
 # selected = ""
 "#;
 
-/// 解析配置文本，损坏时坏文件改名留档并回退默认配置
-fn parse_or_default(text: &str, path: &Path) -> Config {
-    toml::from_str(text).unwrap_or_else(|e| {
-        let pos = e
-            .span()
-            .map(|s| {
-                let before = text.get(..s.start.min(text.len())).unwrap_or("");
-                let line = before.matches('\n').count() + 1;
-                let col = before
-                    .rsplit('\n')
-                    .next()
-                    .map(|l| l.chars().count() + 1)
-                    .unwrap_or(1);
-                format!("（第 {line} 行第 {col} 列）")
-            })
-            .unwrap_or_default();
-        crate::platform::log(&format!(
-            "config.toml 解析失败，使用默认配置{pos}: {}",
-            e.message()
-        ));
-        backup_broken(path);
-        Config::default()
-    })
+/// 解析配置文本：损坏时坏文件改名留档并回退默认配置
+fn parse_or_default(text: &str, path: &Path) -> (Config, bool) {
+    toml::from_str(text)
+        .map(|c| (c, false))
+        .unwrap_or_else(|e| {
+            let pos = e
+                .span()
+                .map(|s| {
+                    let before = text.get(..s.start.min(text.len())).unwrap_or("");
+                    let line = before.matches('\n').count() + 1;
+                    let col = before
+                        .rsplit('\n')
+                        .next()
+                        .map(|l| l.chars().count() + 1)
+                        .unwrap_or(1);
+                    format!("（第 {line} 行第 {col} 列）")
+                })
+                .unwrap_or_default();
+            crate::platform::log(&format!(
+                "config.toml 解析失败，使用默认配置{pos}: {}",
+                e.message()
+            ));
+            backup_broken(path);
+            (Config::default(), true)
+        })
 }
 
 /// 坏文件改名 .bak 留档后再回退默认，用户手改的内容有处可寻
@@ -201,7 +203,12 @@ pub fn load() -> Config {
         Ok(text) => {
             // 旧版本写下的文件没有收紧过 ACL，启动时统一补一次[幂等]
             crate::platform::secure_file_acl(&path);
-            parse_or_default(&text, &path)
+            let (cfg, broken) = parse_or_default(&text, &path);
+            if broken {
+                let s = crate::ui::i18n::detect_system_lang().strings();
+                crate::platform::notify::show(super::notify::NOTIFY_TITLE, s.notify_config_broken);
+            }
+            cfg
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // 模板本身不含 key，但用户可能直接手填，落盘即统一收紧；
@@ -257,17 +264,19 @@ mod tests {
     #[test]
     fn template_parses_back() {
         toml::from_str::<Config>(TEMPLATE).expect("TEMPLATE 必须可解析");
-        let cfg = parse_or_default(TEMPLATE, Path::new("no-such-config.toml"));
+        let (cfg, broken) = parse_or_default(TEMPLATE, Path::new("no-such-config.toml"));
+        assert!(!broken);
         assert_eq!(cfg, Config::default());
     }
 
-    /// 损坏文本回退默认配置，不 panic、不部分采用
+    /// 损坏文本回退默认配置并置回退标记，不 panic、不部分采用
     #[test]
     fn corrupted_text_falls_back_to_default() {
-        let cfg = parse_or_default(
+        let (cfg, broken) = parse_or_default(
             "this is not valid toml ]][",
             Path::new("no-such-config.toml"),
         );
+        assert!(broken);
         assert_eq!(
             cfg.general.poll_interval_secs,
             General::default().poll_interval_secs

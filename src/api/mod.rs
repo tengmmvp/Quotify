@@ -417,6 +417,25 @@ fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
     }
 }
 
+/// 信封校验：success=false 或 code 非 200 归入 FetchError。
+fn envelope_check(v: &Value) -> Result<(), FetchError> {
+    if v.get("success").and_then(Value::as_bool) == Some(false) {
+        let msg = v
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error");
+        let code = v.get("code").and_then(Value::as_i64);
+        return Err(inband_error(code, msg));
+    }
+    if let Some(code) = v.get("code").and_then(Value::as_i64)
+        && code != 200
+    {
+        let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
+        return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
+    }
+    Ok(())
+}
+
 /// 解析完整响应体
 pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
     let v: Value =
@@ -425,20 +444,7 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
     let data = if v.is_array() {
         &v
     } else {
-        if v.get("success").and_then(Value::as_bool) == Some(false) {
-            let msg = v
-                .get("msg")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            let code = v.get("code").and_then(Value::as_i64);
-            return Err(inband_error(code, msg));
-        }
-        if let Some(code) = v.get("code").and_then(Value::as_i64)
-            && code != 200
-        {
-            let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
-            return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
-        }
+        envelope_check(&v)?;
         v.get("data")
             .ok_or_else(|| FetchError::Api("missing data field".into()))?
     };
@@ -455,20 +461,7 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
 pub fn parse_token_total(body: &str) -> Result<f64, FetchError> {
     let v: Value =
         serde_json::from_str(body).map_err(|e| FetchError::Api(format!("parse failed: {e}")))?;
-    if v.get("success").and_then(Value::as_bool) == Some(false) {
-        let msg = v
-            .get("msg")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        let code = v.get("code").and_then(Value::as_i64);
-        return Err(inband_error(code, msg));
-    }
-    if let Some(code) = v.get("code").and_then(Value::as_i64)
-        && code != 200
-    {
-        let msg = v.get("msg").and_then(Value::as_str).unwrap_or("");
-        return Err(inband_error(Some(code), &format!("code {code}: {msg}")));
-    }
+    envelope_check(&v)?;
     let data = v.get("data").unwrap_or(&Value::Null);
     // 服务端合计为权威值，缺失时回退逐点求和
     if let Some(total) = data

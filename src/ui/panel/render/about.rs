@@ -183,13 +183,15 @@ impl Renderer {
             false,
         );
 
-        // ── 双链接并排 ──
+        // ── 三链接并排：仓库 / 反馈 / 复制诊断 ──
         let repo = format!("[{}]", s.link_repo);
         let issues = format!("[{}]", s.link_issues);
+        let diag = format!("[{}]", s.link_diag);
         let link_gap = 20.0;
         let rw = self.measure(&repo, 12.5, 500, false) + 8.0;
         let iw = self.measure(&issues, 12.5, 500, false) + 8.0;
-        let total = rw + link_gap + iw;
+        let dw = self.measure(&diag, 12.5, 500, false) + 8.0;
+        let total = rw + link_gap + iw + link_gap + dw;
         let rx = (w - total) / 2.0;
         self.link(target, Hit::LinkRepo, &repo, rx, dy + link_y, rw, alpha);
         self.link(
@@ -199,6 +201,15 @@ impl Renderer {
             rx + rw + link_gap,
             dy + link_y,
             iw,
+            alpha,
+        );
+        self.link(
+            target,
+            Hit::CopyDiagnostics,
+            &diag,
+            rx + rw + link_gap + iw + link_gap,
+            dy + link_y,
+            dw,
             alpha,
         );
 

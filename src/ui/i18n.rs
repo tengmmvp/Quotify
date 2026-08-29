@@ -168,12 +168,15 @@ pub struct Strings {
     pub app_desc: &'static str,
     pub link_repo: &'static str,
     pub link_issues: &'static str,
+    pub link_diag: &'static str,
     pub whats_new_section: &'static str,
 
     // ── 系统通知标题 ──
     pub notify_threshold_title: &'static str,
     pub notify_reset_5h: &'static str,
     pub notify_reset_weekly: &'static str,
+    pub notify_config_broken: &'static str,
+    pub notify_diag_copied: &'static str,
 }
 
 const ZH: Strings = Strings {
@@ -308,12 +311,15 @@ const ZH: Strings = Strings {
     app_desc: "Windows 任务栏托盘的 GLM Coding Plan 用量小组件",
     link_repo: "开源仓库",
     link_issues: "问题反馈",
+    link_diag: "复制诊断",
     whats_new_section: "最新动态",
 
     // ── 系统通知标题 ──
     notify_threshold_title: "额度预警",
     notify_reset_5h: "5 小时窗口已重置",
     notify_reset_weekly: "周额度已重置",
+    notify_config_broken: "config.toml 解析失败，已回退默认配置，原文件留档为 config.toml.bak，账号与设置需重新配置",
+    notify_diag_copied: "诊断信息已复制到剪贴板",
 };
 
 const EN: Strings = Strings {
@@ -448,12 +454,15 @@ const EN: Strings = Strings {
     app_desc: "A Windows tray widget for GLM Coding Plan usage",
     link_repo: "Repository",
     link_issues: "Feedback",
+    link_diag: "Copy diagnostics",
     whats_new_section: "What's New",
 
     // ── 系统通知标题 ──
     notify_threshold_title: "Quota alert",
     notify_reset_5h: "5-hour window has reset",
     notify_reset_weekly: "Weekly quota has reset",
+    notify_config_broken: "config.toml failed to parse; defaults restored and the original saved as config.toml.bak. Accounts and settings need to be re-entered",
+    notify_diag_copied: "Diagnostics copied to clipboard",
 };
 
 impl Lang {

@@ -16,7 +16,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
     D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
     D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget,
     ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
@@ -118,28 +118,22 @@ pub enum Hit {
     // ── 关于窗 ──
     LinkRepo,
     LinkIssues,
+    CopyDiagnostics,
     NewsItem(usize),
 }
 
 /// Hit 的谓词集中放在枚举旁维护；新增输入框类变体须同步收录
 impl Hit {
     /// 点击后会进入/保持输入态或 key 明文查看态的命中；
-    /// WM_LBUTTONUP 据此决定点击后是否结束输入态
+    /// WM_LBUTTONUP 据此决定点击后是否结束输入态。
+    /// 输入框槽位经 input_field_of_hit 穷尽判定，
+    /// 此处只补三个非槽位但保持输入态的命中
     pub(crate) fn is_input_hit(&self) -> bool {
-        matches!(
-            self,
-            Self::CustomizeInterval
-                | Self::InputInterval
-                | Self::InputProxy
-                | Self::InputPeakStart
-                | Self::InputPeakEnd
-                | Self::AddAccount
-                | Self::InputName
-                | Self::InputKey
-                | Self::RevealKey
-                | Self::InputOrg
-                | Self::InputProject
-        )
+        crate::ui::panel::input_field_of_hit(*self).is_some()
+            || matches!(
+                self,
+                Self::CustomizeInterval | Self::AddAccount | Self::RevealKey
+            )
     }
 }
 
@@ -203,9 +197,6 @@ pub struct Renderer {
     brushes: HashMap<u32, ID2D1SolidColorBrush>,
     formats: HashMap<(u32, u16, bool), IDWriteTextFormat>,
     ro_formats: std::cell::RefCell<HashMap<(&'static str, u32, u16), IDWriteTextFormat>>,
-    /// 帧内测宽缓存：键为 ('static 文本指针, 字节长, 字号位, 字重, mono)，
-    /// 只收编译期常量文本——堆串地址会被复用，同地址不同串将拿错宽；
-    /// 帧首 clear，不跨帧
     frame_measures: HashMap<(usize, usize, u32, u16, bool), f32>,
     pub theme: Theme,
     pub hits: Vec<(Hit, D2D_RECT_F)>,
@@ -219,6 +210,7 @@ pub struct Renderer {
     bolt_geo: Option<ID2D1PathGeometry>,
     eye_geo: Option<ID2D1PathGeometry>,
     dash_style: Option<ID2D1StrokeStyle>,
+    mcp_cache: Option<main::McpCompCache>,
 }
 
 impl Renderer {
@@ -252,6 +244,7 @@ impl Renderer {
                 bolt_geo: None,
                 eye_geo: None,
                 dash_style: None,
+                mcp_cache: None,
             })
         }
     }
@@ -573,7 +566,10 @@ impl Renderer {
                 let content_h = panel.main_h as f32;
                 self.draw_main(target, model, w, h, content_h, dy, alpha)
             }
-            PanelView::Settings => self.draw_settings(target, panel, model, w, dy, alpha),
+            // 添加表单与设置页共用 draw_settings，内部按视图分流
+            PanelView::Settings | PanelView::AddForm => {
+                self.draw_settings(target, panel, model, w, dy, alpha)
+            }
         }
 
         // 峰谷说明卡片最后画，盖过数据行
@@ -668,6 +664,69 @@ impl Renderer {
         );
     }
 
+    /// 文本绘制原语：临时改共享 format 的对齐/换行/居中，用后还原——取得
+    /// fmt 后不得提前 return，改态泄漏会错排后续同参文本
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn text_raw(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        s: &str,
+        rect: &D2D_RECT_F,
+        size: f32,
+        weight: u16,
+        color: [f32; 4],
+        alpha: f32,
+        align: Align,
+        mono: bool,
+        wrap: bool,
+        vcenter: bool,
+        nosnap: bool,
+    ) {
+        let Some(fmt) = self.format(size, weight, mono) else {
+            return;
+        };
+        let align_set = match align {
+            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
+            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
+            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
+        };
+        let _ = fmt.SetTextAlignment(align_set);
+        if wrap {
+            let _ = fmt
+                .SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP);
+        }
+        if vcenter {
+            let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        }
+        let mut opts = D2D1_DRAW_TEXT_OPTIONS_CLIP;
+        if nosnap {
+            opts |= D2D1_DRAW_TEXT_OPTIONS_NO_SNAP;
+        }
+        let w16: Vec<u16> = s.encode_utf16().collect();
+        // 空串跳过：无可绘制内容，也省一次刷子创建
+        if !w16.is_empty() {
+            let brush = self.brush(target, color, alpha);
+            target.DrawText(
+                &w16,
+                &fmt,
+                rect as *const D2D_RECT_F,
+                &brush,
+                opts,
+                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
+            );
+        }
+        // 还原 format 默认态（LEADING/NO_WRAP/NEAR），与缓存创建时一致
+        if wrap {
+            let _ = fmt.SetWordWrapping(
+                windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
+            );
+        }
+        if vcenter {
+            let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        }
+        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+    }
+
     /// 文本绘制的完整选项版：对齐 + 字体族
     #[allow(clippy::too_many_arguments)]
     unsafe fn text_rect_opts(
@@ -682,7 +741,9 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        self.text_aligned(target, s, rect, size, weight, color, alpha, align, mono);
+        self.text_raw(
+            target, s, rect, size, weight, color, alpha, align, mono, false, false, false,
+        );
     }
 
     /// 按枚举对齐绘制文本，段落对齐保持顶部；mono 选择等宽字体。
@@ -699,33 +760,12 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        let Some(fmt) = self.format(size, weight, mono) else {
-            return;
-        };
-        let align_set = match align {
-            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-        };
-        let _ = fmt.SetTextAlignment(align_set);
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        // 空串跳过：无可绘制内容，也省一次刷子创建
-        if !w16.is_empty() {
-            let brush = self.brush(target, color, alpha);
-            target.DrawText(
-                &w16,
-                &fmt,
-                rect as *const D2D_RECT_F,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        self.text_raw(
+            target, s, rect, size, weight, color, alpha, align, mono, false, false, false,
+        );
     }
 
-    /// 多行文案：临时开自动换行，长文按框宽折行（如空态副标题）。
-    /// format 是缓存共享句柄，用后必须还原换行与对齐
+    /// 多行文案：临时开自动换行，长文按框宽折行
     #[allow(clippy::too_many_arguments)]
     unsafe fn text_wrapped(
         &mut self,
@@ -739,35 +779,12 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        let Some(fmt) = self.format(size, weight, mono) else {
-            return;
-        };
-        let _ =
-            fmt.SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_WRAP);
-        let align_set = match align {
-            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-        };
-        let _ = fmt.SetTextAlignment(align_set);
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        if !w16.is_empty() {
-            let brush = self.brush(target, color, alpha);
-            target.DrawText(
-                &w16,
-                &fmt,
-                rect as *const D2D_RECT_F,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-        let _ = fmt
-            .SetWordWrapping(windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP);
-        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        self.text_raw(
+            target, s, rect, size, weight, color, alpha, align, mono, true, false, false,
+        );
     }
 
-    /// 垂直居中版 text_aligned；临时改共享 format 对齐，绘制后立即还原
+    /// 垂直居中版 text_aligned
     #[allow(clippy::too_many_arguments)]
     unsafe fn text_aligned_vc(
         &mut self,
@@ -781,31 +798,9 @@ impl Renderer {
         align: Align,
         mono: bool,
     ) {
-        let Some(fmt) = self.format(size, weight, mono) else {
-            return;
-        };
-        let align_set = match align {
-            Align::Left => DWRITE_TEXT_ALIGNMENT_LEADING,
-            Align::Center => DWRITE_TEXT_ALIGNMENT_CENTER,
-            Align::Right => DWRITE_TEXT_ALIGNMENT_TRAILING,
-        };
-        let _ = fmt.SetTextAlignment(align_set);
-        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        // 空串跳过：无可绘制内容，也省一次刷子创建
-        if !w16.is_empty() {
-            let brush = self.brush(target, color, alpha);
-            target.DrawText(
-                &w16,
-                &fmt,
-                rect as *const D2D_RECT_F,
-                &brush,
-                D2D1_DRAW_TEXT_OPTIONS_CLIP,
-                windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
-            );
-        }
-        let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-        let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        self.text_raw(
+            target, s, rect, size, weight, color, alpha, align, mono, false, true, false,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -389,12 +389,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             if let Some(app) = app_from(hwnd) {
                 app.update_checking = false;
                 if let Some(r) = result {
-                    app.panel.update_available = match r.as_ref() {
-                        Ok(info) => {
-                            crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION"))
-                        }
-                        Err(_) => false,
-                    };
                     app.update_status = Some(*r);
                     if let Some(p) = app.panel.hwnd {
                         relayout_panel(app, p);
@@ -471,8 +465,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                             apply_appearance(app);
                         }
                         app.panel.view = crate::ui::panel::PanelView::Settings;
-                        // 菜单意图是进设置页本体，不停留在添加账号表单
-                        app.panel.adding_account = false;
                         if let Some(p) = app.panel.hwnd {
                             sync_customizing(app);
                             relayout_panel(app, p);
@@ -583,14 +575,15 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
 
         // ── 导航 ──
         Hit::Back => {
-            let was_adding = app.panel.adding_account;
-            app.panel.adding_account = false;
             app.panel.key_revealed = false;
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
-            if !was_adding {
-                app.panel.view = crate::ui::panel::PanelView::Main;
-            }
+            // 表单态的返回是退回设置页，设置页的返回才是回主视图
+            app.panel.view = if app.panel.view == crate::ui::panel::PanelView::AddForm {
+                crate::ui::panel::PanelView::Settings
+            } else {
+                crate::ui::panel::PanelView::Main
+            };
             relayout_panel(app, panel_hwnd);
         }
         Hit::ClosePanel => {
@@ -693,7 +686,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
 
         // ── 设置 · 账号 ──
         Hit::AddAccount => {
-            app.panel.adding_account = true;
+            app.panel.view = crate::ui::panel::PanelView::AddForm;
             app.panel.pending_platform = crate::api::Platform::Cn;
             app.panel.pending_team = false;
             app.panel.input.name.clear();
@@ -783,7 +776,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             if !app.update_checking {
                 app.update_checking = true;
                 app.update_status = None;
-                app.panel.update_available = false;
                 crate::platform::post::spawn_post(app.hwnd(), WM_APP_UPDATE_RESULT, || {
                     crate::service::update::check_latest()
                 });
@@ -801,6 +793,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
         Hit::LinkIssues => {
             crate::platform::open_url(crate::ui::panel::render::about::ISSUES_URL);
+        }
+        Hit::CopyDiagnostics => {
+            let text = diagnostics_text(app);
+            if crate::ui::panel::write_clipboard_text(&text) {
+                crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_diag_copied);
+            }
         }
         Hit::NewsItem(i) => {
             // 展开/收起互斥；展开即视为已读，已读标记推进到该条日期并落盘
@@ -829,6 +827,38 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     unsafe {
         let _ = InvalidateRect(Some(panel_hwnd), None, true);
     }
+}
+
+/// 关于窗「复制诊断信息」的拼装：版本/系统/config 路径/代理/最近错误
+fn diagnostics_text(app: &App) -> String {
+    let os = windows_registry::LOCAL_MACHINE
+        .open("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
+        .map(|k| {
+            let display = k.get_string("DisplayVersion").unwrap_or_default();
+            let build = k.get_string("CurrentBuildNumber").unwrap_or_default();
+            if build.is_empty() {
+                "unknown".to_string()
+            } else if display.is_empty() {
+                build
+            } else {
+                format!("{display} (build {build})")
+            }
+        })
+        .unwrap_or_else(|_| "unknown".into());
+    [
+        format!("Quotify v{}", env!("CARGO_PKG_VERSION")),
+        format!("OS: Windows {os}"),
+        format!("Config: {}", crate::app::config::config_path().display()),
+        match &app.config.general.proxy {
+            Some(p) => format!("Proxy: {p}"),
+            None => "Proxy: direct".into(),
+        },
+        match &app.data.last_error {
+            Some(e) => format!("Last error: {e}"),
+            None => "Last error: none".into(),
+        },
+    ]
+    .join("\n")
 }
 
 /// 换账号后旧快照的重置基线作废，重置提醒状态防新账号首个快照误报
@@ -910,7 +940,8 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         r.hover = None;
     }
     switch_poll_source(app);
-    app.panel.adding_account = false;
+    // 保存成功退回设置页
+    app.panel.view = crate::ui::panel::PanelView::Settings;
     app.panel.key_revealed = false;
     app.panel.clear_input(panel_hwnd);
     relayout_panel(app, panel_hwnd);
@@ -1189,12 +1220,10 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
                 r.hover = None;
             }
             switch_poll_source(app);
-            app.panel.adding_account = false;
             app.panel.key_revealed = false;
             app.panel.clear_input(panel_hwnd);
             app.update_status = None;
             app.update_checking = false;
-            app.panel.update_available = false;
             sync_customizing(app);
             relayout_panel(app, panel_hwnd);
             app.strings.import_done.to_string()
@@ -1443,8 +1472,7 @@ pub fn run() -> i32 {
                 sync_main_height(&mut app);
                 app.panel.toggle_pin(hwnd, rect, n);
                 apply_appearance(&mut app);
-                app.panel.view = crate::ui::panel::PanelView::Settings;
-                app.panel.adding_account = true;
+                app.panel.view = crate::ui::panel::PanelView::AddForm;
                 app.panel.pending_platform = crate::api::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {
                     relayout_panel(&mut app, p);

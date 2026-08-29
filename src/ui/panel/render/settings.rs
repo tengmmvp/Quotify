@@ -28,11 +28,12 @@ impl Renderer {
         let mut y = dy + layout::SETTINGS_EDGE_PAD;
 
         // ── 导航栏 ──
-        if !panel.adding_account {
+        let on_add_form = panel.view == crate::ui::panel::PanelView::AddForm;
+        if !on_add_form {
             self.back_arrow(target, Hit::Back, pad, y + 6.0);
         }
         self.x_button(target, Hit::ClosePanel, w - pad - 10.0, y + 6.0);
-        let nav_title = if panel.adding_account {
+        let nav_title = if on_add_form {
             s.add_account
         } else {
             s.settings
@@ -57,13 +58,13 @@ impl Renderer {
         y += layout::NAV_H;
 
         // ── 账号：设置页首项即数据来源；添加页此处标题用「账号信息」──
-        let section = if panel.adding_account {
+        let section = if on_add_form {
             s.platform_section
         } else {
             s.accounts_section
         };
         y = self.section_label(target, section, pad, y, w, alpha, false);
-        if panel.adding_account {
+        if on_add_form {
             // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID
             y = self.sub_label(target, s.account_platform, pad, y, cw, alpha);
             let plats: [(Hit, &str); 2] = [
@@ -103,9 +104,7 @@ impl Renderer {
                 panel,
                 target,
                 Hit::InputName,
-                layout::INPUT_X,
                 name_y,
-                cw,
                 None,
                 &input.name,
                 "",
@@ -126,9 +125,7 @@ impl Renderer {
                 panel,
                 target,
                 Hit::InputKey,
-                layout::INPUT_X,
                 key_y,
-                cw,
                 Some((Hit::RevealKey, panel.key_revealed)),
                 &key_disp,
                 "",
@@ -144,9 +141,7 @@ impl Renderer {
                     panel,
                     target,
                     Hit::InputOrg,
-                    layout::INPUT_X,
                     org_y,
-                    cw,
                     None,
                     &input.org,
                     "",
@@ -160,9 +155,7 @@ impl Renderer {
                     panel,
                     target,
                     Hit::InputProject,
-                    layout::INPUT_X,
                     project_y,
-                    cw,
                     None,
                     &input.project,
                     "",
@@ -314,9 +307,7 @@ impl Renderer {
                 panel,
                 target,
                 Hit::InputInterval,
-                layout::INPUT_X,
                 iy,
-                96.0,
                 None,
                 &input.interval,
                 "",
@@ -426,9 +417,7 @@ impl Renderer {
             panel,
             target,
             Hit::InputPeakStart,
-            layout::PEAK_START_X,
             pky,
-            64.0,
             None,
             start_buf,
             model.peak_start_raw,
@@ -451,9 +440,7 @@ impl Renderer {
             panel,
             target,
             Hit::InputPeakEnd,
-            layout::PEAK_END_X,
             pky,
-            64.0,
             None,
             end_buf,
             model.peak_end_raw,
@@ -559,9 +546,7 @@ impl Renderer {
             panel,
             target,
             Hit::InputProxy,
-            layout::INPUT_X,
             py,
-            cw,
             None,
             &panel.input.proxy,
             s.proxy_hint,
@@ -598,9 +583,7 @@ impl Renderer {
 
         // ── 关于：检查更新 + 版本，位于底部 ──
         let update_label = match model.update {
-            Some(Ok(info))
-                if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")) =>
-            {
+            Some(Ok(info)) if model.update_available => {
                 format!("{} · {}", s.check_update, info.tag)
             }
             Some(Ok(_)) => s.up_to_date.into(),
@@ -725,21 +708,24 @@ impl Renderer {
 
     /// 自绘输入框：光标用系统 CreateCaret，IME 组合窗随光标定位。
     /// 激活态按光标可视窗口绘制并高亮选区，失焦态画尾部切片。
+    /// 几何 (x/宽/右端让位) 单源取自 field_geo，与光标侧同一坐标
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
         panel: &Panel,
         target: &ID2D1HwndRenderTarget,
         hit: Hit,
-        x: f32,
         y: f32,
-        w: f32,
         eye: Option<(Hit, bool)>,
         content: &str,
         placeholder: &str,
         active: bool,
         alpha: f32,
     ) {
+        let Some(field) = crate::ui::panel::input_field_of_hit(hit) else {
+            return;
+        };
+        let (x, w, tail) = crate::ui::panel::field_geo(field);
         let rect = D2D_RECT_F {
             left: x,
             top: y,
@@ -755,7 +741,6 @@ impl Renderer {
         };
         let edge = self.brush(target, edge_color, alpha);
         target.DrawRectangle(&rect, &edge, 1.2, None);
-        let tail = if eye.is_some() { 26.0 } else { 4.0 };
         let text_rect = D2D_RECT_F {
             left: x + 6.0,
             top: y + 6.0,

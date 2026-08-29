@@ -168,6 +168,10 @@ impl AnimState {
 impl Renderer {
     /// 刷新按钮动画是否仍在进行
     pub fn spin_remaining(&mut self) -> bool {
+        if !self.anim_allowed {
+            self.anim.spin = 0.0;
+            return false;
+        }
         if self.anim.spin > 0.0 {
             self.anim.spin = (self.anim.spin - 0.15).max(0.0);
             true

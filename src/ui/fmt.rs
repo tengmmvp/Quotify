@@ -18,6 +18,16 @@ pub fn compact_number(v: f64) -> String {
         (v / 1e3, "k")
     };
     let s = format!("{scaled:.1}");
+    if suffix != "B" && s.parse::<f64>().is_ok_and(|n| n >= 1000.0) {
+        let (scaled, suffix) = if suffix == "k" {
+            (v / 1e6, "M")
+        } else {
+            (v / 1e9, "B")
+        };
+        let s = format!("{scaled:.1}");
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        return format!("{s}{suffix}");
+    }
     let s = s.trim_end_matches('0').trim_end_matches('.');
     format!("{s}{suffix}")
 }
@@ -121,6 +131,9 @@ mod tests {
         assert_eq!(compact_number(3_400_000_000.0), "3.4B");
         assert_eq!(compact_number(1200.0), "1.2k");
         assert_eq!(compact_number(999.0), "999");
+        // 进位跨档：后缀随之升档，不出 "1000k"/"1000M"
+        assert_eq!(compact_number(999_960.0), "1M");
+        assert_eq!(compact_number(999_950_000.0), "1B");
     }
 
     #[test]

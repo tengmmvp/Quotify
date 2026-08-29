@@ -11,7 +11,7 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HBRUSH, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromWindow, ValidateRect,
+    MonitorFromPoint, MonitorFromWindow, ValidateRect,
 };
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::HiDpi::GetDpiForMonitor;
@@ -33,12 +33,12 @@ const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 
 /// 弹出/收起动画帧时钟
 const TIMER_ANIM: usize = 1;
-/// 预览失焦收回的去抖时钟
-const TIMER_CLOSE_DEBOUNCE: usize = 2;
-/// 预览/锁定态的光标离面巡检时钟
+/// 锁定态的光标离面巡检时钟
 pub(crate) const TIMER_OUTSIDE_CHECK: usize = 3;
 /// 分钟级重绘心跳
 const TIMER_MINUTE_TICK: usize = 4;
+/// 巡检离面到自动收回的等待窗口
+const OUTSIDE_HIDE_MS: u64 = 2000;
 
 /// DPI 探测失败时的兜底值
 pub(crate) const FALLBACK_DPI: f32 = 1.5;
@@ -46,10 +46,9 @@ pub(crate) const FALLBACK_DPI: f32 = 1.5;
 /// 单字段输入缓冲的字节上限
 const INPUT_MAX_BYTES: usize = 128;
 
-/// 面板的展示模式
+/// 面板的展示模式：只有锁定与隐藏两态，由左键单击切换
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelMode {
-    Preview,
     Pinned,
     Hidden,
 }
@@ -189,7 +188,6 @@ pub struct Panel {
     pub view: PanelView,
     pub(crate) scroll_dy: f32,
     pub(crate) scroll_max: f32,
-    pub hovered: bool,
     pub(crate) anchor: Option<RECT>,
     pub renderer: Option<Renderer>,
     pub adding_account: bool,
@@ -198,10 +196,6 @@ pub struct Panel {
     pub input: PanelInput,
     pub(crate) key_revealed: bool,
     pub customizing_interval: bool,
-    pub(crate) anim_x: i32,
-    pub(crate) anim_w: i32,
-    pub(crate) anim_full_h: i32,
-    pub(crate) anim_bottom: i32,
     pub(crate) caret_ctx: (bool, bool),
     pub(crate) selecting: bool,
     pub(crate) text_clicks: Option<(u32, i32, i32, u8)>,
@@ -215,6 +209,7 @@ pub struct Panel {
     pub(crate) account_error: bool,
     pub update_available: bool,
     pub(crate) outside_since: Option<u64>,
+    painted: bool,
     dpi: f32,
 }
 
@@ -226,7 +221,6 @@ impl Panel {
             view: PanelView::Main,
             scroll_dy: 0.0,
             scroll_max: 0.0,
-            hovered: false,
             anchor: None,
             renderer: None,
             adding_account: false,
@@ -235,10 +229,6 @@ impl Panel {
             input: PanelInput::default(),
             key_revealed: false,
             customizing_interval: false,
-            anim_x: 0,
-            anim_w: 0,
-            anim_full_h: 0,
-            anim_bottom: 0,
             main_h: 300,
             account_error: false,
             update_available: false,
@@ -252,6 +242,7 @@ impl Panel {
             drag_offset: None,
             class_registered: false,
             outside_since: None,
+            painted: false,
             dpi: FALLBACK_DPI,
         }
     }
@@ -350,7 +341,21 @@ impl Panel {
     /// 计算并应用面板几何
     pub(crate) fn place(&mut self, hwnd: HWND, logical_h: i32, show: bool) {
         unsafe {
-            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            // 拖动进行中（drag_offset）与拖过（dragged）都保持当前位置；
+            // 首开前隐藏窗口悬在默认位（主屏），托盘在副屏时按窗口取屏
+            // 首帧会用错 DPI 与工作区，非拖动态一律按锚点定屏
+            let moved = self.dragged || self.drag_offset.is_some();
+            let monitor = if !moved && let Some(a) = self.anchor {
+                MonitorFromPoint(
+                    POINT {
+                        x: (a.left + a.right) / 2,
+                        y: a.top,
+                    },
+                    MONITOR_DEFAULTTONEAREST,
+                )
+            } else {
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            };
             let mut mi = MONITORINFO {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
@@ -359,8 +364,6 @@ impl Panel {
             self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
             let w = self.px(PANEL_WIDTH);
-            // 拖动进行中（drag_offset）与拖过（dragged）都保持当前位置
-            let moved = self.dragged || self.drag_offset.is_some();
             let (x, y) = if moved {
                 let mut wr = RECT::default();
                 let _ = GetWindowRect(hwnd, &mut wr);
@@ -396,10 +399,6 @@ impl Panel {
                 SWP_NOCOPYBITS
             };
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
-            self.anim_x = x;
-            self.anim_w = w;
-            self.anim_full_h = h;
-            self.anim_bottom = y + h;
             // 滚动按屏幕内真实可见高度计：面板浮于任务栏之上，遮住任务
             // 栏的部分同样可见，仅视口越出屏幕底的部分不算可见
             let visible = h.min((mi.rcMonitor.bottom - y).max(0));
@@ -426,6 +425,8 @@ impl Panel {
         // 先于 place 读取：place 的 SetWindowPos 带 SWP_SHOWWINDOW 会置可见位
         let fresh = unsafe { !IsWindowVisible(hwnd).as_bool() };
         self.anchor = Some(anchor);
+        // 新的开合周期：首帧淡入资格重置
+        self.painted = false;
         // 拖动仅临时查看；面板重新弹出时回到托盘锚点，拖动残留一并清除
         self.dragged = false;
         self.drag_offset = None;
@@ -444,16 +445,6 @@ impl Panel {
             SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 1200, None);
             SetTimer(Some(hwnd), TIMER_MINUTE_TICK, 60_000, None);
             let _ = InvalidateRect(Some(hwnd), None, true);
-        }
-    }
-
-    /// 请求收起，仅预览模式生效，400ms 防抖
-    pub fn request_close(&mut self) {
-        if self.hovered || self.mode != PanelMode::Preview {
-            return;
-        }
-        if let Some(h) = self.hwnd {
-            unsafe { SetTimer(Some(h), TIMER_CLOSE_DEBOUNCE, 400, None) };
         }
     }
 
@@ -476,12 +467,13 @@ impl Panel {
 
     pub(crate) fn begin_hide(&mut self, hwnd: HWND) {
         self.mode = PanelMode::Hidden;
-        self.hovered = false;
         self.adding_account = false;
         self.key_revealed = false;
-        // 收起即丢弃巡检计时与未完结的拖动，重开从干净状态起步
         self.outside_since = None;
         self.drag_offset = None;
+        self.selecting = false;
+        self.press_at = None;
+        self.text_clicks = None;
         self.clear_input(hwnd);
         // 直接隐藏：自绘收缩/淡出会与 DWM 过渡叠加闪烁
         unsafe {
@@ -490,8 +482,11 @@ impl Panel {
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
         }
-        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积
+        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积；
+        // 悬停高亮与命中区一并清，重开首帧不带旧状态
         if let Some(r) = self.renderer.as_mut() {
+            r.hover = None;
+            r.hits.clear();
             r.clear_brush_cache();
         }
         // 收起后到下次打开前不再绘制，归还工作集把静止内存压回托盘档；
@@ -499,7 +494,7 @@ impl Panel {
         crate::platform::trim_working_set();
     }
 
-    /// 左键：预览 ⇄ 锁定；已锁定 → 收起
+    /// 左键：隐藏 → 锁定；已锁定 → 收起
     pub fn toggle_pin(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
         match self.mode {
             PanelMode::Pinned => {
@@ -507,16 +502,14 @@ impl Panel {
                     self.begin_hide(h);
                 }
             }
-            _ => {
-                // 悬停预览中锁定：面板本就显示，保持正在看的视图；
+            PanelMode::Hidden => {
                 // 从隐藏重开才回主视图，不停留在上次滚动的旧设置页
-                if self.mode == PanelMode::Hidden {
-                    self.reset_to_main();
-                }
-                self.mode = PanelMode::Pinned;
+                self.reset_to_main();
                 self.show_at(parent, anchor, accounts);
-                // 显示后立即激活——后台窗口拿不到键盘焦点，IME 异常
+                // 置 Pinned 须在窗口就位后：建窗失败保持 Hidden，状态机可重试
                 if let Some(h) = self.hwnd {
+                    self.mode = PanelMode::Pinned;
+                    // 显示后立即激活——后台窗口拿不到键盘焦点，IME 异常
                     unsafe {
                         let _ = SetForegroundWindow(h);
                     }
@@ -525,20 +518,18 @@ impl Panel {
         }
     }
 
-    pub fn show_preview(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
-        self.mode = PanelMode::Preview;
-        self.reset_to_main();
-        self.show_at(parent, anchor, accounts);
-    }
-
     /// 打开面板前的复位：回主视图、清滚动偏移、添加表单与输入临时态；
-    /// 预览/锁定两条打开路径共用，防收起后重开停在上次滚动的旧设置页。
+    /// 左键从隐藏重开时调用，防收起后重开停在上次滚动的旧设置页。
     /// 间隔行展开态不清：view_height 有配套 +38 钩子，展开态须跨开合保留
     fn reset_to_main(&mut self) {
         self.view = PanelView::Main;
         self.scroll_dy = 0.0;
         self.adding_account = false;
         self.key_revealed = false;
+        self.input.interval.clear();
+        self.input.proxy.clear();
+        self.input.peak_start.clear();
+        self.input.peak_end.clear();
         if let Some(h) = self.hwnd {
             self.clear_input(h);
         } else {
@@ -586,7 +577,6 @@ impl Panel {
             self.vis_start.set(0);
         }
         self.input.field = Some(field);
-        self.mode = PanelMode::Pinned;
         if switched {
             let buf = self.input.active_str().to_string();
             self.input.edit.caret_to_end(&buf);
@@ -899,11 +889,22 @@ pub extern "system" fn panel_wndproc(
                                     app.config.general.appearance.as_deref(),
                                 ),
                             );
+                            // 进程首开时 renderer 到 paint 才建，show_at 的淡入
+                            // 设不上；且 TIMER_ANIM 先于 WM_PAINT 派发，空转一
+                            // 拍即自灭——此处补回淡入并重挂时钟。设备丢失重建
+                            // 走的也是 fresh，但内容本就在屏，凭 painted 排除
+                            if !app.panel.painted {
+                                r.anim.appear = Some(anim::Tween::now(180));
+                                start_anim(hwnd);
+                            }
                         }
                         let model = PanelModel::from_app(app);
                         let view = app.panel.view;
                         let dpi = app.panel.dpi;
                         keep = r.paint(hwnd, &rect, &app.panel, &model, view, dpi);
+                        if keep {
+                            app.panel.painted = true;
+                        }
                     }
                     // paint 判定设备丢失时丢弃整个 Renderer，并立即请求下一帧
                     // 走 fresh 路径全量重建、重新对齐主题——不请求的话静止面板
@@ -927,29 +928,15 @@ pub extern "system" fn panel_wndproc(
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         LRESULT(0)
                     }
-                    TIMER_CLOSE_DEBOUNCE => {
-                        let app = app_from_tray(hwnd);
-                        if let Some(app) = app {
-                            let _ = KillTimer(Some(hwnd), TIMER_CLOSE_DEBOUNCE);
-                            // 到期时鼠标指针已回托盘则取消收回——悬停语义优先
-                            let near_tray = app.panel.cursor_near_anchor();
-                            if !app.panel.hovered
-                                && app.panel.mode == PanelMode::Preview
-                                && !near_tray
-                            {
-                                app.panel.begin_hide(hwnd);
-                            }
-                        }
-                        LRESULT(0)
-                    }
                     TIMER_OUTSIDE_CHECK => {
                         let app = app_from_tray(hwnd);
                         if let Some(app) = app {
-                            // 不能调 Shell_NotifyIconGetRect——跨进程同步调用，高频轮询互锁卡死
-                            SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 200, None);
-                            let preview = app.panel.mode == PanelMode::Preview;
-                            let pinned = app.panel.mode == PanelMode::Pinned;
-                            if (preview || pinned) && !app.panel.hovered {
+                            // 先判模式再重挂：收起瞬间残留的一拍不再自我续命，
+                            // 隐藏期巡检彻底停摆
+                            if app.panel.mode == PanelMode::Pinned {
+                                SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 200, None);
+                                // 不能调 Shell_NotifyIconGetRect——跨进程同步调用，
+                                // 高频轮询互锁卡死
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
@@ -962,20 +949,21 @@ pub extern "system" fn panel_wndproc(
                                     .is_some_and(|ph| w == ph || GetAncestor(w, GA_ROOT) == ph);
                                 let in_panel =
                                     in_popup || w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
-                                // 正在输入则绝不收起
-                                let focus_in_panel = app.panel.input.field.is_some()
-                                    || windows::Win32::UI::Input::KeyboardAndMouse::GetFocus()
-                                        == hwnd;
+                                // 正在输入则绝不收起。仅认输入态：开门即抢前台使
+                                // GetFocus 恒真，会把「离面超时自动收」整个废掉
+                                let typing = app.panel.input.field.is_some();
                                 // 鼠标在托盘图标上
                                 let near_tray = app.panel.cursor_near_anchor();
-                                if in_panel || focus_in_panel || near_tray {
+                                // 拖动中视为在场：窗口被钳在工作区边缘时光标
+                                // 可能已滑出面板外，按住不放不该被收起
+                                let dragging = app.panel.drag_offset.is_some();
+                                if in_panel || typing || near_tray || dragging {
                                     app.panel.outside_since = None;
                                 } else {
                                     let now =
                                         windows::Win32::System::SystemInformation::GetTickCount64();
                                     let since = *app.panel.outside_since.get_or_insert(now);
-                                    let timeout: u64 = if preview { 300 } else { 2000 };
-                                    if now - since > timeout {
+                                    if now - since > OUTSIDE_HIDE_MS {
                                         app.panel.outside_since = None;
                                         app.panel.begin_hide(hwnd);
                                     }
@@ -1036,13 +1024,12 @@ pub extern "system" fn panel_wndproc(
                         }
                         return LRESULT(0);
                     }
-                    // 每次移动都重挂：TME_LEAVE 一次性且会被鼠标捕获打断，
-                    // 仅在 !hovered 时挂载的话，捕获结束后 MOUSELEAVE 永远不来，hovered 卡 true
+                    // TME_LEAVE 一次性且会被鼠标捕获打断，每次移动重挂；
+                    // 真正离开时由 MOUSELEAVE 清悬停高亮
                     track_leave(hwnd);
-                    if !app.panel.hovered {
-                        app.panel.hovered = true;
-                        let _ = KillTimer(Some(hwnd), TIMER_CLOSE_DEBOUNCE);
-                    }
+                    // 在场即时重置离面计时：巡检 200ms 一拍，两拍之间的短暂
+                    // 回访不该被算进离面时间
+                    app.panel.outside_since = None;
                     let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
                     if let Some(r) = app.panel.renderer.as_mut() {
                         let hit = r.hit_at(x, y);
@@ -1060,15 +1047,16 @@ pub extern "system" fn panel_wndproc(
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let w = WindowFromPoint(pt);
+                    // 校正过渡态：TME 触发瞬间光标可能恰在子控件上，误清会闪
                     let still_here = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                     if still_here {
-                        app.panel.hovered = true;
+                        // 误触发，重挂跟踪等真正的离开
                         track_leave(hwnd);
-                    } else {
-                        app.panel.hovered = false;
-                        if app.panel.mode == PanelMode::Preview {
-                            app.panel.request_close();
-                        }
+                    } else if let Some(r) = app.panel.renderer.as_mut()
+                        && r.hover.is_some()
+                    {
+                        r.hover = None;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
@@ -1318,13 +1306,22 @@ pub extern "system" fn panel_wndproc(
             WM_KILLFOCUS => {
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app
-                    && app.panel.input.field.is_some()
-                    // 焦点真已转走才清；若焦点绕回本窗口则保留输入态
+                    // 焦点真已转走才清；若焦点绕回本窗口则保留
                     && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != hwnd
                 {
+                    // 明文查看随失焦收回，不给旁人余光；连击链一并重置：
+                    // 点框→失焦→点回不该被计为双击
+                    let was_revealed = app.panel.key_revealed;
+                    app.panel.key_revealed = false;
+                    app.panel.text_clicks = None;
                     // 失焦不清输入会让面板被当作「正在输入」永不收起，IME 组合窗也会游离
-                    app.panel.clear_input(hwnd);
-                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    let was_typing = app.panel.input.field.is_some();
+                    if was_typing {
+                        app.panel.clear_input(hwnd);
+                    }
+                    if was_revealed || was_typing {
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
                 LRESULT(0)
             }

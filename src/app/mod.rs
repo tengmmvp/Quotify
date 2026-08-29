@@ -4,16 +4,16 @@ pub mod config;
 mod notify;
 
 use chrono::{DateTime, Utc};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetSystemMetrics,
-    GetWindowLongPtrW, HMENU, KillTimer, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-    RegisterClassW, SM_CXSMICON, SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN,
-    TPM_LEFTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND,
-    WM_DESTROY, WM_MOUSEMOVE, WM_NULL, WM_TIMER, WNDCLASSW, WS_POPUP,
+    DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU,
+    MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
+    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
+    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_NULL, WNDCLASSW,
+    WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -30,8 +30,8 @@ use crate::service::poller::{
 };
 use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
+use crate::ui::panel::Panel;
 use crate::ui::panel::layout::INTERVAL_PRESETS;
-use crate::ui::panel::{Panel, PanelMode};
 use crate::ui::tray::{self, TrayIcon};
 use notify::{NOTIFY_TITLE, check_reset, check_threshold};
 
@@ -42,14 +42,6 @@ const IDM_EXIT: u16 = 1003;
 
 /// 导入配置文件大小上限
 const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
-
-/// 托盘悬停兜底计时器 id
-const TIMER_TRAY_HOVER: usize = 5;
-/// 兜底悬停判定时长
-const TRAY_HOVER_MS: u32 = 500;
-
-/// v4 回调的键盘激活通知码
-const NIN_KEYSELECT: u32 = 0x0401;
 
 /// 失败时保留旧快照供面板显示。
 pub struct AccountData {
@@ -153,6 +145,11 @@ impl App {
             .map(|b| b.used_percent)
             .unwrap_or(0.0);
         let key = (used.round() as i64, self.data.snapshot.is_some(), failed);
+        // tooltip 先于图标 key 早退刷新：其他桶摘要可能单独变化，
+        // 每拍一次 NIM_MODIFY 开销可忽略
+        if let Some(tray) = &self.tray {
+            tray.set_tooltip(&tooltip_text(self));
+        }
         if self.last_icon_key == Some(key) {
             return;
         }
@@ -322,40 +319,10 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
     match msg {
         WM_APP_TRAY => {
             let app = app_from(hwnd);
-            let (code, _) = tray::parse_callback(lparam);
+            let code = tray::parse_callback(lparam);
             match code {
-                WM_MOUSEMOVE => {
-                    // 部分 Win11 任务栏重写后不再发 NIN_POPUPOPEN 悬停通知
-                    // [微软 Q&A 有案在录]，鼠标移动回调仍会到达：起计时器
-                    // 模拟悬停，重复移动自动重置计时；到点由 WM_TIMER 校验
-                    // 光标仍在图标上才弹，正常机器由系统通知先行并掐掉计时
-                    unsafe {
-                        let _ = SetTimer(Some(hwnd), TIMER_TRAY_HOVER, TRAY_HOVER_MS, None);
-                    }
-                }
-                tray::NIN_POPUPOPEN => {
-                    // 系统悬停通知已生效，掐掉兜底计时防稍后重复弹
-                    unsafe {
-                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
-                    }
-                    // 与兜底同守卫：Pinned 态悬停不打断正在看的视图
-                    if let Some(app) = app
-                        && app.panel.mode == PanelMode::Hidden
-                        && let Some(rect) = tray_rect(app)
-                    {
-                        open_hover_preview(hwnd, app, rect);
-                    }
-                }
-                tray::NIN_POPUPCLOSE => {
-                    // 悬停已结束，兜底计时一并作废
-                    unsafe {
-                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
-                    }
-                    if let Some(app) = app {
-                        app.panel.request_close();
-                    }
-                }
-                NIN_KEYSELECT | windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
+                // 悬停只出系统 tooltip（用量摘要）；面板由左键打开
+                windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
                     if let Some(app) = app
                         && let Some(rect) = tray_rect(app)
                     {
@@ -365,28 +332,43 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         apply_appearance(app);
                     }
                 }
+                windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
+                    if let Some(app) = app {
+                        app.show_context_menu(tray::context_menu_pos());
+                    }
+                }
+                // 键盘激活走 WM_CONTEXTMENU 且不带坐标（右键另有
+                // RBUTTONUP 臂）；光标可能在任意处，菜单定位用图标矩形中心
                 windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                     if let Some(app) = app {
-                        app.show_context_menu(tray::context_menu_pos(wparam));
+                        let pos = tray_rect(app)
+                            .map(|r| windows::Win32::Foundation::POINT {
+                                x: (r.left + r.right) / 2,
+                                y: (r.top + r.bottom) / 2,
+                            })
+                            .unwrap_or_else(tray::context_menu_pos);
+                        app.show_context_menu(pos);
                     }
                 }
                 _ => {}
             }
             LRESULT(0)
         }
-        WM_TIMER => {
-            // 悬停兜底计时到点：面板已开[系统通知先到]则静默退场，仅光标
-            // 仍停在图标上且面板隐藏时才补弹
-            if wparam.0 == TIMER_TRAY_HOVER {
-                unsafe {
-                    let _ = KillTimer(Some(hwnd), TIMER_TRAY_HOVER);
+        msg if msg == *tray::TASKBAR_CREATED => {
+            // explorer 重启：托盘图标随任务栏进程消亡，广播到达即重注册
+            if let Some(app) = app_from(hwnd)
+                && let Some(icon) = app.tray_icon
+            {
+                let tip = tooltip_text(app);
+                if let Some(tray) = app.tray.as_mut() {
+                    tray.readd(icon, &tip);
                 }
-                if let Some(app) = app_from(hwnd)
-                    && app.panel.mode == PanelMode::Hidden
+                // 任务栏重建后图标可能换位，面板还开着时同步刷新锚点，
+                // near_tray 保活与下次重排不按旧矩形误判
+                if app.panel.mode == crate::ui::panel::PanelMode::Pinned
                     && let Some(rect) = tray_rect(app)
-                    && cursor_in_tray(&rect)
                 {
-                    open_hover_preview(hwnd, app, rect);
+                    app.panel.anchor = Some(rect);
                 }
             }
             LRESULT(0)
@@ -461,12 +443,15 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         WM_APP_WAKE_INSTANCE => {
+            // 第二实例唤醒的语义是「弹出来」：已显示时不动作，仅隐藏时开门
             if let Some(app) = app_from(hwnd)
+                && app.panel.mode == crate::ui::panel::PanelMode::Hidden
                 && let Some(rect) = tray_rect(app)
             {
                 let n = app.config.accounts.len();
                 sync_main_height(app);
                 app.panel.toggle_pin(hwnd, rect, n);
+                apply_appearance(app);
             }
             LRESULT(0)
         }
@@ -474,12 +459,20 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let cmd = (wparam.0 & 0xFFFF) as u16;
             match cmd {
                 IDM_SETTINGS => {
-                    if let Some(app) = app_from(hwnd)
-                        && let Some(rect) = tray_rect(app)
-                    {
-                        let n = app.config.accounts.len();
-                        app.panel.show_preview(hwnd, rect, n);
+                    if let Some(app) = app_from(hwnd) {
+                        // 隐藏时先开门（toggle_pin 内部先复位主视图再显示，
+                        // 视图切换须在其后），已显示则只切视图
+                        if app.panel.mode == crate::ui::panel::PanelMode::Hidden
+                            && let Some(rect) = tray_rect(app)
+                        {
+                            let n = app.config.accounts.len();
+                            sync_main_height(app);
+                            app.panel.toggle_pin(hwnd, rect, n);
+                            apply_appearance(app);
+                        }
                         app.panel.view = crate::ui::panel::PanelView::Settings;
+                        // 菜单意图是进设置页本体，不停留在添加账号表单
+                        app.panel.adding_account = false;
                         if let Some(p) = app.panel.hwnd {
                             sync_customizing(app);
                             relayout_panel(app, p);
@@ -522,27 +515,36 @@ fn tray_rect(app: &App) -> Option<RECT> {
     app.tray.as_ref().and_then(|t| t.rect())
 }
 
-/// 悬停弹预览面板：系统通知与兜底计时两路共用同一打开序列
-fn open_hover_preview(hwnd: HWND, app: &mut App, rect: RECT) {
-    let n = app.config.accounts.len();
-    sync_main_height(app);
-    app.panel.show_preview(hwnd, rect, n);
-    apply_appearance(app);
-}
-
-/// 光标是否仍在托盘图标上，触发弹面板的判定。容差收紧到 ±8：explorer
-/// 只在光标压着图标矩形时发 WM_MOUSEMOVE，宽容差会让「扫过图标后停在
-/// 相邻托盘项上」误弹[移动已停、计时不再重置]。面板保持打开用的
-/// cursor_near_anchor 仍是 ±24，两处语义不同
-fn cursor_in_tray(rect: &RECT) -> bool {
-    let mut pt = POINT::default();
-    unsafe {
-        let _ = GetCursorPos(&mut pt);
+/// 托盘 tooltip 文本：应用名 + 各桶用量摘要，无数据仅应用名。
+fn tooltip_text(app: &App) -> String {
+    let Some(snap) = app.data.snapshot.as_ref() else {
+        return "Quotify".to_string();
+    };
+    let part = |pct: Option<f64>, name: &str| {
+        pct.map(|p| format!("{name} {}", crate::ui::fmt::percent(p)))
+    };
+    let segs: Vec<String> = [
+        part(
+            snap.five_hour.as_ref().map(|b| b.used_percent),
+            app.strings.tooltip_5h,
+        ),
+        part(
+            snap.weekly.as_ref().map(|b| b.used_percent),
+            app.strings.tooltip_weekly,
+        ),
+        part(
+            snap.mcp.as_ref().map(|m| m.used_percent),
+            app.strings.tooltip_mcp,
+        ),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if segs.is_empty() {
+        "Quotify".to_string()
+    } else {
+        format!("Quotify | {}", segs.join(" | "))
     }
-    pt.x >= rect.left - 8
-        && pt.x <= rect.right + 8
-        && pt.y >= rect.top - 8
-        && pt.y <= rect.bottom + 8
 }
 
 /// App 装箱后存活到进程退出，GWLP_USERDATA 指针全程有效，可转写为
@@ -567,14 +569,11 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
         }
         Hit::Settings => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.view = crate::ui::panel::PanelView::Settings;
             sync_customizing(app);
             relayout_panel(app, panel_hwnd);
         }
         Hit::AccountSwitch => {
-            // 弹窗与面板间有间隙，Preview 下离面防抖会连带误收；置 Pinned 锁定
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             if let Some(p) = app.panel.hwnd {
                 app.popup.open(app.hwnd(), p, app.config.accounts.len());
             }
@@ -611,7 +610,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             relayout_panel(app, panel_hwnd);
         }
         Hit::CustomizeInterval => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.customizing_interval = true;
             if app.panel.input.interval.trim().is_empty() {
                 prefill_interval(app);
@@ -637,6 +635,9 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
             invalidate_ui(app);
+            if let Some(tray) = &app.tray {
+                tray.set_tooltip(&tooltip_text(app));
+            }
         }
         Hit::Appearance(choice) => {
             app.config.general.appearance = match choice {
@@ -692,7 +693,6 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
 
         // ── 设置 · 账号 ──
         Hit::AddAccount => {
-            app.panel.mode = crate::ui::panel::PanelMode::Pinned;
             app.panel.adding_account = true;
             app.panel.pending_platform = crate::api::Platform::Cn;
             app.panel.pending_team = false;
@@ -1150,15 +1150,28 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
 
     let notify_body = match parsed {
         Some(cfg) => {
-            if cfg.accounts.is_empty()
-                && !app.config.accounts.is_empty()
-                && !confirm_box(
+            if cfg.accounts.is_empty() && !app.config.accounts.is_empty() {
+                // 确认框同为模态：巡检三明治同文件选择，防读框超时
+                // 面板在对话框背后被收起
+                unsafe {
+                    let _ = KillTimer(Some(panel_hwnd), crate::ui::panel::TIMER_OUTSIDE_CHECK);
+                }
+                let ok = confirm_box(
                     app,
                     app.strings.import_confirm_title,
                     app.strings.import_confirm_body,
-                )
-            {
-                return;
+                );
+                unsafe {
+                    let _ = SetTimer(
+                        Some(panel_hwnd),
+                        crate::ui::panel::TIMER_OUTSIDE_CHECK,
+                        200,
+                        None,
+                    );
+                }
+                if !ok {
+                    return;
+                }
             }
             app.config = cfg;
             // 外部文件的值域不可信，归一化与启动加载保持一致
@@ -1199,7 +1212,8 @@ fn sync_customizing(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
     let is_preset = INTERVAL_PRESETS.contains(&cur);
     app.panel.customizing_interval = !is_preset;
-    if !is_preset {
+    // 缓冲非空说明用户正在输入，预填会覆盖未应用的编辑
+    if !is_preset && app.panel.input.interval.is_empty() {
         prefill_interval(app);
     }
 }
@@ -1426,9 +1440,10 @@ pub fn run() -> i32 {
             });
             {
                 let n = app.config.accounts.len();
-                app.panel.show_preview(hwnd, rect, n);
+                sync_main_height(&mut app);
+                app.panel.toggle_pin(hwnd, rect, n);
+                apply_appearance(&mut app);
                 app.panel.view = crate::ui::panel::PanelView::Settings;
-                app.panel.mode = crate::ui::panel::PanelMode::Pinned;
                 app.panel.adding_account = true;
                 app.panel.pending_platform = crate::api::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {

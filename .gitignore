@@ -1,6 +1,9 @@
 # 构建产物
 /target
 
+# 工具产物
+.playwright-mcp/
+
 # IDE
 .vscode/
 .idea/

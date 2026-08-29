@@ -247,15 +247,18 @@ impl EditState {
         }
     }
 
-    /// 修改前压「操作前快照」；连续键入只保留最早一步。栈深上限 64
+    /// 修改前压「操作前快照」；连续键入只保留最早一步。栈深上限 64，
+    /// 溢出淘汰最旧——truncate 会丢刚压入的最新步，溢出后首次 undo 跨两步
     fn begin_edit(&mut self, text: &str, typing: bool) {
         if typing && self.last_typing {
             self.future.clear();
             return;
         }
+        if self.history.len() >= 64 {
+            self.history.remove(0);
+        }
         self.history
             .push((text.to_string(), self.caret, self.anchor));
-        self.history.truncate(64);
         self.future.clear();
         self.last_typing = typing;
     }

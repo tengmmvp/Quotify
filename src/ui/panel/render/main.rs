@@ -233,6 +233,13 @@ impl Renderer {
                     right: w - pad - 12.0,
                     bottom: card_top + 40.0,
                 };
+                let (msg, _) = self.ellipsize(
+                    &msg,
+                    13.0,
+                    (title_rect.right - title_rect.left).max(60.0),
+                    500,
+                    false,
+                );
                 self.text_aligned(
                     target,
                     &msg,
@@ -412,6 +419,7 @@ impl Renderer {
                         ),
                         None => msg,
                     };
+                    let (line, _) = self.ellipsize(&line, 12.0, w - pad * 2.0 - 74.0, 400, false);
                     self.text(
                         target,
                         &line,

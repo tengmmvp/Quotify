@@ -82,6 +82,11 @@ pub struct Strings {
     /// 检查更新失败，对应 `service::update` 的 Err
     pub err_update: &'static str,
 
+    // ── 托盘 tooltip ──
+    pub tooltip_5h: &'static str,
+    pub tooltip_weekly: &'static str,
+    pub tooltip_mcp: &'static str,
+
     // ── 托盘菜单 ──
     pub settings: &'static str,
     pub about: &'static str,
@@ -216,6 +221,11 @@ const ZH: Strings = Strings {
     err_api: "接口错误",
     err_network: "网络错误",
     err_update: "检查更新失败",
+
+    // ── 托盘 tooltip ──
+    tooltip_5h: "5h",
+    tooltip_weekly: "周",
+    tooltip_mcp: "MCP",
 
     // ── 托盘菜单 ──
     settings: "设置",
@@ -352,6 +362,11 @@ const EN: Strings = Strings {
     err_network: "Network error",
     err_update: "Update check failed",
 
+    // ── 托盘 tooltip ──
+    tooltip_5h: "5h",
+    tooltip_weekly: "Week",
+    tooltip_mcp: "MCP",
+
     // ── 托盘菜单 ──
     settings: "Settings",
     about: "About",
@@ -400,7 +415,7 @@ const EN: Strings = Strings {
     // ── 设置 · 用量通知 ──
     notifications: "Notifications",
     notify_threshold: "Usage alert",
-    notify_threshold_desc: "Alerts once above {p}%",
+    notify_threshold_desc: "Alerts once above {p}%; re-arms after usage falls back",
     notify_reset_5h_opt: "5-hour session reset alerts",
     notify_reset_5h_desc: "Alerts when the 5-hour window resets",
     notify_reset_weekly_opt: "Weekly session reset alerts",

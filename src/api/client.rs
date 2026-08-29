@@ -157,14 +157,15 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     } else {
         (plain, bearer.as_str())
     };
-    let mut snap = match fetch_quota(spec.platform, first, team) {
+    let (mut snap, effective) = match fetch_quota(spec.platform, first, team) {
+        Ok(snap) => (snap, first),
         Err(FetchError::Auth) => {
             let snap = fetch_quota(spec.platform, second, team)?;
             // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用
             set_needs_bearer(plain, !remembered);
-            snap
+            (snap, second)
         }
-        other => other?,
+        Err(e) => return Err(e),
     };
     // 附加信息三路并行：token 今日/本周区间与余额各一请求，共享同一 Agent，
     // 连接池天然支持并发；端点失败只缺对应块不拖垮主用量，失败各记一条日志
@@ -173,14 +174,17 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         // 时间窗换算失败时两路区间请求都不发
         let (today, week) = match params.as_ref() {
             Some((today, week, end)) => (
-                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, today, end))),
-                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, week, end))),
+                Some(
+                    scope.spawn(|| fetch_token_window(spec.platform, effective, team, today, end)),
+                ),
+                Some(scope.spawn(|| fetch_token_window(spec.platform, effective, team, week, end))),
             ),
             None => (None, None),
         };
-        // 余额端点仅国内版有；附加三路同用 quota 的记忆感知形态，防需要
-        // Bearer 的 key 每轮白烧 401
-        let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
+        // 附加三路沿用 quota 最终成功的凭证形态，防切换轮全数 401；
+        // 余额端点仅国内版有
+        let balance =
+            (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(effective)));
         (join(today), join(week), join(balance))
     });
     // 两区间要么都有要么都没有

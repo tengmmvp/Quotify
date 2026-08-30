@@ -237,6 +237,8 @@ pub struct Panel {
     pub(crate) selecting: bool,
     pub(crate) text_clicks: Option<(u32, i32, i32, u8)>,
     vis_start: std::cell::Cell<usize>,
+    last_input_at: std::cell::Cell<std::time::Instant>,
+    blink_drawn: std::cell::Cell<bool>,
     ime_owned: bool,
     pub(crate) dragged: bool,
     pub(crate) press_at: Option<(i32, i32)>,
@@ -273,6 +275,8 @@ impl Panel {
             selecting: false,
             text_clicks: None,
             vis_start: std::cell::Cell::new(0),
+            last_input_at: std::cell::Cell::new(std::time::Instant::now()),
+            blink_drawn: std::cell::Cell::new(true),
             ime_owned: false,
             dragged: false,
             press_at: None,
@@ -571,14 +575,13 @@ impl Panel {
         }
     }
 
-    /// 结束输入状态，销毁光标与 IME 上下文
+    /// 退出输入态，摘除 IME 上下文。
     pub(crate) fn clear_input(&mut self, hwnd: HWND) {
         self.input.field = None;
         self.input.edit.reset();
         self.input.surrogate = None;
         self.vis_start.set(0);
         unsafe {
-            let _ = DestroyCaret();
             // 摘除 IME 上下文：裸窗口挂上后要收回，避免游离
             use windows::Win32::UI::Input::Ime::{
                 HIMC, ImmAssociateContext, ImmDestroyContext, ImmGetContext,
@@ -593,17 +596,16 @@ impl Panel {
         self.ime_owned = false;
     }
 
-    /// 聚焦输入字段：系统光标 + IME 组合窗跟随光标。
-    /// 切换字段须重置编辑状态（撤销栈跨字段会污染新缓冲）；
-    /// 重复聚焦同一字段保留光标位置，供点击定位后不被弹回末尾
+    /// 聚焦输入字段：进入输入态，IME 组合窗跟随光标。
+    /// 切换字段重置编辑状态，撤销栈跨字段会污染新缓冲；
+    /// 重复聚焦保留光标位置，点击定位不被弹回末尾。
     pub fn focus_input(&mut self, hwnd: HWND, field: InputField) {
         let switched = self.input.field != Some(field);
         if switched {
-            if self.input.field.is_some() {
-                // 旧字段行含激活边框与选区高亮像素，重开面板前整窗重绘清掉
-                unsafe {
-                    let _ = InvalidateRect(Some(hwnd), None, false);
-                }
+            // 切换即整窗重绘：清旧字段的激活边框与选区像素，首聚焦的
+            // 光标也靠这次重绘现身。
+            unsafe {
+                let _ = InvalidateRect(Some(hwnd), None, false);
             }
             self.input.edit.reset();
             // 陈旧高代理半区跨字段残留会与低半区错拼增补平面字符
@@ -615,21 +617,17 @@ impl Panel {
             let buf = self.input.active_str().to_string();
             self.input.edit.caret_to_end(&buf);
         }
+        self.note_caret_interaction();
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
-            // 仅切换字段时重建：重复建光标会连闪，重复挂 IME 会销毁
-            // 中文组合串；重复聚焦只挪光标位置。
-            if switched {
-                let caret_h = self.px(16);
-                // 宽度随 DPI 放大：150% 缩放下 1 物理像素不足 1 逻辑像素，过细难辨
-                let _ = CreateCaret(hwnd, None, self.px(1).max(1), caret_h);
-                let _ = ShowCaret(Some(hwnd));
-            }
-            // 布局只算一次：光标落位与 IME 挂载后的组合窗定位共用同一产物；
-            // renderer 缺席（首帧前）以 0 兜底，下次 update_caret 补正
+            // 动画时钟保活：光标闪烁的翻转重绘由 TIMER_ANIM 驱动。
+            let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
+            self.anim_period = 16;
+            // 布局只算一次：光标 x 与 IME 组合窗定位共用同一产物；
+            // renderer 缺席即首帧前时以 0 兜底，下次 update_caret 补正。
             let cx = if let Some(r) = self.renderer.as_ref() {
                 let cx = self.caret_layout(r).cx;
-                self.place_caret(hwnd, cx);
+                self.sync_ime_pos(hwnd, cx);
                 cx
             } else {
                 0.0
@@ -689,12 +687,10 @@ impl Panel {
         }
     }
 
-    /// 光标可视布局：一次 TextLayout 建成整串前缀宽表，可视窗口与光标
-    /// x 全部查表得出，附带宽表供命中换算与渲染切片复用。绘制与系统
-    /// 光标定位共用此函数，同一次计算同一结果，两侧位置恒一致。
-    /// 未超宽从 0 起；超宽时优先沿用上次起点（粘滞，避免每次取最小
-    /// 起点让点击处窗口回跳），光标出窗才二分调整。
-    /// Key 掩码态圆点与字符一一对应，位次空间不变
+    /// 光标可视布局：一次 TextLayout 建成前缀宽表，光标定位、命中
+    /// 换算与渲染切片全查此表，绘制与 IME 定位共用，位置恒一致。
+    /// 未超宽从 0 起；超宽沿用上次起点保持粘滞，防点击处窗口回跳，
+    /// 光标出窗才二分调整。Key 掩码态圆点与字符一一对应，位次空间不变。
     pub(crate) fn caret_layout(&self, renderer: &Renderer) -> CaretLayout {
         let Some(field) = self.input.field else {
             return CaretLayout {
@@ -779,7 +775,7 @@ impl Panel {
     }
 
     /// 光标行锚点 y（逻辑像素，含框内垂直偏移与滚动平移）；
-    /// 系统光标定位、IME 组合窗与文本区命中判定共用
+    /// IME 组合窗与文本区命中判定共用。
     fn caret_line_y(&self, field: InputField) -> f32 {
         let y = match field {
             InputField::Interval => {
@@ -799,7 +795,7 @@ impl Panel {
             InputField::Org => layout::ADD_ORG_Y,
             InputField::Project => layout::ADD_PROJECT_Y,
         };
-        // 内容上滚后锚点同步上移，系统光标与 IME 组合窗贴住可视位置
+        // 内容上滚后锚点同步上移，IME 组合窗贴住可视位置。
         y + layout::CARET_Y_OFFSET - self.scroll_dy
     }
 
@@ -846,33 +842,48 @@ impl Panel {
         }
     }
 
-    /// 按已算好的光标 x 落系统光标并同步 IME 组合窗；供同一事件内已持
-    /// 布局产物的调用点复用，不再重算
+    /// 按已算好的光标 x 挪 IME 组合窗，供同一事件内已持布局产物的
+    /// 调用点复用。
     fn place_caret(&self, hwnd: HWND, cx: f32) {
-        let Some(field) = self.input.field else {
-            return;
-        };
-        let by = self.caret_line_y(field);
-        let bx = field_geo(field).0;
-        let x = bx + 6.0 + cx;
-        // by 已含 CARET_Y_OFFSET，框内垂直居中
         unsafe {
-            let _ = SetCaretPos(
-                (x * self.dpi).round() as i32,
-                (by * self.dpi).round() as i32,
-            );
-            // 组合窗随光标重定位，中文组合串贴住光标
             self.sync_ime_pos(hwnd, cx);
         }
     }
 
-    /// 按字段内容计算光标位置，与 input_field 绘制对齐（同一 caret_layout）。
-    /// 一次布局定光标与组合窗；renderer 缺席（首帧前）时跳过定位，待下
-    /// 次调用补
+    /// 光标闪烁相位：由上次交互时刻起算，亮灭各半秒取模判定，
+    /// 交互归零光标立现。返回当前可见性与距下次翻转的毫秒数。
+    pub(crate) fn caret_blink(&self) -> (bool, u32) {
+        Self::blink_phase(self.last_input_at.get().elapsed().as_millis())
+    }
+
+    /// 相位判定与时间源解耦，供测试钉位。
+    fn blink_phase(elapsed_ms: u128) -> (bool, u32) {
+        const ON: u128 = 500;
+        const OFF: u128 = 500;
+        let total = ON + OFF;
+        let t = elapsed_ms % total;
+        if t < ON {
+            (true, (ON - t) as u32)
+        } else {
+            (false, (total - t) as u32)
+        }
+    }
+
+    /// 点击、键入、光标移动、聚焦统一重置闪烁相位。
+    fn note_caret_interaction(&self) {
+        self.last_input_at.set(std::time::Instant::now());
+        // 相位归零必可见，与下一帧绘制一致，翻转检测不会误判多绘一帧。
+        self.blink_drawn.set(true);
+    }
+
+    /// 按字段内容计算光标位置并挪 IME 组合窗，与 input_field 绘制共用
+    /// 同一布局产物；同时重置闪烁相位，各调用点即光标与文本变化点。
+    /// renderer 缺席即首帧前时跳过定位，待下次调用补。
     pub fn update_caret(&self, hwnd: HWND, renderer: Option<&Renderer>) {
         if self.input.field.is_none() {
             return;
         }
+        self.note_caret_interaction();
         let Some(r) = renderer else {
             return;
         };
@@ -1094,6 +1105,8 @@ pub extern "system" fn panel_wndproc(
                             let pos = app.panel.caret_hit_test(&cl, f, x);
                             if pos != app.panel.input.edit.caret {
                                 app.panel.input.edit.place(pos, true);
+                                // 光标随指针推进也是交互，相位归零立现。
+                                app.panel.note_caret_interaction();
                                 // 窗内查表定位；越出可视窗（捕获使框外坐标可达）
                                 // 须完整重排让窗口滚动，否则光标画出框外不自愈
                                 let (_bx, fw, tail) = field_geo(f);
@@ -1159,7 +1172,7 @@ pub extern "system" fn panel_wndproc(
                         .clamp(0.0, app.panel.scroll_max);
                     if next != app.panel.scroll_dy {
                         app.panel.scroll_dy = next;
-                        // 焦点在输入框上时，系统光标随内容一起平移
+                        // 焦点在输入框上时，IME 组合窗随内容一起平移。
                         if app.panel.input.field.is_some() {
                             let r = app.panel.renderer.as_ref();
                             app.panel.update_caret(hwnd, r);
@@ -1579,38 +1592,71 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
         };
         let mut done = true;
         let mut footer_only = false;
+        let mut repaint = false;
         if let Some(r) = app.panel.renderer.as_mut() {
             let appear_active = r.anim.appear.is_some();
             if let Some(t) = &r.anim.appear {
                 if t.finished() {
                     r.anim.appear = None;
+                    // 结束帧仍须重绘，画终态清掉中间态残影。
+                    repaint = true;
                 } else {
                     done = false;
+                    repaint = true;
                 }
             }
             let footer_active = r.anim.footer.as_ref().is_some_and(|f| !f.tween.finished());
             if let Some(f) = &r.anim.footer {
                 if f.tween.finished() {
                     r.anim.footer = None;
+                    // 结束帧画静态页脚，清掉滑动中间态。
+                    repaint = true;
                 } else {
                     done = false;
+                    repaint = true;
                 }
             }
             let spin_active = r.spin_remaining();
             if spin_active {
                 done = false;
+                repaint = true;
             }
             // 页脚换装独占时帧率减半：文字滑动 30fps 足够，整窗重绘的
             // CPU 砍半；淡入/旋转在场维持满帧
             footer_only = footer_active && !appear_active && !spin_active;
         }
-        let _ = InvalidateRect(Some(hwnd), None, false);
+        let anim_active = !done;
+        // 输入态光标闪烁：时钟保活，仅相位跨过翻转点才整窗重绘；
+        // 焦点与输入态双门控，失焦不闪。
+        let mut caret_wake: Option<u32> = None;
+        let caret_active = app.panel.input.field.is_some()
+            && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
+        if caret_active {
+            done = false;
+            let (on, wake_in) = app.panel.caret_blink();
+            if on != app.panel.blink_drawn.get() {
+                app.panel.blink_drawn.set(on);
+                repaint = true;
+            }
+            caret_wake = Some(wake_in);
+        }
+        if repaint {
+            let _ = InvalidateRect(Some(hwnd), None, false);
+        }
 
         if done {
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             app.panel.anim_period = 0;
         } else {
-            let want = if footer_only { 33 } else { 16 };
+            // 仅光标闪烁在场时一次定到翻转点，空闲期零空转；
+            // 其余动画按原有帧率。
+            let want = if footer_only {
+                33
+            } else if anim_active {
+                16
+            } else {
+                caret_wake.unwrap_or(16).max(1)
+            };
             if app.panel.anim_period != want {
                 // 仅周期变化时重设：SetTimer 会重置计时起点
                 SetTimer(Some(hwnd), TIMER_ANIM, want, None);
@@ -1770,6 +1816,19 @@ mod tests {
         // 可视窗口起点偏移：返回绝对位次而非窗口内位次
         let vs = cl(&[0.0, 5.0, 10.0, 15.0, 20.0], 1);
         assert_eq!(p.caret_hit_test(&vs, field, base + 5.0), 2);
+    }
+
+    /// 光标闪烁相位：交互归零立现，亮灭各半秒，翻转剩余毫秒递减，
+    /// 周期循环回开。
+    #[test]
+    fn caret_blink_phase() {
+        assert_eq!(Panel::blink_phase(0), (true, 500));
+        assert_eq!(Panel::blink_phase(499), (true, 1));
+        assert_eq!(Panel::blink_phase(500), (false, 500));
+        assert_eq!(Panel::blink_phase(999), (false, 1));
+        assert_eq!(Panel::blink_phase(1000), (true, 500));
+        assert_eq!(Panel::blink_phase(1499), (true, 1));
+        assert_eq!(Panel::blink_phase(1500), (false, 500));
     }
 
     /// 巡检判定：在场清计时、离面首拍起算、严格大于才收、收后重开

@@ -698,9 +698,40 @@ impl Renderer {
         y + layout::SECTION_LABEL_H
     }
 
-    /// 自绘输入框：光标用系统 CreateCaret，IME 组合窗随光标定位。
+    /// 自绘光标：有键盘焦点且闪烁相位在亮段才画。cx 为框内光标 x，
+    /// 宽度取物理整像素，避免缩放比下抗锯齿出淡边。
+    unsafe fn draw_caret(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        x: f32,
+        cx: f32,
+        y: f32,
+        alpha: f32,
+    ) {
+        let focused = panel
+            .hwnd
+            .is_some_and(|h| windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == h);
+        if !focused || !panel.caret_blink().0 {
+            return;
+        }
+        let left = x + 6.0 + cx;
+        let cw = panel.px(1).max(1) as f32 / panel.dpi;
+        let caret = self.brush(target, self.theme.action, alpha);
+        target.FillRectangle(
+            &D2D_RECT_F {
+                left,
+                top: y + layout::CARET_Y_OFFSET,
+                right: left + cw,
+                bottom: y + layout::CARET_Y_OFFSET + 16.0,
+            },
+            &caret,
+        );
+    }
+
+    /// 自绘输入框：光标直绘，IME 组合窗随光标定位。
     /// 激活态按光标可视窗口绘制并高亮选区，失焦态画尾部切片。
-    /// 几何 (x/宽/右端让位) 单源取自 field_geo，与光标侧同一坐标
+    /// 几何 x、宽、右端让位单源取自 field_geo。
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
@@ -751,6 +782,10 @@ impl Renderer {
                 Align::Left,
                 false,
             );
+            // 空缓冲聚焦态的光标画在框首。
+            if active {
+                self.draw_caret(target, panel, x, 0.0, y, alpha);
+            }
         } else if active {
             let avail = (w - 6.0 - tail).max(1.0);
             let cl = panel.caret_layout(self);
@@ -791,6 +826,8 @@ impl Renderer {
                 Align::Left,
                 true,
             );
+            // 光标 x 与 IME 定位取自同一布局产物。
+            self.draw_caret(target, panel, x, cl.cx, y, alpha);
         } else {
             // 失焦态：尾部可视切片取最长可放入后缀；前缀宽表一次成型，
             // 后缀宽 = 全宽 - 前缀宽，零逐候选测量

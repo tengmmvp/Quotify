@@ -838,7 +838,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Key);
         }
         // key 明暗切换；点击不夺输入焦点，输入态保持。明暗切换改变显示串
-        // 宽度，系统光标与 IME 组合窗须按新宽度重定位
+        // 宽度，光标与 IME 组合窗须按新宽度重定位。
         Hit::RevealKey => {
             app.panel.key_revealed = !app.panel.key_revealed;
             if let Some(p) = app.panel.hwnd {

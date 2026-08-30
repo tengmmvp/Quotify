@@ -73,7 +73,10 @@ impl<'a> PanelModel<'a> {
             update_available: app.update_status.as_ref().is_some_and(|r| {
                 matches!(r, Ok(info) if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")))
             }),
-            peak_range: crate::app::peak_range_of(&app.config),
+            peak_range: crate::ui::peak::peak_range(
+                &app.config.general.peak_start,
+                &app.config.general.peak_end,
+            ),
             peak_start_raw: &app.config.general.peak_start,
             peak_end_raw: &app.config.general.peak_end,
             update: app.update_status.as_ref(),

@@ -484,11 +484,7 @@ impl Renderer {
             (Hit::Language(LanguageChoice::En), "English"),
         ];
         // 配置字符串 → 选项枚举：未配置 / 未知值都归「跟随系统」
-        let cur_lang = match model.language {
-            Some("zh") => LanguageChoice::Zh,
-            Some("en") => LanguageChoice::En,
-            _ => LanguageChoice::System,
-        };
+        let cur_lang = LanguageChoice::from_setting(model.language);
         y = self.segmented_raw(
             target,
             &langs,
@@ -505,11 +501,7 @@ impl Renderer {
             (Hit::Appearance(AppearanceChoice::Light), s.theme_light),
             (Hit::Appearance(AppearanceChoice::Dark), s.theme_dark),
         ];
-        let cur_theme = match model.appearance {
-            Some("light") => AppearanceChoice::Light,
-            Some("dark") => AppearanceChoice::Dark,
-            _ => AppearanceChoice::System,
-        };
+        let cur_theme = AppearanceChoice::from_setting(model.appearance);
         y = self.segmented_raw(
             target,
             &themes,
@@ -1213,10 +1205,19 @@ fn mask_key(key: &str, active: bool) -> String {
     }
 }
 
-/// 掩码规则回归：12 位阈值两侧、聚焦强制全显圆点、短串与中段不露明文
+/// 掩码规则回归：12 位阈值两侧、聚焦强制全显圆点、短串与中段不露明文。
+/// 另钉轮询预设档位值，档位值漂移在此报警；标签与档位的配对靠渲染侧
+/// 按下标顺序维护，无自动防护。
 #[cfg(test)]
 mod tests {
     use super::mask_key;
+    use crate::ui::panel::layout::INTERVAL_PRESETS;
+
+    #[test]
+    fn interval_presets_pinned() {
+        // 只锁档位值；与四个标签的配对靠渲染侧按下标顺序维护，无防护
+        assert_eq!(INTERVAL_PRESETS, [60, 300, 900, 1800]);
+    }
 
     #[test]
     fn mask_key_threshold() {

@@ -5,7 +5,7 @@
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ELLIPSE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 use super::{Align, Hit, Renderer};
 use crate::service::whatsnew::{NEWS_MAX, NewsItem};
@@ -61,13 +61,16 @@ fn item_h(item: &NewsItem, expanded: bool) -> f32 {
 
 impl Renderer {
     /// 关于窗一帧；骨架同面板 paint，返回 false 表示设备已丢失，
-    /// 调用方须丢弃整个 Renderer
+    /// 调用方须丢弃整个 Renderer。
+    #[allow(clippy::too_many_arguments)]
     pub fn paint_about(
         &mut self,
         hwnd: windows::Win32::Foundation::HWND,
         rect_phys: &RECT,
         model: &PanelModel,
         expanded: Option<usize>,
+        egg: Option<f32>,
+        egg_eaten: bool,
         dpi: f32,
     ) -> bool {
         unsafe {
@@ -79,7 +82,7 @@ impl Renderer {
             self.hits.clear();
             self.frame_measures.clear();
             target.BeginDraw();
-            self.draw_about(&target, model, expanded, w, h);
+            self.draw_about(&target, model, expanded, egg, egg_eaten, w, h);
             match target.EndDraw(None, None) {
                 Ok(()) => true,
                 Err(e) => {
@@ -91,11 +94,14 @@ impl Renderer {
     }
 
     /// 头部信息与双链接为固定区，最新动态区缀于末位
+    #[allow(clippy::too_many_arguments)]
     unsafe fn draw_about(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         model: &PanelModel,
         expanded: Option<usize>,
+        egg: Option<f32>,
+        egg_eaten: bool,
         w: f32,
         h: f32,
     ) {
@@ -128,6 +134,15 @@ impl Renderer {
 
         // ── 头部：logo + 应用名 + 版本 ──
         self.logo(target, w / 2.0 - 22.0, dy + 24.0, 44.0, alpha);
+        self.hits.push((
+            Hit::AboutLogo,
+            D2D_RECT_F {
+                left: w / 2.0 - 26.0,
+                top: dy + 20.0,
+                right: w / 2.0 + 26.0,
+                bottom: dy + 72.0,
+            },
+        ));
         let name_rect = D2D_RECT_F {
             left: 0.0,
             top: dy + name_y,
@@ -146,42 +161,103 @@ impl Renderer {
             false,
         );
         let ver = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
-        let ver_rect = D2D_RECT_F {
-            left: 0.0,
-            top: dy + ver_y,
-            right: w,
-            bottom: dy + ver_y + 16.0,
+        let eating = egg.filter(|_| !egg_eaten);
+        // 全程距离 = 两行长度和的恒速推进；跨行交接处瞬移到下行左端。
+        let (ver_eat, desc_eat) = match eating {
+            Some(p) => {
+                let ver_full = self.measure(&ver, 12.0, 400, false) + 12.0;
+                let desc_full = self.measure(s.app_desc, 11.5, 400, false) + 12.0;
+                let d = p * (ver_full + desc_full);
+                if d < ver_full {
+                    (Some(d / ver_full), 0.0)
+                } else {
+                    (None, (d - ver_full) / desc_full)
+                }
+            }
+            None => (None, 0.0),
         };
-        self.text_aligned(
-            target,
-            &ver,
-            &ver_rect,
-            12.0,
-            400,
-            self.theme.text_tertiary,
-            alpha,
-            Align::Center,
-            false,
-        );
+        match ver_eat {
+            Some(q) => {
+                self.egg_eat_line(
+                    target,
+                    w,
+                    &ver,
+                    dy + ver_y,
+                    12.0,
+                    self.theme.text_tertiary,
+                    q,
+                    egg.unwrap_or(0.0),
+                    alpha,
+                );
+            }
+            None if eating.is_some() || egg_eaten => {}
+            None => {
+                let ver_rect = D2D_RECT_F {
+                    left: 0.0,
+                    top: dy + ver_y,
+                    right: w,
+                    bottom: dy + ver_y + 16.0,
+                };
+                self.text_aligned(
+                    target,
+                    &ver,
+                    &ver_rect,
+                    12.0,
+                    400,
+                    self.theme.text_tertiary,
+                    alpha,
+                    Align::Center,
+                    false,
+                );
+            }
+        }
 
         // ── 项目描述 ──
-        let desc_rect = D2D_RECT_F {
-            left: 12.0,
-            top: dy + desc_y,
-            right: w - 12.0,
-            bottom: dy + desc_y + 16.0,
-        };
-        self.text_aligned(
-            target,
-            s.app_desc,
-            &desc_rect,
-            11.5,
-            400,
-            self.theme.text_secondary,
-            alpha,
-            Align::Center,
-            false,
-        );
+        match eating {
+            Some(_) if ver_eat.is_some() => {
+                self.draw_desc(target, s, w, dy + desc_y, alpha);
+            }
+            Some(p) => {
+                self.egg_eat_line(
+                    target,
+                    w,
+                    s.app_desc,
+                    dy + desc_y,
+                    11.5,
+                    self.theme.text_secondary,
+                    desc_eat,
+                    p,
+                    alpha,
+                );
+            }
+            None if !egg_eaten => {
+                self.draw_desc(target, s, w, dy + desc_y, alpha);
+            }
+            None => {
+                let quote = match model.lang {
+                    crate::ui::i18n::Lang::Zh => "人不能两次踏进同一条河流。",
+                    crate::ui::i18n::Lang::En => "No man ever steps in the same river twice.",
+                };
+                let mid_y = (ver_y + desc_y + 16.0) / 2.0;
+                let quote_rect = D2D_RECT_F {
+                    left: 0.0,
+                    top: dy + mid_y,
+                    right: w,
+                    bottom: dy + mid_y + 16.0,
+                };
+                self.text_aligned(
+                    target,
+                    quote,
+                    &quote_rect,
+                    11.5,
+                    400,
+                    self.theme.text_tertiary,
+                    alpha,
+                    Align::Center,
+                    false,
+                );
+            }
+        }
 
         // ── 三链接并排：仓库 / 反馈 / 复制诊断 ──
         let repo = format!("[{}]", s.link_repo);
@@ -250,6 +326,128 @@ impl Renderer {
                 y += item_h(item, expanded == Some(i)) + NEWS_GAP;
             }
         }
+    }
+
+    /// 项目描述行
+    unsafe fn draw_desc(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        s: &crate::ui::i18n::Strings,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) {
+        let desc_rect = D2D_RECT_F {
+            left: 12.0,
+            top: y,
+            right: w - 12.0,
+            bottom: y + 16.0,
+        };
+        self.text_aligned(
+            target,
+            s.app_desc,
+            &desc_rect,
+            11.5,
+            400,
+            self.theme.text_secondary,
+            alpha,
+            Align::Center,
+            false,
+        );
+    }
+
+    /// 彩蛋横扫一行：文字色随行传入，与该行正常态一致避免跨行跳色
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn egg_eat_line(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        w: f32,
+        text: &str,
+        line_y: f32,
+        size: f32,
+        color: [f32; 4],
+        q: f32,
+        p: f32,
+        alpha: f32,
+    ) {
+        let tw = self.measure(text, size, 400, false);
+        let full = tw + 12.0;
+        let x = w / 2.0 - full / 2.0 + q * full;
+        let rect = D2D_RECT_F {
+            left: 0.0,
+            top: line_y,
+            right: w,
+            bottom: line_y + 16.0,
+        };
+        unsafe {
+            target.PushAxisAlignedClip(
+                &D2D_RECT_F {
+                    left: x + 9.0,
+                    ..rect
+                },
+                windows::Win32::Graphics::Direct2D::D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+            );
+        }
+        self.text_aligned(
+            target,
+            text,
+            &rect,
+            size,
+            400,
+            color,
+            alpha,
+            Align::Center,
+            false,
+        );
+        unsafe {
+            target.PopAxisAlignedClip();
+        }
+        self.pacman_at(target, x, line_y + 8.0, 8.0, p, alpha);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn pacman_at(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        p: f32,
+        alpha: f32,
+    ) {
+        if self.pacman_geo.is_none() {
+            self.pacman_geo = self.build_pacman_geo();
+        }
+        let Some((upper, lower)) = self.pacman_geo.clone() else {
+            return;
+        };
+        let phase = (p * 8.0).fract();
+        let sm = |t: f32| {
+            let c = t.clamp(0.0, 1.0);
+            c * c * (3.0 - 2.0 * c)
+        };
+        let ratio = if phase < 0.65 {
+            sm(phase / 0.65)
+        } else {
+            1.0 - sm((phase - 0.65) / 0.35)
+        };
+        let mouth = 0.02 + ratio * 0.94;
+        let b = self.brush(target, self.theme.logo_tile, alpha);
+        let k = r / super::widgets::PACMAN_R;
+        for (geo, ang) in [(upper, -mouth), (lower, mouth)] {
+            let (s, c) = ang.sin_cos();
+            target.SetTransform(&Matrix3x2 {
+                M11: k * c,
+                M12: k * s,
+                M21: -k * s,
+                M22: k * c,
+                M31: cx,
+                M32: cy,
+            });
+            target.FillGeometry(&geo, &b, None);
+            target.DrawGeometry(&geo, &b, 1.0, None);
+        }
+        target.SetTransform(&Matrix3x2::identity());
     }
 
     /// 一枚文字链接

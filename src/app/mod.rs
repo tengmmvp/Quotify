@@ -11,9 +11,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GWLP_USERDATA, GetMessageW, GetSystemMetrics, GetWindowLongPtrW, HMENU,
     MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
-    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON,
-    TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_NULL, WNDCLASSW,
-    WS_POPUP,
+    SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY,
+    WM_NULL, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -43,6 +43,22 @@ const IDM_EXIT: u16 = 1003;
 /// 导入配置文件大小上限
 const IMPORT_MAX_BYTES: u64 = 1024 * 1024;
 
+/// 托盘注册重试定时器：首注册失败每 2s 重试，上限 15 次，成功或
+/// 超限即撤；explorer 重启的兜底另走 TaskbarCreated。
+const TIMER_TRAY_RETRY: usize = 1;
+const TRAY_RETRY_MS: u32 = 2000;
+const TRAY_RETRY_MAX: u32 = 15;
+
+/// 更新检查结果的回传通道
+static UPDATE_SLOT: crate::platform::post::Slot<
+    Result<crate::service::update::ReleaseInfo, String>,
+> = crate::platform::post::Slot::new();
+
+/// 仓库动态拉取结果的回传通道
+static NEWS_SLOT: crate::platform::post::Slot<
+    Result<Vec<crate::service::whatsnew::NewsItem>, String>,
+> = crate::platform::post::Slot::new();
+
 /// 失败时保留旧快照供面板显示。
 pub struct AccountData {
     pub(crate) snapshot: Option<UsageSnapshot>,
@@ -56,6 +72,7 @@ pub struct App {
     pub(crate) strings: &'static Strings,
     pub(crate) data: AccountData,
     tray: Option<TrayIcon>,
+    tray_retries: u32,
     poller: Option<Poller>,
     poll_target: PollTarget,
     poll_interval: PollInterval,
@@ -91,6 +108,7 @@ impl App {
                 last_error: None,
             },
             tray: None,
+            tray_retries: 0,
             poller: None,
             poll_target: std::sync::Arc::new(std::sync::Mutex::new(None)),
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
@@ -191,13 +209,8 @@ impl App {
                 let anim_texts = anim_ok.then(|| {
                     let prev = prev_at.unwrap();
                     let s = self.strings;
-                    let fresh = (chrono::Local::now() - prev).num_seconds() < 60;
-                    let old_text = if fresh {
-                        s.updated_just_now.to_string()
-                    } else {
-                        s.updated_ago
-                            .replace("{t}", &crate::ui::fmt::ago(prev, self.lang))
-                    };
+                    // 旧文案与静态页脚同源：动画起点必须逐字节等于上一帧
+                    let old_text = crate::ui::fmt::updated_text(s, self.lang, prev);
                     (old_text, s.updated_just_now.to_string())
                 });
                 self.check_notifications(&snap);
@@ -300,13 +313,22 @@ impl App {
         }
     }
 
-    /// 托盘右键菜单
-    fn show_context_menu(&self, pos: windows::Win32::Foundation::POINT) {
+    /// 开门三步的唯一入口：调高度 → 弹面板 → 套外观。toggle_pin 内部
+    /// 先复位主视图再显示，视图切换必须在其后——顺序错则开门停在错页
+    pub(crate) fn open_panel(&mut self, tray: HWND, anchor: windows::Win32::Foundation::RECT) {
+        let n = self.config.accounts.len();
+        sync_main_height(self);
+        self.panel.toggle_pin(tray, anchor, n);
+        apply_appearance(self);
+    }
+
+    /// 托盘右键菜单。文案取 &'static 不借 App：TrackPopupMenu 的嵌套泵
+    /// 会派发其他消息并重取 App，泵后不得再使用进入前的引用。
+    fn show_context_menu(owner: HWND, s: &'static Strings, pos: windows::Win32::Foundation::POINT) {
         unsafe {
-            let owner = self.hwnd();
-            let settings = wide(self.strings.settings);
-            let about = wide(self.strings.about);
-            let exit = wide(self.strings.exit);
+            let settings = wide(s.settings);
+            let about = wide(s.about);
+            let exit = wide(s.exit);
             let menu: HMENU = CreatePopupMenu().unwrap_or_default();
             if menu.is_invalid() {
                 return;
@@ -374,28 +396,28 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     if let Some(app) = app
                         && let Some(rect) = tray_rect(app)
                     {
-                        let n = app.config.accounts.len();
-                        sync_main_height(app);
-                        app.panel.toggle_pin(hwnd, rect, n);
-                        apply_appearance(app);
+                        app.open_panel(hwnd, rect);
                     }
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
-                    if let Some(app) = app {
-                        app.show_context_menu(tray::context_menu_pos());
+                    let ctx = app.map(|a| (a.hwnd(), a.strings));
+                    if let Some((owner, s)) = ctx {
+                        App::show_context_menu(owner, s, tray::context_menu_pos());
                     }
                 }
                 // 键盘激活走 WM_CONTEXTMENU 且不带坐标（右键另有
                 // RBUTTONUP 臂）；光标可能在任意处，菜单定位用图标矩形中心
                 windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                     if let Some(app) = app {
+                        let owner = app.hwnd();
+                        let s = app.strings;
                         let pos = tray_rect(app)
                             .map(|r| windows::Win32::Foundation::POINT {
                                 x: (r.left + r.right) / 2,
                                 y: (r.top + r.bottom) / 2,
                             })
                             .unwrap_or_else(tray::context_menu_pos);
-                        app.show_context_menu(pos);
+                        App::show_context_menu(owner, s, pos);
                     }
                 }
                 _ => {}
@@ -418,26 +440,63 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 {
                     app.panel.anchor = Some(rect);
                 }
+                // 补回成功撤掉还在跑的重试定时器；失败则挂起重试接管，
+                // 不让图标缺席到下次 explorer 重启
+                if app.tray.as_ref().is_some_and(|t| t.registered) {
+                    unsafe {
+                        use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+                        let _ = KillTimer(Some(hwnd), TIMER_TRAY_RETRY);
+                    }
+                } else {
+                    app.tray_retries = 0;
+                    unsafe {
+                        SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
+                    }
+                }
             }
             LRESULT(0)
         }
+        WM_TIMER => {
+            // 托盘首注册失败的短程重试；成功或超限即撤，TaskbarCreated 兜底。
+            // 未知定时器 id 落回默认处理，未来新增带回调的定时器不被吞。
+            if wparam.0 == TIMER_TRAY_RETRY {
+                if let Some(app) = app_from(hwnd) {
+                    let registered = app.tray.as_ref().is_some_and(|t| t.registered);
+                    let mut done = registered;
+                    if !registered {
+                        app.tray_retries += 1;
+                        let tip = tooltip_text(app);
+                        if let (Some(icon), Some(tray)) = (app.tray_icon, app.tray.as_mut()) {
+                            tray.readd(icon, &tip);
+                            done = tray.registered;
+                        }
+                    }
+                    if done || app.tray_retries >= TRAY_RETRY_MAX {
+                        unsafe {
+                            use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+                            let _ = KillTimer(Some(hwnd), TIMER_TRAY_RETRY);
+                        }
+                    }
+                }
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
         WM_APP_POLL_RESULT => {
-            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
-            let boxed = wparam.0 as *mut PollMessage;
-            let msg = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
-            if let (Some(app), Some(msg)) = (app_from(hwnd), msg) {
-                app.handle_poll_result(*msg);
+            // 无载荷唤醒码：结果在通道里排队空取，伪造消息最多扑空
+            if let Some(app) = app_from(hwnd) {
+                while let Some(msg) = crate::service::poller::POLL_SLOT.take() {
+                    app.handle_poll_result(msg);
+                }
             }
             LRESULT(0)
         }
         WM_APP_UPDATE_RESULT => {
-            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
-            let boxed = wparam.0 as *mut Result<crate::service::update::ReleaseInfo, String>;
-            let result = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
             if let Some(app) = app_from(hwnd) {
                 app.update_checking = false;
-                if let Some(r) = result {
-                    app.update_status = Some(*r);
+                while let Some(r) = UPDATE_SLOT.take() {
+                    app.update_status = Some(r);
                     if let Some(p) = app.panel.hwnd {
                         relayout_panel(app, p);
                         unsafe {
@@ -452,9 +511,10 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             // 外观未显式指定时，系统主题切换即时重绘面板
             if is_immersive_color_set(lparam)
                 && let Some(app) = app_from(hwnd)
-                && !app.config.general.appearance.as_deref().is_some_and(|s| {
-                    s.eq_ignore_ascii_case("light") || s.eq_ignore_ascii_case("dark")
-                })
+                && crate::ui::panel::theme::explicit_appearance(
+                    app.config.general.appearance.as_deref(),
+                )
+                .is_none()
             {
                 apply_appearance(app);
                 // 面板与打开中的弹窗、关于窗一并按新主题重绘
@@ -463,22 +523,19 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         WM_APP_NEWS_RESULT => {
-            // 先取回 owned 再判 app：app 缺失时指针同样要释放，防泄漏
-            let boxed = wparam.0 as *mut Result<Vec<crate::service::whatsnew::NewsItem>, String>;
-            let result = (!boxed.is_null()).then(|| unsafe { Box::from_raw(boxed) });
-            if let Some(app) = app_from(hwnd)
-                && let Some(result) = result.map(|b| *b)
-            {
-                match result {
-                    Ok(news) => {
-                        app.news = Some(news);
-                        // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
-                        refit_about(app);
-                    }
-                    Err(e) => {
-                        crate::platform::log(&format!("[Quotify] 动态拉取失败: {e}"));
-                        // 复位闸门，下次打开关于窗可重试
-                        app.news_fetched = false;
+            if let Some(app) = app_from(hwnd) {
+                while let Some(result) = NEWS_SLOT.take() {
+                    match result {
+                        Ok(news) => {
+                            app.news = Some(news);
+                            // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
+                            refit_about(app);
+                        }
+                        Err(e) => {
+                            crate::platform::log(&format!("[Quotify] 动态拉取失败: {e}"));
+                            // 复位闸门，下次打开关于窗可重试
+                            app.news_fetched = false;
+                        }
                     }
                 }
             }
@@ -490,10 +547,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 && app.panel.mode == crate::ui::panel::PanelMode::Hidden
                 && let Some(rect) = tray_rect(app)
             {
-                let n = app.config.accounts.len();
-                sync_main_height(app);
-                app.panel.toggle_pin(hwnd, rect, n);
-                apply_appearance(app);
+                app.open_panel(hwnd, rect);
             }
             LRESULT(0)
         }
@@ -502,15 +556,11 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             match cmd {
                 IDM_SETTINGS => {
                     if let Some(app) = app_from(hwnd) {
-                        // 隐藏时先开门（toggle_pin 内部先复位主视图再显示，
-                        // 视图切换须在其后），已显示则只切视图
+                        // 隐藏时先开门，顺序约束在 open_panel 内；已显示则只切视图。
                         if app.panel.mode == crate::ui::panel::PanelMode::Hidden
                             && let Some(rect) = tray_rect(app)
                         {
-                            let n = app.config.accounts.len();
-                            sync_main_height(app);
-                            app.panel.toggle_pin(hwnd, rect, n);
-                            apply_appearance(app);
+                            app.open_panel(hwnd, rect);
                         }
                         app.panel.view = crate::ui::panel::PanelView::Settings;
                         if let Some(p) = app.panel.hwnd {
@@ -525,9 +575,14 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         // 慢解析会在进程内排队，拖住启动轮询、延后面板首屏
                         if app.news.is_none() && !app.news_fetched {
                             app.news_fetched = true;
-                            crate::platform::post::spawn_post(hwnd, WM_APP_NEWS_RESULT, || {
-                                crate::service::whatsnew::fetch_latest()
-                            });
+                            if !crate::platform::post::spawn_post(
+                                &NEWS_SLOT,
+                                hwnd,
+                                WM_APP_NEWS_RESULT,
+                                crate::service::whatsnew::fetch_latest,
+                            ) {
+                                app.news_fetched = false;
+                            }
                         }
                         let h = crate::ui::panel::render::about::about_height(
                             app.news.as_deref(),
@@ -596,7 +651,7 @@ fn app_from(hwnd: HWND) -> Option<&'static mut App> {
 
 /// 面板命中处理
 pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
-    use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
+    use crate::ui::panel::render::{Hit, ScopeChoice};
     match hit {
         Hit::Refresh | Hit::Retry => {
             // 主动重试开启新一轮记录，同文案失败再现时也重记日志
@@ -606,6 +661,9 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
             if let Some(r) = app.panel.renderer.as_mut() {
                 r.start_spin();
+                // 旋转的驱动时钟在此统一补挂：appear 收尾会撤 TIMER_ANIM，
+                // 调用点无须知晓此坑。
+                unsafe { crate::ui::panel::start_anim(panel_hwnd) };
             }
         }
         Hit::Settings => {
@@ -667,11 +725,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
 
         // ── 设置 · 通用 ──
         Hit::Language(choice) => {
-            app.config.general.language = match choice {
-                LanguageChoice::System => None,
-                LanguageChoice::Zh => Some("zh".to_string()),
-                LanguageChoice::En => Some("en".to_string()),
-            };
+            app.config.general.language = choice.to_config();
             app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
@@ -681,11 +735,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
         }
         Hit::Appearance(choice) => {
-            app.config.general.appearance = match choice {
-                AppearanceChoice::System => None,
-                AppearanceChoice::Light => Some("light".to_string()),
-                AppearanceChoice::Dark => Some("dark".to_string()),
-            };
+            app.config.general.appearance = choice.to_config();
             crate::app::config::save(&app.config);
             apply_appearance(app);
             invalidate_ui(app);
@@ -818,15 +868,22 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         }
 
         // ── 设置 · 配置管理与关于 ──
-        Hit::ExportConfig => export_config(app),
-        Hit::ImportConfig => import_config(app, panel_hwnd),
+        // 模态两臂由窗口过程层分派以防泵后引用失效，经本函数到达即接线错误。
+        Hit::ExportConfig | Hit::ImportConfig => {
+            crate::platform::log("[Quotify] 模态命中误入 handle_panel_hit");
+        }
         Hit::CheckUpdate => {
             if !app.update_checking {
                 app.update_checking = true;
                 app.update_status = None;
-                crate::platform::post::spawn_post(app.hwnd(), WM_APP_UPDATE_RESULT, || {
-                    crate::service::update::check_latest()
-                });
+                if !crate::platform::post::spawn_post(
+                    &UPDATE_SLOT,
+                    app.hwnd(),
+                    WM_APP_UPDATE_RESULT,
+                    crate::service::update::check_latest,
+                ) {
+                    app.update_checking = false;
+                }
             }
         }
         Hit::OpenDownload => {
@@ -870,6 +927,32 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             };
             // 展开改变窗高：重定位并重绘关于窗
             refit_about(app);
+        }
+        Hit::AboutLogo => {
+            // 单向彩蛋：吃掉后点击不再响应，关关于窗复位
+            let about = &mut app.about;
+            if about.egg.is_none() && !about.egg_eaten {
+                about.egg_clicks = about.egg_clicks.saturating_add(1);
+                if about.egg_clicks >= 5 {
+                    about.egg_clicks = 0;
+                    let anim = about
+                        .wnd
+                        .renderer
+                        .as_ref()
+                        .is_some_and(|r| r.animations_on());
+                    if anim {
+                        about.egg = Some(crate::ui::panel::anim::Tween::now(1500));
+                        // 动画时钟可能已被 appear 收尾撤掉，彩蛋期间重挂
+                        use windows::Win32::UI::WindowsAndMessaging::SetTimer;
+                        unsafe {
+                            SetTimer(Some(panel_hwnd), crate::ui::float_wnd::TIMER_ANIM, 16, None);
+                        }
+                    } else {
+                        // 减少动效：不播，直接到终态
+                        about.egg_eaten = true;
+                    }
+                }
+            }
         }
     }
     unsafe {
@@ -1118,14 +1201,42 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 警告级 OK/Cancel 确认框，取消返回 false；导出明文与导入清空共用
-fn confirm_box(app: &App, title: &str, body: &str) -> bool {
+/// 模态期间的巡检冻结：面板在弹框背后离面属正常，巡检须停防误收；
+/// Drop 恢复时钟，早退不漏挂。
+struct ModalGuard(HWND);
+
+impl ModalGuard {
+    fn new(panel: HWND) -> Self {
+        unsafe {
+            use windows::Win32::UI::WindowsAndMessaging::KillTimer;
+            let _ = KillTimer(Some(panel), crate::ui::panel::TIMER_OUTSIDE_CHECK);
+        }
+        Self(panel)
+    }
+}
+
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetTimer(
+                Some(self.0),
+                crate::ui::panel::TIMER_OUTSIDE_CHECK,
+                200,
+                None,
+            );
+        }
+    }
+}
+
+/// 警告级 OK/Cancel 确认框，取消返 false，导出与导入共用；只收
+/// owner 与文案不借 App——嵌套泵返回后调用方引用已失效。
+fn confirm_box(owner: HWND, title: &str, body: &str) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{IDOK, MB_ICONWARNING, MB_OKCANCEL, MessageBoxW};
     let title = wide(title);
     let body = wide(body);
     let r = unsafe {
         MessageBoxW(
-            Some(app.hwnd()),
+            Some(owner),
             PCWSTR(body.as_ptr()),
             PCWSTR(title.as_ptr()),
             MB_OKCANCEL | MB_ICONWARNING,
@@ -1134,35 +1245,32 @@ fn confirm_box(app: &App, title: &str, body: &str) -> bool {
     r == IDOK
 }
 
-/// 导出配置为明文 JSON
-fn export_config(app: &App) {
-    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-
-    // 模态对话框期间冻结面板巡检，防止面板被误判收起
-    if let Some(panel) = app.panel.hwnd {
-        unsafe {
-            let _ = KillTimer(Some(panel), crate::ui::panel::TIMER_OUTSIDE_CHECK);
-        }
-    }
+/// 导出配置为明文 JSON。两段式取引用：模态对话框跑嵌套消息泵，泵内
+/// 其他消息会重取 App 使本函数前段的引用失效——模态前只取 &'static
+/// 数据，模态后重取引用落盘。
+pub fn export_config(panel_hwnd: HWND) {
+    let (owner, title, body) = {
+        let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+            return;
+        };
+        (
+            app.hwnd(),
+            app.strings.export_confirm_title,
+            app.strings.export_confirm_body,
+        )
+    };
     // 风险知情先于选位置：敏感内容的告知应前置；取消则连保存对话框
-    // 都不出，静默中止导出、无 toast
-    let confirmed = confirm_box(
-        app,
-        app.strings.export_confirm_title,
-        app.strings.export_confirm_body,
-    );
-    let picked = confirmed.then(|| crate::platform::save_dialog("quotify-config.json"));
-    if let Some(panel) = app.panel.hwnd {
-        unsafe {
-            let _ = SetTimer(
-                Some(panel),
-                crate::ui::panel::TIMER_OUTSIDE_CHECK,
-                200,
-                None,
-            );
-        }
-    }
-    let Some(path) = picked.flatten() else {
+    // 都不出，静默中止导出、无 toast。
+    let picked = {
+        let _modal = ModalGuard::new(panel_hwnd);
+        confirm_box(owner, title, body)
+            .then(|| crate::platform::save_dialog("quotify-config.json"))
+            .flatten()
+    };
+    let Some(path) = picked else {
+        return;
+    };
+    let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
         return;
     };
     let body = match serde_json::to_string_pretty(&app.config)
@@ -1182,22 +1290,12 @@ fn export_config(app: &App) {
     crate::platform::notify::show(NOTIFY_TITLE, &body);
 }
 
-/// 导入配置 JSON；模态期间冻结面板巡检防止误收起
-fn import_config(app: &mut App, panel_hwnd: HWND) {
-    use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
-
-    unsafe {
-        let _ = KillTimer(Some(panel_hwnd), crate::ui::panel::TIMER_OUTSIDE_CHECK);
-    }
-    let picked = crate::platform::open_dialog();
-    unsafe {
-        let _ = SetTimer(
-            Some(panel_hwnd),
-            crate::ui::panel::TIMER_OUTSIDE_CHECK,
-            200,
-            None,
-        );
-    }
+/// 导入配置 JSON，两段式同 export_config：模态段不持 App 引用，应用段重取。
+pub fn import_config(panel_hwnd: HWND) {
+    let picked = {
+        let _modal = ModalGuard::new(panel_hwnd);
+        crate::platform::open_dialog()
+    };
     let Some(path) = picked else {
         // 用户取消选择文件，无事发生
         return;
@@ -1228,62 +1326,62 @@ fn import_config(app: &mut App, panel_hwnd: HWND) {
                 })
         }
     };
-
-    let notify_body = match parsed {
-        Some(cfg) => {
-            if cfg.accounts.is_empty() && !app.config.accounts.is_empty() {
-                // 确认框同为模态：巡检三明治同文件选择，防读框超时
-                // 面板在对话框背后被收起
-                unsafe {
-                    let _ = KillTimer(Some(panel_hwnd), crate::ui::panel::TIMER_OUTSIDE_CHECK);
-                }
-                let ok = confirm_box(
-                    app,
+    let Some(cfg) = parsed else {
+        crate::platform::log("[Quotify] 配置导入失败：文件不可读或格式无效");
+        let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+            return;
+        };
+        crate::platform::notify::show(NOTIFY_TITLE, app.strings.import_failed);
+        return;
+    };
+    // 导入会清掉现有账号时先确认；现状判定与文案一次取用拷出，
+    // 确认框模态泵返回后重取。
+    if cfg.accounts.is_empty() {
+        let confirm = {
+            let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+                return;
+            };
+            (!app.config.accounts.is_empty()).then(|| {
+                (
+                    app.hwnd(),
                     app.strings.import_confirm_title,
                     app.strings.import_confirm_body,
-                );
-                unsafe {
-                    let _ = SetTimer(
-                        Some(panel_hwnd),
-                        crate::ui::panel::TIMER_OUTSIDE_CHECK,
-                        200,
-                        None,
-                    );
-                }
-                if !ok {
-                    return;
-                }
+                )
+            })
+        };
+        if let Some((owner, title, body)) = confirm {
+            let _modal = ModalGuard::new(panel_hwnd);
+            if !confirm_box(owner, title, body) {
+                return;
             }
-            app.config = cfg;
-            // 外部文件的值域不可信，归一化与启动加载保持一致
-            normalize_config(&mut app.config);
-            app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
-            app.strings = app.lang.strings();
-            if app.config.selected_account().is_none() {
-                app.config.selected = None;
-            }
-            if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
-                crate::platform::log(&format!("[Quotify] 导入的代理地址无效，保持原连接: {e}"));
-            }
-            if let Some(r) = app.panel.renderer.as_mut() {
-                r.hits.clear();
-                r.hover = None;
-            }
-            switch_poll_source(app);
-            app.panel.key_revealed = false;
-            app.panel.clear_input(panel_hwnd);
-            app.update_status = None;
-            app.update_checking = false;
-            sync_customizing(app);
-            relayout_panel(app, panel_hwnd);
-            app.strings.import_done.to_string()
         }
-        None => {
-            crate::platform::log("[Quotify] 配置导入失败：文件不可读或格式无效");
-            app.strings.import_failed.to_string()
-        }
+    }
+    let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+        return;
     };
-    crate::platform::notify::show(NOTIFY_TITLE, &notify_body);
+    app.config = cfg;
+    // 外部文件的值域不可信，归一化与启动加载保持一致。
+    normalize_config(&mut app.config);
+    app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
+    app.strings = app.lang.strings();
+    if app.config.selected_account().is_none() {
+        app.config.selected = None;
+    }
+    if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
+        crate::platform::log(&format!("[Quotify] 导入的代理地址无效，保持原连接: {e}"));
+    }
+    if let Some(r) = app.panel.renderer.as_mut() {
+        r.hits.clear();
+        r.hover = None;
+    }
+    switch_poll_source(app);
+    app.panel.key_revealed = false;
+    app.panel.clear_input(panel_hwnd);
+    app.update_status = None;
+    app.update_checking = false;
+    sync_customizing(app);
+    relayout_panel(app, panel_hwnd);
+    crate::platform::notify::show(NOTIFY_TITLE, app.strings.import_done);
 }
 
 /// 非预设间隔展开自定义行并预填；预设则收起
@@ -1344,21 +1442,7 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
 }
 
 pub(crate) fn resolved_appearance(setting: Option<&str>) -> crate::ui::panel::theme::Appearance {
-    match setting {
-        Some(s) if s.eq_ignore_ascii_case("light") => crate::ui::panel::theme::Appearance::Light,
-        Some(s) if s.eq_ignore_ascii_case("dark") => crate::ui::panel::theme::Appearance::Dark,
-        _ => crate::ui::panel::theme::Theme::system_appearance(),
-    }
-}
-
-/// 解析配置中的高峰区间；格式无效或两端相等回退官方默认，start > end 视为跨午夜
-pub fn peak_range_of(config: &Config) -> crate::ui::peak::PeakRange {
-    let s = crate::ui::peak::parse_hhmm(&config.general.peak_start);
-    let e = crate::ui::peak::parse_hhmm(&config.general.peak_end);
-    match (s, e) {
-        (Some(s), Some(e)) if s != e => (s, e),
-        _ => crate::ui::peak::DEFAULT_PEAK,
-    }
+    crate::ui::panel::theme::resolved(setting)
 }
 
 /// 配置值域归一化，启动加载与导入共用；阈值越界夹回 1–100，
@@ -1392,23 +1476,8 @@ fn apply_appearance(app: &mut App) {
 }
 
 fn sync_main_height(app: &mut App) {
-    let (rows, comp, stats, bal) = match app.data.snapshot.as_ref() {
-        None => (0, false, false, false),
-        Some(snap) => (
-            [
-                snap.five_hour.is_some(),
-                snap.weekly.is_some(),
-                snap.mcp.is_some(),
-            ]
-            .iter()
-            .filter(|b| **b)
-            .count(),
-            // 明细非空才陈列构成区，与渲染侧判定同源
-            snap.mcp.as_ref().is_some_and(|m| !m.details.is_empty()),
-            snap.token_stats.is_some(),
-            snap.balance.is_some(),
-        ),
-    };
+    // 特征派生单源于 api::main_features，与渲染侧陈列判定同源
+    let (rows, comp, stats, bal) = crate::api::main_features(app.data.snapshot.as_ref());
     app.panel.main_h = crate::ui::panel::layout::main_view_height(
         app.data.snapshot.is_some(),
         rows,
@@ -1500,7 +1569,12 @@ pub fn run() -> i32 {
         }
         let initial = initial.unwrap_or_default();
         app.tray_icon = Some(initial);
-        app.tray = TrayIcon::new(hwnd, initial);
+        app.tray = Some(TrayIcon::new(hwnd, initial));
+        // 开机自启可能撞上任务栏未就绪，失败挂短程重试直至图标就位
+        if !app.tray.as_ref().is_some_and(|t| t.registered) {
+            app.tray_retries = 0;
+            SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
+        }
 
         app.sync_poll_context();
         app.poller = Poller::spawn(
@@ -1523,10 +1597,7 @@ pub fn run() -> i32 {
                 bottom: 920,
             });
             {
-                let n = app.config.accounts.len();
-                sync_main_height(&mut app);
-                app.panel.toggle_pin(hwnd, rect, n);
-                apply_appearance(&mut app);
+                app.open_panel(hwnd, rect);
                 app.panel.view = crate::ui::panel::PanelView::AddForm;
                 app.panel.pending_platform = crate::api::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {
@@ -1559,7 +1630,6 @@ pub fn run() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::peak::DEFAULT_PEAK;
 
     #[test]
     fn interval_minutes_parse_to_secs() {
@@ -1586,34 +1656,6 @@ mod tests {
     fn interval_above_cap_clamped() {
         // 1441 分钟 = 86460 秒，超一天上限
         assert_eq!(parse_interval_secs("1441"), Some(MAX_POLL_SECS));
-    }
-
-    #[test]
-    fn peak_range_equal_or_invalid_falls_back() {
-        let mut c = Config::default();
-        c.general.peak_start = "09:00".into();
-        c.general.peak_end = "09:00".into();
-        assert_eq!(peak_range_of(&c), DEFAULT_PEAK);
-        // 格式非法同样回退官方默认
-        c.general.peak_start = "9am".into();
-        assert_eq!(peak_range_of(&c), DEFAULT_PEAK);
-    }
-
-    #[test]
-    fn peak_range_valid_window() {
-        let mut c = Config::default();
-        c.general.peak_start = "09:00".into();
-        c.general.peak_end = "18:00".into();
-        assert_eq!(peak_range_of(&c), (9 * 60, 18 * 60));
-    }
-
-    #[test]
-    fn peak_range_overnight_kept_verbatim() {
-        // start > end 表示跨午夜，原样保留不交换
-        let mut c = Config::default();
-        c.general.peak_start = "22:00".into();
-        c.general.peak_end = "06:00".into();
-        assert_eq!(peak_range_of(&c), (22 * 60, 6 * 60));
     }
 
     #[test]

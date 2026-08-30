@@ -16,6 +16,9 @@ const ABOUT_WND_CLASS: &str = "QuotifyAbout";
 pub struct AboutWindow {
     pub wnd: FloatWnd,
     pub news_expanded: Option<usize>,
+    pub(crate) egg_clicks: u8,
+    pub(crate) egg: Option<crate::ui::panel::anim::Tween>,
+    pub(crate) egg_eaten: bool,
 }
 
 impl AboutWindow {
@@ -23,6 +26,9 @@ impl AboutWindow {
         Self {
             wnd: FloatWnd::new(),
             news_expanded: None,
+            egg_clicks: 0,
+            egg: None,
+            egg_eaten: false,
         }
     }
 
@@ -61,6 +67,9 @@ impl AboutWindow {
     pub fn close(&mut self) {
         // 收起即放弃：展开态一并复位，重开从折叠档起步
         self.news_expanded = None;
+        self.egg_clicks = 0;
+        self.egg = None;
+        self.egg_eaten = false;
         self.wnd.close();
     }
 }

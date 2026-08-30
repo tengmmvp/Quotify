@@ -34,6 +34,9 @@ pub struct PollMessage {
     pub outcome: PollOutcome,
 }
 
+/// 轮询结果的回传通道：轮询线程入队，UI 线程被唤醒后排空。
+pub static POLL_SLOT: crate::platform::post::Slot<PollMessage> = crate::platform::post::Slot::new();
+
 pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
 pub type PollInterval = Arc<Mutex<u64>>;
 pub type PollGeneration = Arc<AtomicU64>;
@@ -171,7 +174,7 @@ fn poll_loop(
             Ok(s) => PollOutcome::Success(Box::new(s)),
             Err(e) => PollOutcome::Failure(Box::new(e)),
         };
-        crate::platform::post::post_boxed(
+        POLL_SLOT.post(
             hwnd,
             WM_APP_POLL_RESULT,
             PollMessage {

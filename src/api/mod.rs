@@ -150,6 +150,31 @@ pub struct UsageSnapshot {
     pub queried_at: DateTime<Local>,
 }
 
+impl UsageSnapshot {
+    /// 明细非空才陈列 MCP 构成区，高度侧与渲染侧同引此判定。
+    pub fn has_mcp_details(&self) -> bool {
+        self.mcp.as_ref().is_some_and(|m| !m.details.is_empty())
+    }
+}
+
+/// 快照 → 主视图高度特征的唯一事实源：(指标行数, 构成区, Token 统计,
+/// 余额)。sync_main_height 的高度入参由此派生，区块陈列判定须与本处
+/// 同源——漏同步的后果是内容被裁或底部留白
+pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> (usize, bool, bool, bool) {
+    match snap {
+        None => (0, false, false, false),
+        Some(s) => (
+            [s.five_hour.is_some(), s.weekly.is_some(), s.mcp.is_some()]
+                .iter()
+                .filter(|b| **b)
+                .count(),
+            s.has_mcp_details(),
+            s.token_stats.is_some(),
+            s.balance.is_some(),
+        ),
+    }
+}
+
 /// Token 消耗合计：今日（本地 0 点起）与近 7 天（7 天前 0 点起）
 #[derive(Debug, Clone, Copy)]
 pub struct TokenStats {
@@ -493,6 +518,77 @@ pub fn parse_token_total(body: &str) -> Result<f64, FetchError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用最小快照：各特征字段按参填，其余取空态。
+    /// mcp 传 Some(n)：桶在场且 n 条明细；Some(0)：桶在场明细空；None：桶缺
+    fn feature_snap(
+        five: bool,
+        weekly: bool,
+        mcp: Option<usize>,
+        stats: bool,
+        bal: bool,
+    ) -> UsageSnapshot {
+        let bucket = || {
+            Some(QuotaBucket {
+                used_percent: 1.0,
+                resets_at: None,
+                total: None,
+                current: None,
+            })
+        };
+        UsageSnapshot {
+            plan_version: PlanVersion::V2,
+            tier: PlanTier::Lite,
+            plan_label: None,
+            five_hour: five.then(bucket).flatten(),
+            weekly: weekly.then(bucket).flatten(),
+            mcp: mcp.map(|n| McpUsage {
+                used_percent: 1.0,
+                current_value: 1.0,
+                total: 100.0,
+                resets_at: None,
+                details: (0..n)
+                    .map(|i| McpDetail {
+                        model_code: format!("m{i}"),
+                        usage: 1.0,
+                    })
+                    .collect(),
+            }),
+            token_stats: stats.then_some(TokenStats {
+                today: 1.0,
+                week: 2.0,
+            }),
+            balance: bal.then_some(Balance::default()),
+            queried_at: Local::now(),
+        }
+    }
+
+    /// 高度特征钉位：桶缺失组合 → 四特征。与 sync_main_height /
+    /// draw_main 的区块陈列判定同源，漂移即面板高度错位
+    #[test]
+    fn main_features_matrix() {
+        assert_eq!(main_features(None), (0, false, false, false));
+        // 三桶齐 + 明细 1 条 + 统计 + 余额
+        assert_eq!(
+            main_features(Some(&feature_snap(true, true, Some(1), true, true))),
+            (3, true, true, true)
+        );
+        // MCP 桶在场但明细空：行数计它、构成区不陈列
+        assert_eq!(
+            main_features(Some(&feature_snap(true, false, Some(0), false, false))),
+            (2, false, false, false)
+        );
+        // 只剩周桶与余额
+        assert_eq!(
+            main_features(Some(&feature_snap(false, true, None, false, true))),
+            (1, false, false, true)
+        );
+        // 空快照（全缺）：零特征
+        assert_eq!(
+            main_features(Some(&feature_snap(false, false, None, false, false))),
+            (0, false, false, false)
+        );
+    }
 
     #[test]
     fn v3_two_credit_buckets_with_mcp() {

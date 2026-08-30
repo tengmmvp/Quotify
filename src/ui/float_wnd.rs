@@ -23,7 +23,7 @@ use crate::ui::{x_of, y_of};
 /// 关闭巡检：前台被夺走即收起[弹窗叠加面板已收起判定]
 const TIMER_SWEEP: usize = 1;
 /// 弹出动画帧时钟
-const TIMER_ANIM: usize = 2;
+pub(crate) const TIMER_ANIM: usize = 2;
 
 /// 浮动窗口种类：wndproc 公共臂据此分派到具体窗口
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -197,7 +197,7 @@ pub(crate) fn float_wndproc(
                     if let Some(r) = renderer.as_mut() {
                         if fresh {
                             r.theme = crate::ui::panel::theme::Theme::new(
-                                crate::app::resolved_appearance(
+                                crate::ui::panel::theme::resolved(
                                     app.config.general.appearance.as_deref(),
                                 ),
                             );
@@ -209,7 +209,9 @@ pub(crate) fn float_wndproc(
                             FloatKind::Popup => r.paint_popup(hwnd, &rect, &model, dpi),
                             FloatKind::About => {
                                 let expanded = app.about.news_expanded;
-                                r.paint_about(hwnd, &rect, &model, expanded, dpi)
+                                let egg = app.about.egg.as_ref().map(|t| t.progress());
+                                let eaten = app.about.egg_eaten;
+                                r.paint_about(hwnd, &rect, &model, expanded, egg, eaten, dpi)
                             }
                         };
                     }
@@ -238,12 +240,29 @@ pub(crate) fn float_wndproc(
                     LRESULT(0)
                 }
                 TIMER_ANIM => {
-                    let app = app_from_tray(hwnd);
-                    let done = app
-                        .and_then(|a| float_of(a, kind).renderer.as_ref())
-                        .and_then(|r| r.anim.appear.as_ref().map(|t| t.finished()))
-                        .unwrap_or(true);
-                    if done {
+                    let mut app = app_from_tray(hwnd);
+                    let mut egg_alive = false;
+                    if let Some(a) = app.as_mut()
+                        && kind == FloatKind::About
+                    {
+                        let finished = a.about.egg.as_ref().is_some_and(|t| t.finished());
+                        if finished {
+                            a.about.egg = None;
+                            a.about.egg_eaten = true;
+                        }
+                        egg_alive = a.about.egg.is_some();
+                    }
+                    let appear_done = app.as_ref().is_none_or(|a| {
+                        let f = match kind {
+                            FloatKind::Popup => &a.popup.wnd,
+                            FloatKind::About => &a.about.wnd,
+                        };
+                        f.renderer
+                            .as_ref()
+                            .and_then(|r| r.anim.appear.as_ref().map(|t| t.finished()))
+                            .unwrap_or(true)
+                    });
+                    if appear_done && !egg_alive {
                         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -304,8 +323,8 @@ pub(crate) fn float_wndproc(
                 if hit_hwnd == hwnd && (lparam.0 & 0xFFFF) as u32 == HTCLIENT {
                     let hand = app_from_tray(hwnd)
                         .and_then(|a| float_of(a, kind).renderer.as_ref())
-                        .map(|r| r.hover.is_some())
-                        .unwrap_or(false);
+                        .and_then(|r| r.hover)
+                        .is_some_and(|h| h != crate::ui::panel::render::Hit::AboutLogo);
                     let cursor = if hand { IDC_HAND } else { IDC_ARROW };
                     if let Ok(c) = LoadCursorW(None, cursor) {
                         let _ = SetCursor(Some(c));

@@ -244,15 +244,13 @@ pub fn save(config: &Config) {
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    // tmp 先行收紧：改名会保留安全描述符，中途被杀也不留宽松 ACL 的
-    // 明文残留；rename 之后的收紧退化为幂等兜底
+    // tmp 先收紧再 rename：改名保留安全描述符，落定后无需再写 ACL，
+    // 省一次 SD 写；tmp 收紧失败的罕见场景由下次启动 load 补紧兜底。
     crate::platform::secure_file_acl(&tmp);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));
         let _ = std::fs::remove_file(&tmp);
-        return;
     }
-    crate::platform::secure_file_acl(&path);
 }
 
 #[cfg(test)]

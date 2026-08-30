@@ -374,8 +374,8 @@ impl Renderer {
                             alpha,
                             model.lang,
                         );
-                        // 明细非空才陈列构成区，与 sync_main_height 判定同源
-                        if !m.details.is_empty() {
+                        // 构成区陈列判定单源于 has_mcp_details，与高度侧同引
+                        if snap.has_mcp_details() {
                             y = self.mcp_composition(target, m, snap.queried_at, y, w, alpha);
                         }
                     }
@@ -575,13 +575,7 @@ impl Renderer {
                         false,
                     );
                 } else if let Some(snap) = model.snapshot {
-                    let fresh = (chrono::Local::now() - snap.queried_at).num_seconds() < 60;
-                    let text = if fresh {
-                        s.updated_just_now.to_string()
-                    } else {
-                        s.updated_ago
-                            .replace("{t}", &fmt::ago(snap.queried_at, model.lang))
-                    };
+                    let text = fmt::updated_text(s, model.lang, snap.queried_at);
                     self.text_aligned(
                         target,
                         &text,
@@ -1086,11 +1080,12 @@ impl Renderer {
         }
     }
 
-    /// 票据合计行：左 label、右数值，中间引导点自动填满；返回下一行 y
+    /// 票据合计行：左 label、右数值，中间引导点自动填满；返回下一行 y。
+    /// label 恒为 i18n 静态文案，测宽走帧内去重缓存。
     unsafe fn leader_row(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: &'static str,
         value: &str,
         y: f32,
         w: f32,
@@ -1124,7 +1119,7 @@ impl Renderer {
             alpha,
         );
         // 引导点铺在 label 右端到数值左端之间的行视觉中心上
-        let label_w = self.measure(label, 12.0, 400, false);
+        let label_w = self.measure_static(label, 12.0, 400, false);
         let cy = y + 10.0;
         let dot = self.brush(target, self.theme.text_tertiary, alpha * 0.55);
         let x = pad + label_w + 8.0;

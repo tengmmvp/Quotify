@@ -43,12 +43,54 @@ pub enum AppearanceChoice {
     Dark,
 }
 
+impl AppearanceChoice {
+    /// 配置字符串 → 选项：未配置 / 未知值都归「跟随系统」，
+    /// 与 explicit_appearance 同口径，控件高亮不错档。
+    pub fn from_setting(setting: Option<&str>) -> Self {
+        match crate::ui::panel::theme::explicit_appearance(setting) {
+            Some(crate::ui::panel::theme::Appearance::Light) => AppearanceChoice::Light,
+            Some(crate::ui::panel::theme::Appearance::Dark) => AppearanceChoice::Dark,
+            None => AppearanceChoice::System,
+        }
+    }
+
+    /// 选项 → 配置字符串：System 写 None（跟随系统）。
+    pub fn to_config(self) -> Option<String> {
+        match self {
+            AppearanceChoice::System => None,
+            AppearanceChoice::Light => Some("light".to_string()),
+            AppearanceChoice::Dark => Some("dark".to_string()),
+        }
+    }
+}
+
 /// 界面语言选择：System = 跟随系统
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LanguageChoice {
     System,
     Zh,
     En,
+}
+
+impl LanguageChoice {
+    /// 配置字符串 → 选项：未配置 / 未知值都归「跟随系统」，
+    /// 与 explicit_lang 同口径，控件高亮不错档。
+    pub fn from_setting(setting: Option<&str>) -> Self {
+        match crate::ui::i18n::explicit_lang(setting) {
+            Some(crate::ui::i18n::Lang::Zh) => LanguageChoice::Zh,
+            Some(crate::ui::i18n::Lang::En) => LanguageChoice::En,
+            None => LanguageChoice::System,
+        }
+    }
+
+    /// 选项 → 配置字符串：System 写 None（跟随系统）。
+    pub fn to_config(self) -> Option<String> {
+        match self {
+            LanguageChoice::System => None,
+            LanguageChoice::Zh => Some("zh".to_string()),
+            LanguageChoice::En => Some("en".to_string()),
+        }
+    }
 }
 
 /// 添加账号的类型选择：个人版 / 团队版，团队仅国内站
@@ -120,6 +162,7 @@ pub enum Hit {
     LinkIssues,
     CopyDiagnostics,
     NewsItem(usize),
+    AboutLogo,
 }
 
 /// Hit 的谓词集中放在枚举旁维护；新增输入框类变体须同步收录
@@ -228,6 +271,7 @@ pub struct Renderer {
     pacman_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
     refresh_geo: Option<ID2D1PathGeometry>,
     dots_geos: HashMap<u32, ID2D1PathGeometry>,
+    u16_buf: std::cell::RefCell<Vec<u16>>,
     dash_style: Option<ID2D1StrokeStyle>,
     mcp_cache: Option<main::McpCompCache>,
 }
@@ -265,6 +309,7 @@ impl Renderer {
                 pacman_geo: None,
                 refresh_geo: None,
                 dots_geos: HashMap::new(),
+                u16_buf: std::cell::RefCell::new(Vec::new()),
                 dash_style: None,
                 mcp_cache: None,
             })
@@ -439,13 +484,21 @@ impl Renderer {
         w
     }
 
+    /// 编码入共享暂存并返回借用
+    fn encode_u16(&self, s: &str) -> std::cell::RefMut<'_, Vec<u16>> {
+        let mut buf = self.u16_buf.borrow_mut();
+        buf.clear();
+        buf.extend(s.encode_utf16());
+        buf
+    }
+
     /// 按 format 建 layout 取宽
     unsafe fn measure_with(&self, fmt: &IDWriteTextFormat, s: &str) -> f32 {
         unsafe {
-            let w16: Vec<u16> = s.encode_utf16().collect();
-            if w16.is_empty() {
+            if s.is_empty() {
                 return 0.0;
             }
+            let w16 = self.encode_u16(s);
             let Ok(layout) = self.dwrite.CreateTextLayout(&w16, fmt, 1.0e6, 1.0e6) else {
                 return 0.0;
             };
@@ -478,16 +531,18 @@ impl Renderer {
         let Some(fmt) = self.format(size, weight, mono) else {
             return (s.to_string(), 0.0);
         };
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        let Ok(layout) = self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6) else {
+        let (layout, w16_len) = {
+            let w16 = self.encode_u16(s);
+            let len = w16.len();
+            (self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6), len)
+        };
+        let Ok(layout) = layout else {
             // 退化路径按整串测量兜底，宽 0 会让跟随元素叠上文本头
             let w = self.measure_with(&fmt, s);
             return (s.to_string(), w);
         };
-        let mut cms = vec![
-            windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default();
-            w16.len()
-        ];
+        let mut cms =
+            vec![windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default(); w16_len];
         let mut n = 0u32;
         if layout.GetClusterMetrics(Some(&mut cms), &mut n).is_err() {
             // 簇度量缺席时截断无从谈起，宽退回整串测量
@@ -504,10 +559,12 @@ impl Renderer {
             w += cm.width;
             units += cm.length as usize;
         }
-        if units >= w16.len() {
+        if units >= w16_len {
             return (s.to_string(), w);
         }
-        let mut out: Vec<u16> = w16[..units].to_vec();
+        // 暂存自 layout 创建后未被改写——会改写的调用都在提前 return
+        // 的失败路径上，可安全读回切片。
+        let mut out: Vec<u16> = self.u16_buf.borrow()[..units].to_vec();
         out.push(0x2026);
         let disp = String::from_utf16_lossy(&out);
         (disp, w + ell_w)
@@ -724,10 +781,11 @@ impl Renderer {
         if nosnap {
             opts |= D2D1_DRAW_TEXT_OPTIONS_NO_SNAP;
         }
-        let w16: Vec<u16> = s.encode_utf16().collect();
-        // 空串跳过：无可绘制内容，也省一次刷子创建
-        if !w16.is_empty() {
+        // 空串跳过：无可绘制内容，也省一次刷子创建；刷子先建——
+        // 编码暂存的借用存活期间不得再借 &mut self。
+        if !s.is_empty() {
             let brush = self.brush(target, color, alpha);
+            let w16 = self.encode_u16(s);
             target.DrawText(
                 &w16,
                 &fmt,

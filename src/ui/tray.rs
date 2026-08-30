@@ -27,7 +27,7 @@ pub static TASKBAR_CREATED: std::sync::LazyLock<u32> = std::sync::LazyLock::new(
 pub struct TrayIcon {
     hwnd: HWND,
     id: u32,
-    registered: bool,
+    pub registered: bool,
 }
 
 fn base_data(hwnd: HWND, id: u32) -> NOTIFYICONDATAW {
@@ -47,27 +47,28 @@ fn write_tip(nid: &mut NOTIFYICONDATAW, tip: &str) {
 }
 
 impl TrayIcon {
-    /// 注册托盘图标：`hwnd` 为接收回调消息的隐藏窗口。注册即带应用名
-    /// tooltip——不带文本的图标在 Win11 上会被系统强行弹空白框
-    pub fn new(hwnd: HWND, hicon: HICON) -> Option<Self> {
+    /// 注册托盘图标，`hwnd` 为回调窗口；注册即带应用名 tooltip——无文本
+    /// 的图标在 Win11 会被强弹空白框。NIM_ADD 间歇失败不丢弃实例，交由
+    /// 重试定时器与 TaskbarCreated 接管。
+    pub fn new(hwnd: HWND, hicon: HICON) -> Self {
         unsafe {
             let mut nid = base_data(hwnd, 1);
             nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
             nid.uCallbackMessage = WM_APP_TRAY;
             nid.hIcon = hicon;
             write_tip(&mut nid, "Quotify");
-            if !Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+            let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+            if !ok {
                 log(&format!(
                     "[Quotify] 托盘 NIM_ADD 失败: {}",
                     windows::core::HRESULT::from_thread()
                 ));
-                return None;
             }
-            Some(Self {
+            Self {
                 hwnd,
                 id: 1,
-                registered: true,
-            })
+                registered: ok,
+            }
         }
     }
 

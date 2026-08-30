@@ -175,7 +175,8 @@ pub(crate) fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<I
         | Hit::LinkRepo
         | Hit::LinkIssues
         | Hit::CopyDiagnostics
-        | Hit::NewsItem(_) => None,
+        | Hit::NewsItem(_)
+        | Hit::AboutLogo => None,
     }
 }
 
@@ -616,10 +617,14 @@ impl Panel {
         }
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
-            let caret_h = self.px(16);
-            // 宽度随 DPI 放大：150% 缩放下 1 物理像素不足 1 逻辑像素，过细难辨
-            let _ = CreateCaret(hwnd, None, self.px(1).max(1), caret_h);
-            let _ = ShowCaret(Some(hwnd));
+            // 仅切换字段时重建：重复建光标会连闪，重复挂 IME 会销毁
+            // 中文组合串；重复聚焦只挪光标位置。
+            if switched {
+                let caret_h = self.px(16);
+                // 宽度随 DPI 放大：150% 缩放下 1 物理像素不足 1 逻辑像素，过细难辨
+                let _ = CreateCaret(hwnd, None, self.px(1).max(1), caret_h);
+                let _ = ShowCaret(Some(hwnd));
+            }
             // 布局只算一次：光标落位与 IME 挂载后的组合窗定位共用同一产物；
             // renderer 缺席（首帧前）以 0 兜底，下次 update_caret 补正
             let cx = if let Some(r) = self.renderer.as_ref() {
@@ -629,7 +634,9 @@ impl Panel {
             } else {
                 0.0
             };
-            self.attach_ime(hwnd, cx);
+            if switched {
+                self.attach_ime(hwnd, cx);
+            }
         }
     }
 
@@ -960,7 +967,7 @@ pub extern "system" fn panel_wndproc(
                         // 逐帧重建主题会反复读注册表
                         if fresh {
                             r.theme = crate::ui::panel::theme::Theme::new(
-                                crate::app::resolved_appearance(
+                                crate::ui::panel::theme::resolved(
                                     app.config.general.appearance.as_deref(),
                                 ),
                             );
@@ -1206,16 +1213,21 @@ pub extern "system" fn panel_wndproc(
                         // 列表收敛在 Hit::is_input_hit，新增输入框时与枚举同文件维护
                         let refocus = hit.is_some_and(|h| h.is_input_hit());
                         if let Some(hit) = hit {
-                            crate::app::handle_panel_hit(app, hit, hwnd);
-                            // start_spin 只置位不挂表：appear 结束时 TIMER_ANIM
-                            // 已被 on_anim_tick KillTimer，刷新/重试点击后须在
-                            // 此补挂，否则旋转不动且 spin 残留到下次开面板
-                            if matches!(
-                                hit,
-                                crate::ui::panel::render::Hit::Refresh
-                                    | crate::ui::panel::render::Hit::Retry
-                            ) {
-                                start_anim(hwnd);
+                            // 模态臂在分派层直接走两段式函数并提前返回：
+                            // 对话框嵌套泵会派发其他消息重取 App，泵后本臂
+                            // 持有的引用已失效，不得再触碰，下方 clear_input
+                            // 同样不可用。输入态不跨弹框——弹框抢焦点即
+                            // KILLFOCUS 清输入，缓冲文本保留与旧路径一致。
+                            match hit {
+                                crate::ui::panel::render::Hit::ExportConfig => {
+                                    crate::app::export_config(hwnd);
+                                    return LRESULT(0);
+                                }
+                                crate::ui::panel::render::Hit::ImportConfig => {
+                                    crate::app::import_config(hwnd);
+                                    return LRESULT(0);
+                                }
+                                _ => crate::app::handle_panel_hit(app, hit, hwnd),
                             }
                         }
                         if !refocus && (app.panel.input.field.is_some() || app.panel.key_revealed) {
@@ -1730,6 +1742,34 @@ mod tests {
         assert_eq!(p.view_height(1), 883);
         p.account_error = true;
         assert_eq!(p.view_height(1), 901);
+    }
+
+    /// 光标点击定位：等宽最近边界、越界钳入、零宽平局取末位、
+    /// 可视窗口偏移下返回绝对位次
+    #[test]
+    fn caret_hit_positions() {
+        let p = Panel::new();
+        let field = InputField::Name;
+        let base = field_geo(field).0 + 6.0;
+        let cl = |widths: &[f32], vis_start: usize| CaretLayout {
+            vis_start,
+            cx: 0.0,
+            widths: widths.to_vec(),
+        };
+        // 等宽表 [0,5,10,15,20]：点击两格之间取近者，等距取小位次
+        let w = cl(&[0.0, 5.0, 10.0, 15.0, 20.0], 0);
+        assert_eq!(p.caret_hit_test(&w, field, base + 2.0), 0);
+        assert_eq!(p.caret_hit_test(&w, field, base + 7.6), 2);
+        assert_eq!(p.caret_hit_test(&w, field, base + 7.4), 1);
+        // 框内左右极端钳入首尾
+        assert_eq!(p.caret_hit_test(&w, field, base - 100.0), 0);
+        assert_eq!(p.caret_hit_test(&w, field, base + 1000.0), 4);
+        // 零宽字符（位次 1→2 同宽）：点击该宽处取末位
+        let zw = cl(&[0.0, 5.0, 5.0, 10.0], 0);
+        assert_eq!(p.caret_hit_test(&zw, field, base + 5.0), 2);
+        // 可视窗口起点偏移：返回绝对位次而非窗口内位次
+        let vs = cl(&[0.0, 5.0, 10.0, 15.0, 20.0], 1);
+        assert_eq!(p.caret_hit_test(&vs, field, base + 5.0), 2);
     }
 
     /// 巡检判定：在场清计时、离面首拍起算、严格大于才收、收后重开

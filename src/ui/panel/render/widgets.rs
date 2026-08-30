@@ -632,7 +632,7 @@ impl Renderer {
 
     /// 构建吃豆人上下两半圆几何（半径 PACMAN_R，局部原点即圆心）。
     /// 半圆的直径边经过圆心，绕圆心旋转即可张合出嘴
-    fn build_pacman_geo(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
+    pub(super) fn build_pacman_geo(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         unsafe {
             let build_half = |clockwise: bool| -> Option<ID2D1PathGeometry> {
                 let geo = self.factory.CreatePathGeometry().ok()?;

@@ -157,7 +157,7 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     } else {
         (plain, bearer.as_str())
     };
-    let params = token_params();
+    let params = token_params(chrono::Local::now());
     // 四路全并行：主数据不被慢附加端点拖住。附加三路用记忆形态首发：
     // 切换轮可能 401 丢块（下轮即对）、主路失败轮照发白费（可忽略）、
     // 端点失败只缺块不拖垮主用量
@@ -206,10 +206,10 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     Ok(snap)
 }
 
-/// Token 统计的区间参数：今日[本地 0 点]与 7 天前 0 点两个起点，加当前
-/// 小时末终点，均已编码为 URL 参数；本地时间换算失败返回 None
-fn token_params() -> Option<(String, String, String)> {
-    let now = chrono::Local::now();
+/// Token 统计区间参数：今日与 7 天前 0 点两起点 + 当前小时末终点，
+/// 空格已编码可直拼 URL；起点换算失败如 DST 交界返 None，两路请求
+/// 都不发，终点失败则退化为当前刻。
+fn token_params(now: chrono::DateTime<chrono::Local>) -> Option<(String, String, String)> {
     let end = now
         .with_minute(59)
         .and_then(|t| t.with_second(59))
@@ -261,24 +261,25 @@ fn stamp(dt: &chrono::DateTime<chrono::Local>) -> String {
 fn fetch_balance(api_key: &str) -> Result<Option<Balance>, FetchError> {
     let url = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report";
     let body = http_get(url, api_key)?;
-    let Some(data) = body.get("data").filter(|d| d.is_object()) else {
-        return Ok(None);
-    };
+    Ok(parse_balance(&body))
+}
+
+/// 余额报告响应解析：availableBalance 优先、balance 回退，两者皆缺
+/// 说明形态未知宁缺毋假；数值字段非有限数按缺处理。
+fn parse_balance(v: &Value) -> Option<Balance> {
+    let data = v.get("data").filter(|d| d.is_object())?;
     let num = |k: &str| {
         data.get(k)
             .and_then(Value::as_f64)
-            .filter(|v| v.is_finite())
+            .filter(|x| x.is_finite())
     };
-    // availableBalance 优先，回退 balance；两者皆缺说明形态未知，宁缺毋假
-    let Some(available) = num("availableBalance").or_else(|| num("balance")) else {
-        return Ok(None);
-    };
-    Ok(Some(Balance {
+    let available = num("availableBalance").or_else(|| num("balance"))?;
+    Some(Balance {
         available,
         recharged: num("rechargeAmount"),
         granted: num("giveAmount"),
         spent: num("totalSpendAmount"),
-    }))
+    })
 }
 
 fn http_get(url: &str, api_key: &str) -> Result<Value, FetchError> {
@@ -362,8 +363,54 @@ fn fetch_quota(
 
 #[cfg(test)]
 mod tests {
-    use super::classify_status;
+    use super::{classify_status, parse_balance, token_params};
     use crate::api::FetchError;
+    use serde_json::json;
+
+    #[test]
+    fn balance_report_shapes() {
+        // 字段齐：availableBalance 优先，三个次级字段随行
+        let b = parse_balance(&json!({
+            "data": {
+                "availableBalance": 12.5,
+                "balance": 99.0,
+                "rechargeAmount": 20.0,
+                "giveAmount": 5.0,
+                "totalSpendAmount": 12.5,
+            }
+        }))
+        .unwrap();
+        assert_eq!(b.available, 12.5);
+        assert_eq!(b.recharged, Some(20.0));
+        assert_eq!(b.granted, Some(5.0));
+        assert_eq!(b.spent, Some(12.5));
+        // 无 availableBalance 时回退 balance
+        let b = parse_balance(&json!({ "data": { "balance": 7.0 } })).unwrap();
+        assert_eq!(b.available, 7.0);
+        assert_eq!(b.recharged, None);
+        // 两者皆缺：形态未知宁缺毋假
+        assert!(parse_balance(&json!({ "data": {} })).is_none());
+        // data 非对象 / 缺失同 None
+        assert!(parse_balance(&json!({ "data": 3 })).is_none());
+        assert!(parse_balance(&json!({})).is_none());
+        // 非有限数按缺处理
+        let b =
+            parse_balance(&json!({ "data": { "balance": 3.0, "rechargeAmount": null } })).unwrap();
+        assert_eq!(b.recharged, None);
+    }
+
+    #[test]
+    fn token_window_params_shape() {
+        use chrono::TimeZone;
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 29, 20, 15, 30)
+            .unwrap();
+        let (today, week, end) = token_params(now).unwrap();
+        // 三值均已百分号编码；终点取当前小时末
+        assert_eq!(today, "2026-08-29%2000:00:00");
+        assert_eq!(week, "2026-08-22%2000:00:00");
+        assert_eq!(end, "2026-08-29%2020:59:59");
+    }
 
     #[test]
     fn status_classification() {

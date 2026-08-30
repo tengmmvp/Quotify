@@ -40,6 +40,15 @@ pub fn parse_hhmm(s: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
+/// 解析高峰区间配置；格式无效或两端相等回退官方默认，
+/// start > end 视为跨午夜原样保留。
+pub fn peak_range(start: &str, end: &str) -> PeakRange {
+    match (parse_hhmm(start), parse_hhmm(end)) {
+        (Some(s), Some(e)) if s != e => (s, e),
+        _ => DEFAULT_PEAK,
+    }
+}
+
 /// 区间显示为 HH:MM–HH:MM
 pub fn fmt_range(range: PeakRange) -> String {
     let hhmm = |t: u32| format!("{:02}:{:02}", t / 60, t % 60);
@@ -102,5 +111,18 @@ mod tests {
         assert_eq!(parse_hhmm("12:60"), None);
         assert_eq!(parse_hhmm("abc"), None);
         assert_eq!(fmt_range(DEFAULT_PEAK), "14:00–18:00");
+    }
+
+    #[test]
+    fn peak_range_config_fallbacks() {
+        // 两端相等回退官方默认
+        assert_eq!(peak_range("09:00", "09:00"), DEFAULT_PEAK);
+        // 格式非法同样回退
+        assert_eq!(peak_range("9am", "18:00"), DEFAULT_PEAK);
+        assert_eq!(peak_range("09:00", "6pm"), DEFAULT_PEAK);
+        // 合法窗口
+        assert_eq!(peak_range("09:00", "18:00"), (9 * 60, 18 * 60));
+        // start > end 表示跨午夜，原样保留不交换
+        assert_eq!(peak_range("22:00", "06:00"), (22 * 60, 6 * 60));
     }
 }

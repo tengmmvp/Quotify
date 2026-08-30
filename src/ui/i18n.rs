@@ -17,13 +17,18 @@ pub fn detect_system_lang() -> Lang {
         .unwrap_or(Lang::En)
 }
 
+/// 配置语言字符串的显式值：Some 为显式 zh/en，None 为跟随系统。
+pub fn explicit_lang(setting: Option<&str>) -> Option<Lang> {
+    match setting.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("zh") => Some(Lang::Zh),
+        Some(s) if s.eq_ignore_ascii_case("en") => Some(Lang::En),
+        _ => None,
+    }
+}
+
 /// 解析配置里的语言设置
 pub fn resolve_lang(setting: Option<&str>) -> Lang {
-    match setting.map(str::trim) {
-        Some(s) if s.eq_ignore_ascii_case("zh") => Lang::Zh,
-        Some(s) if s.eq_ignore_ascii_case("en") => Lang::En,
-        _ => detect_system_lang(),
-    }
+    explicit_lang(setting).unwrap_or_else(detect_system_lang)
 }
 
 /// 全部界面文案

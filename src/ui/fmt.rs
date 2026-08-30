@@ -76,6 +76,16 @@ pub fn as_of_time(at: DateTime<Local>) -> String {
     at.format("%H:%M").to_string()
 }
 
+/// 页脚「数据更新」文案：60 秒内「刚刚更新」，否则相对时长；换装
+/// 动画的 old_text 与静态页脚共用本函数，防两份实现漂移致动画起点错。
+pub fn updated_text(s: &crate::ui::i18n::Strings, lang: Lang, at: DateTime<Local>) -> String {
+    if (Local::now() - at).num_seconds() < 60 {
+        s.updated_just_now.to_string()
+    } else {
+        s.updated_ago.replace("{t}", &ago(at, lang))
+    }
+}
+
 /// 更新时间脚注用的距今时长短表述
 pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
     let secs = (Local::now() - at).num_seconds().clamp(0, i64::MAX);

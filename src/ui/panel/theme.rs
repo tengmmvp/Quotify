@@ -39,6 +39,21 @@ pub struct Theme {
 pub const PANEL_WIDTH: i32 = 340;
 pub const RADIUS: f32 = 4.0;
 
+/// 配置外观字符串的显式值：Some 为显式 light/dark，None 为跟随系统；
+/// 先 trim 再忽略大小写，是字面量解析的唯一事实源，控件高亮与生效同引。
+pub fn explicit_appearance(setting: Option<&str>) -> Option<Appearance> {
+    match setting.map(str::trim) {
+        Some(s) if s.eq_ignore_ascii_case("light") => Some(Appearance::Light),
+        Some(s) if s.eq_ignore_ascii_case("dark") => Some(Appearance::Dark),
+        _ => None,
+    }
+}
+
+/// 解析配置为实际外观：显式优先，未配置/未知跟随系统。
+pub fn resolved(setting: Option<&str>) -> Appearance {
+    explicit_appearance(setting).unwrap_or_else(Theme::system_appearance)
+}
+
 fn rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
     [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0, a]
 }

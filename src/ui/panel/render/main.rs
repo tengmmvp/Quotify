@@ -266,18 +266,13 @@ impl Renderer {
                 target.DrawRoundedRectangle(&card, &edge, 1.0, None);
                 let title_rect = D2D_RECT_F {
                     left: pad + 12.0,
-                    top: card_top + 18.0,
+                    top: card_top + 12.0,
                     right: w - pad - 12.0,
-                    bottom: card_top + 40.0,
+                    bottom: card_top + 50.0,
                 };
-                let (msg, _) = self.ellipsize(
-                    &msg,
-                    13.0,
-                    (title_rect.right - title_rect.left).max(60.0),
-                    500,
-                    false,
-                );
-                self.text_aligned(
+                // 自动换行至多两行：单行文案照常一行，长文第二行
+                // 末按矩形截断。
+                self.text_wrapped(
                     target,
                     &msg,
                     &title_rect,
@@ -285,14 +280,14 @@ impl Renderer {
                     500,
                     self.theme.danger,
                     alpha,
-                    Align::Center,
+                    Align::Left,
                     false,
                 );
                 self.outline_button(
                     target,
                     Hit::Retry,
                     cx - 44.0,
-                    card_top + 50.0,
+                    card_top + 58.0,
                     88.0,
                     28.0,
                     s.retry,

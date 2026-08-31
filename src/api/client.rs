@@ -72,6 +72,33 @@ pub(crate) fn agent_long() -> ureq::Agent {
     agents().long
 }
 
+/// 校验代理地址形态：显式 http:// 或 socks5:// 前缀、host 非空、
+/// 端口 1–65535。ureq 会默认补前缀且不校验端口，须自行解析。
+pub fn proxy_valid(s: &str) -> Result<(), String> {
+    let lower = s.trim().to_ascii_lowercase();
+    let rest = lower
+        .strip_prefix("http://")
+        .or_else(|| lower.strip_prefix("socks5://"))
+        .ok_or("must start with http:// or socks5://")?;
+    let hostport = rest.rsplit_once('@').map(|(_, h)| h).unwrap_or(rest);
+    let (host, port) = match hostport.rfind(']') {
+        Some(i) => (&hostport[..=i], hostport[i + 1..].strip_prefix(':')),
+        None => hostport
+            .rsplit_once(':')
+            .map_or((hostport, None), |(h, p)| (h, Some(p))),
+    };
+    if host.is_empty() {
+        return Err("empty host".into());
+    }
+    if let Some(p) = port {
+        let n: u32 = p.parse().map_err(|_| "invalid port")?;
+        if !(1..=65535).contains(&n) {
+            return Err("port out of range".into());
+        }
+    }
+    Ok(())
+}
+
 /// 设置代理并重建两个 Agent
 pub fn set_proxy(proxy: Option<String>) -> Result<(), String> {
     let proxy = proxy
@@ -363,7 +390,7 @@ fn fetch_quota(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_status, parse_balance, token_params};
+    use super::{classify_status, parse_balance, proxy_valid, token_params};
     use crate::api::FetchError;
     use serde_json::json;
 
@@ -397,6 +424,31 @@ mod tests {
         let b =
             parse_balance(&json!({ "data": { "balance": 3.0, "rechargeAmount": null } })).unwrap();
         assert_eq!(b.recharged, None);
+    }
+
+    #[test]
+    fn proxy_valid_shapes() {
+        // 显式前缀 + 合法结构才放行
+        assert!(proxy_valid("http://127.0.0.1:7890").is_ok());
+        assert!(proxy_valid("socks5://proxy.example.com:1080").is_ok());
+        assert!(proxy_valid("HTTP://host:80").is_ok());
+        assert!(proxy_valid("  http://host:80  ").is_ok());
+        assert!(proxy_valid("http://user:pass@host:8080").is_ok());
+        assert!(proxy_valid("socks5://[::1]:1080").is_ok());
+        assert!(proxy_valid("http://localhost").is_ok());
+        // ureq 会默认补 scheme 的裸主机名，全部拦下
+        assert!(proxy_valid("127").is_err());
+        assert!(proxy_valid("127.0.0.1:7890").is_err());
+        assert!(proxy_valid("localhost").is_err());
+        // 前缀对但结构坏，自行解析拦下
+        assert!(proxy_valid("http://").is_err());
+        assert!(proxy_valid("http://host:notaport").is_err());
+        assert!(proxy_valid("http://host:0").is_err());
+        assert!(proxy_valid("http://host:99999").is_err());
+        assert!(proxy_valid("ftp://host:21").is_err());
+        // 裸 IPv6 无方括号在结构校验滑过，由 ureq 的 Uri 解析兜底拒绝
+        assert!(proxy_valid("http://::1").is_ok());
+        assert!(ureq::Proxy::new("http://::1").is_err());
     }
 
     #[test]

@@ -178,6 +178,13 @@ impl Hit {
                 Self::CustomizeInterval | Self::AddAccount | Self::RevealKey
             )
     }
+
+    /// 模态类命中：分派必须走窗口过程层拦截直调两段式，进
+    /// handle_panel_hit 即接线错误。新增模态变体时同步登记
+    /// crate::app::dispatch_modal。
+    pub(crate) fn is_modal(&self) -> bool {
+        matches!(self, Self::ExportConfig | Self::ImportConfig)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

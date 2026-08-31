@@ -124,9 +124,9 @@ impl App {
             news_fetched: false,
             autostart_enabled: crate::platform::autostart::is_enabled(),
             last_icon_key: None,
-            threshold_armed_5h: true,
+            threshold_armed_5h: false,
             last_reset_5h: None,
-            threshold_armed_weekly: true,
+            threshold_armed_weekly: false,
             last_reset_weekly: None,
             last_logged_error: None,
         }
@@ -320,6 +320,10 @@ impl App {
         sync_main_height(self);
         self.panel.toggle_pin(tray, anchor, n);
         apply_appearance(self);
+        // 打开时若已处某窗口末分钟，立即把心跳切到秒拍，不等首个 tick。
+        if let Some(h) = self.panel.hwnd {
+            crate::ui::panel::retune_minute(self, h);
+        }
     }
 
     /// 托盘右键菜单。文案取 &'static 不借 App：TrackPopupMenu 的嵌套泵
@@ -669,6 +673,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::Settings => {
             app.panel.view = crate::ui::panel::PanelView::Settings;
             sync_customizing(app);
+            // 代理框预填当前生效值，用户可改可清空；清空应用即直连
+            if app.panel.input.proxy.is_empty()
+                && let Some(p) = app.config.general.proxy.clone()
+            {
+                app.panel.input.proxy = p;
+            }
             relayout_panel(app, panel_hwnd);
         }
         Hit::AccountSwitch => {
@@ -1047,6 +1057,20 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     if key.is_empty() {
         return;
     }
+    if app.panel.pending_team {
+        let missing = if app.panel.input.org.trim().is_empty() {
+            Some(crate::ui::panel::InputField::Org)
+        } else if app.panel.input.project.trim().is_empty() {
+            Some(crate::ui::panel::InputField::Project)
+        } else {
+            None
+        };
+        if let Some(field) = missing {
+            crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_team_required);
+            app.panel.focus_input(panel_hwnd, field);
+            return;
+        }
+    }
     // 名称留空默认 Default
     let name = if name.is_empty() {
         "Default".to_string()
@@ -1187,11 +1211,23 @@ fn refit_about(app: &mut App) {
 /// 应用网络代理；立即重建连接并触发一次拉取验证
 fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     let raw = app.panel.input.proxy.trim().to_string();
-    app.config.general.proxy = if raw.is_empty() { None } else { Some(raw) };
-    crate::app::config::save(&app.config);
-    if let Err(e) = crate::api::client::set_proxy(app.config.general.proxy.clone()) {
-        crate::platform::log(&format!("[Quotify] 代理地址无效，保持原连接: {e}"));
+    let next = if raw.is_empty() { None } else { Some(raw) };
+    // 校验先行：无效地址不落盘——坏值一旦持久化，此后每次启动都
+    // 静默降级直连；失败保留输入框现场供修改。
+    if let Some(p) = next.as_deref()
+        && let Err(e) = crate::api::client::proxy_valid(p)
+    {
+        crate::platform::log(&format!("[Quotify] 代理地址无效，未保存: {e}"));
+        crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_proxy_invalid);
+        return;
     }
+    if let Err(e) = crate::api::client::set_proxy(next.clone()) {
+        crate::platform::log(&format!("[Quotify] 代理设置失败，未保存: {e}"));
+        crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_proxy_invalid);
+        return;
+    }
+    app.config.general.proxy = next;
+    crate::app::config::save(&app.config);
     app.panel.clear_input(panel_hwnd);
     // 换代理后的拉取是新尝试轮次，同文案失败再现时也重记日志
     app.last_logged_error = None;
@@ -1243,6 +1279,17 @@ fn confirm_box(owner: HWND, title: &str, body: &str) -> bool {
         )
     };
     r == IDOK
+}
+
+/// 模态类命中的直调分派：此类命中进 handle_panel_hit 会因嵌套泵
+/// 引用失效，由分派层按 is_modal 拦截转此。新增模态变体时与
+/// is_modal 同步登记，误入仅留日志。
+pub fn dispatch_modal(hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
+    match hit {
+        crate::ui::panel::render::Hit::ExportConfig => export_config(panel_hwnd),
+        crate::ui::panel::render::Hit::ImportConfig => import_config(panel_hwnd),
+        _ => crate::platform::log("[Quotify] 非模态命中误入 dispatch_modal"),
+    }
 }
 
 /// 导出配置为明文 JSON。两段式取引用：模态对话框跑嵌套消息泵，泵内
@@ -1525,6 +1572,9 @@ pub fn run() -> i32 {
         }
         let app = Box::new(App::new(config));
         let mut app = app;
+        // 启动即套外观，未开面板前的首次右键菜单也带主题；此刻
+        // renderer 均未建立，无副作用。
+        apply_appearance(&mut app);
 
         let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
         let hinst = hinst.unwrap_or_default();

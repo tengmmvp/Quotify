@@ -247,6 +247,8 @@ pub struct Panel {
     pub(crate) main_h: i32,
     pub(crate) account_error: bool,
     pub(crate) anim_period: u32,
+    /// 分钟心跳当前周期：倒计时末分钟切秒拍，跨 tick 记忆避免重设。
+    minute_period: std::cell::Cell<u32>,
     pub(crate) outside_since: Option<u64>,
     painted: bool,
     caret_cache: std::cell::RefCell<Option<CaretCacheEntry>>,
@@ -271,6 +273,7 @@ impl Panel {
             main_h: 300,
             account_error: false,
             anim_period: 0,
+            minute_period: std::cell::Cell::new(0),
             caret_ctx: (false, false),
             selecting: false,
             text_clicks: None,
@@ -484,6 +487,7 @@ impl Panel {
             // 巡检首延给足弹出宽限，防弹出瞬间即被误收回
             SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 1200, None);
             SetTimer(Some(hwnd), TIMER_MINUTE_TICK, 60_000, None);
+            self.minute_period.set(60_000);
             let _ = InvalidateRect(Some(hwnd), None, true);
         }
     }
@@ -520,6 +524,7 @@ impl Panel {
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
+            self.minute_period.set(0);
         }
         // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积；
         // 悬停高亮与命中区一并清，重开首帧不带旧状态
@@ -917,6 +922,40 @@ pub(crate) unsafe fn start_anim(hwnd: HWND) {
     }
 }
 
+/// 分钟心跳随最近重置时刻变拍：末分钟切秒拍让读数逐秒走，重置后
+/// 回分钟拍；周期变化才重设。
+pub(crate) fn retune_minute(app: &crate::app::App, hwnd: HWND) {
+    let now = chrono::Utc::now();
+    let soonest = app.data.snapshot.as_ref().and_then(|s| {
+        [s.five_hour.as_ref(), s.weekly.as_ref()]
+            .into_iter()
+            .flatten()
+            .filter_map(|b| b.resets_at)
+            .filter(|t| *t > now)
+            .min()
+    });
+    let want = minute_period(soonest, now);
+    if app.panel.minute_period.get() != want {
+        unsafe {
+            let _ = SetTimer(Some(hwnd), TIMER_MINUTE_TICK, want, None);
+        }
+        app.panel.minute_period.set(want);
+    }
+}
+
+/// 周期判定与时间源解耦，供测试钉位。切分点与 countdown 显示切分
+/// 对齐：剩余整 60 秒仍显示「N 分」走分拍，59 秒起切秒拍。
+fn minute_period(
+    soonest: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> u32 {
+    if soonest.is_some_and(|t| t > now && (t - now).num_seconds() < 60) {
+        1000
+    } else {
+        60_000
+    }
+}
+
 /// 离面巡检的单步判定：present 为四路保活（在面板/弹窗、输入中、
 /// 托盘锚区、拖动中）任一命中。在场即清计时；离面从首拍起算，超时
 /// 返回 true（应收起）并清计时。纯函数，Win32 侧只负责采集布尔与时钟
@@ -1019,6 +1058,9 @@ pub extern "system" fn panel_wndproc(
                     // WM_PAINT 本就整窗重绘，收窄失效矩形省不下绘制开销
                     TIMER_MINUTE_TICK => {
                         let _ = InvalidateRect(Some(hwnd), None, false);
+                        if let Some(app) = app_from_tray(hwnd) {
+                            retune_minute(app, hwnd);
+                        }
                         LRESULT(0)
                     }
                     TIMER_OUTSIDE_CHECK => {
@@ -1226,22 +1268,16 @@ pub extern "system" fn panel_wndproc(
                         // 列表收敛在 Hit::is_input_hit，新增输入框时与枚举同文件维护
                         let refocus = hit.is_some_and(|h| h.is_input_hit());
                         if let Some(hit) = hit {
-                            // 模态臂在分派层直接走两段式函数并提前返回：
-                            // 对话框嵌套泵会派发其他消息重取 App，泵后本臂
-                            // 持有的引用已失效，不得再触碰，下方 clear_input
-                            // 同样不可用。输入态不跨弹框——弹框抢焦点即
+                            // 模态命中统一拦截直调两段式并提前返回：对话框
+                            // 嵌套泵会派发其他消息重取 App，泵后本臂持有的
+                            // 引用已失效，不得再触碰，下方 clear_input 同样
+                            // 不可用。输入态不跨弹框——弹框抢焦点即
                             // KILLFOCUS 清输入，缓冲文本保留与旧路径一致。
-                            match hit {
-                                crate::ui::panel::render::Hit::ExportConfig => {
-                                    crate::app::export_config(hwnd);
-                                    return LRESULT(0);
-                                }
-                                crate::ui::panel::render::Hit::ImportConfig => {
-                                    crate::app::import_config(hwnd);
-                                    return LRESULT(0);
-                                }
-                                _ => crate::app::handle_panel_hit(app, hit, hwnd),
+                            if hit.is_modal() {
+                                crate::app::dispatch_modal(hit, hwnd);
+                                return LRESULT(0);
                             }
+                            crate::app::handle_panel_hit(app, hit, hwnd);
                         }
                         if !refocus && (app.panel.input.field.is_some() || app.panel.key_revealed) {
                             app.panel.clear_input(hwnd);
@@ -1829,6 +1865,20 @@ mod tests {
         assert_eq!(Panel::blink_phase(1000), (true, 500));
         assert_eq!(Panel::blink_phase(1499), (true, 1));
         assert_eq!(Panel::blink_phase(1500), (false, 500));
+    }
+
+    /// 心跳变拍切分：整 60 秒走分拍、59 秒切秒拍、过期与缺失走分拍。
+    #[test]
+    fn minute_period_boundaries() {
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 8, 31, 12, 0, 0).unwrap();
+        let at = |s: i64| now + chrono::Duration::seconds(s);
+        assert_eq!(minute_period(None, now), 60_000);
+        assert_eq!(minute_period(Some(at(60)), now), 60_000);
+        assert_eq!(minute_period(Some(at(59)), now), 1000);
+        assert_eq!(minute_period(Some(at(1)), now), 1000);
+        // 过期时刻走分拍，等新数据换新时刻
+        assert_eq!(minute_period(Some(at(-5)), now), 60_000);
     }
 
     /// 巡检判定：在场清计时、离面首拍起算、严格大于才收、收后重开

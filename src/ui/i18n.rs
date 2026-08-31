@@ -182,6 +182,8 @@ pub struct Strings {
     pub notify_reset_weekly: &'static str,
     pub notify_config_broken: &'static str,
     pub notify_diag_copied: &'static str,
+    pub notify_proxy_invalid: &'static str,
+    pub notify_team_required: &'static str,
 }
 
 const ZH: Strings = Strings {
@@ -325,6 +327,8 @@ const ZH: Strings = Strings {
     notify_reset_weekly: "周额度已重置",
     notify_config_broken: "config.toml 解析失败，已回退默认配置，原文件留档为 config.toml.bak，账号与设置需重新配置",
     notify_diag_copied: "诊断信息已复制到剪贴板",
+    notify_proxy_invalid: "代理地址无效，未保存",
+    notify_team_required: "团队账号需填写组织 ID 与项目 ID",
 };
 
 const EN: Strings = Strings {
@@ -468,6 +472,8 @@ const EN: Strings = Strings {
     notify_reset_weekly: "Weekly quota has reset",
     notify_config_broken: "config.toml failed to parse; defaults restored and the original saved as config.toml.bak. Accounts and settings need to be re-entered",
     notify_diag_copied: "Diagnostics copied to clipboard",
+    notify_proxy_invalid: "Invalid proxy address; not saved",
+    notify_team_required: "Team accounts require Organization ID and Project ID",
 };
 
 impl Lang {

@@ -155,7 +155,7 @@ impl Renderer {
             self.refresh_geo = self.build_refresh_glyph();
         }
         if let Some(geo) = self.refresh_geo.clone() {
-            let (s, c) = spin.sin_cos();
+            let (s, c) = (-spin).sin_cos();
             target.SetTransform(&Matrix3x2 {
                 M11: c,
                 M12: s,

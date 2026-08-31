@@ -82,7 +82,9 @@ impl Renderer {
                 alpha,
             );
             y = self.sub_label(target, s.account_type_label, pad, y, cw, alpha);
-            let team = panel.pending_team;
+            // 行集与 y 链跟随生效布局
+            let team = panel.layout_team;
+            let team_sel = panel.pending_team;
             let types: [(Hit, &str); 2] = [
                 (Hit::AccountType(ScopeChoice::Personal), s.type_personal),
                 (Hit::AccountType(ScopeChoice::Team), s.type_team),
@@ -90,7 +92,7 @@ impl Renderer {
             y = self.segmented_raw(
                 target,
                 &types,
-                |h| matches!(h, Hit::AccountType(v) if team == matches!(*v, ScopeChoice::Team)),
+                |h| matches!(h, Hit::AccountType(v) if team_sel == matches!(*v, ScopeChoice::Team)),
                 pad,
                 y,
                 cw,
@@ -299,7 +301,7 @@ impl Renderer {
             cw,
             alpha,
         );
-        if panel.customizing_interval {
+        if panel.layout_customizing {
             // y 钉在 layout::interval_input_y，与光标、高度公式同源
             let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
             let input = &panel.input;
@@ -385,7 +387,7 @@ impl Renderer {
             + layout::peak_input_y(
                 model.accounts_count > 0,
                 panel.account_error,
-                panel.customizing_interval,
+                panel.layout_customizing,
             );
         // 当前配置值作为弱色占位提示，输入即覆盖，无需删除
         let start_buf = panel.input.peak_start.as_str();
@@ -532,7 +534,7 @@ impl Renderer {
             + layout::proxy_input_y(
                 model.accounts_count > 0,
                 panel.account_error,
-                panel.customizing_interval,
+                panel.layout_customizing,
             );
         self.input_field(
             panel,

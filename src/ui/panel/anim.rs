@@ -1,9 +1,15 @@
 //! 动画系统
 
-/// 三次缓出
+/// 三次缓出：展开方向用，快起慢收。
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
+}
+
+/// 三次缓入：收缩方向用，慢起快收。
+pub fn ease_in_cubic(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t.powi(3)
 }
 
 /// 单条动画的时间状态
@@ -58,6 +64,9 @@ mod tests {
         assert_eq!(ease_out_cubic(0.0), 0.0);
         assert_eq!(ease_out_cubic(1.0), 1.0);
         assert!((ease_out_cubic(0.5) - 0.875).abs() < 1e-6);
+        assert_eq!(ease_in_cubic(0.0), 0.0);
+        assert_eq!(ease_in_cubic(1.0), 1.0);
+        assert_eq!(ease_in_cubic(0.5), 0.125);
     }
 
     #[test]

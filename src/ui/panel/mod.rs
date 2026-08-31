@@ -82,6 +82,15 @@ pub enum InputField {
     Project,
 }
 
+/// 一次高度过渡：起点高、目标高、计时与发起视图
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeightAnim {
+    pub(crate) from: i32,
+    pub(crate) to: i32,
+    pub(crate) tween: anim::Tween,
+    pub(crate) view: PanelView,
+}
+
 /// 自绘输入缓冲；字段序同 InputField
 #[derive(Default)]
 pub struct PanelInput {
@@ -230,9 +239,11 @@ pub struct Panel {
     pub renderer: Option<Renderer>,
     pub pending_platform: crate::api::Platform,
     pub pending_team: bool,
+    pub layout_team: bool,
     pub input: PanelInput,
     pub(crate) key_revealed: bool,
     pub customizing_interval: bool,
+    pub layout_customizing: bool,
     pub(crate) caret_ctx: (bool, bool),
     pub(crate) selecting: bool,
     pub(crate) text_clicks: Option<(u32, i32, i32, u8)>,
@@ -247,6 +258,7 @@ pub struct Panel {
     pub(crate) main_h: i32,
     pub(crate) account_error: bool,
     pub(crate) anim_period: u32,
+    pub(crate) height_anim: Option<HeightAnim>,
     /// 分钟心跳当前周期：倒计时末分钟切秒拍，跨 tick 记忆避免重设。
     minute_period: std::cell::Cell<u32>,
     pub(crate) outside_since: Option<u64>,
@@ -267,12 +279,15 @@ impl Panel {
             renderer: None,
             pending_platform: crate::api::Platform::Cn,
             pending_team: false,
+            layout_team: false,
             input: PanelInput::default(),
             key_revealed: false,
             customizing_interval: false,
+            layout_customizing: false,
             main_h: 300,
             account_error: false,
             anim_period: 0,
+            height_anim: None,
             minute_period: std::cell::Cell::new(0),
             caret_ctx: (false, false),
             selecting: false,
@@ -299,16 +314,19 @@ impl Panel {
 
     /// 面板当前视图的逻辑高度
     pub(crate) fn view_height(&self, accounts: usize) -> i32 {
+        self.view_height_for(self.layout_team, self.layout_customizing, accounts)
+    }
+
+    /// 指定布局组合的逻辑高度：收缩过渡启动时按目标布局求终点
+    pub(crate) fn view_height_for(&self, team: bool, customizing: bool, accounts: usize) -> i32 {
         match self.view {
             // 动态：随指标行数 / 余额 / 副标题伸缩，由 sync_main_height 维护
             PanelView::Main => self.main_h,
-            PanelView::AddForm => layout::add_page_height(self.pending_team),
+            PanelView::AddForm => layout::add_page_height(team),
             // 整页高度由 layout 的段常量链求和，与 draw_settings 的 y 推进链同源
-            PanelView::Settings => layout::settings_view_height(
-                accounts > 0,
-                self.account_error,
-                self.customizing_interval,
-            ),
+            PanelView::Settings => {
+                layout::settings_view_height(accounts > 0, self.account_error, customizing)
+            }
         }
     }
 
@@ -406,15 +424,54 @@ impl Panel {
             let _ = GetMonitorInfoW(monitor, &mut mi);
             self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
+            // 高度过渡进行中窗口几何归动画帧独占，外部重排让位；
+            // 跨视图过渡已被 relayout 终止，拖动中无动画不判。
+            if !show
+                && self.drag_offset.is_none()
+                && self.height_anim.is_some_and(|a| a.view == self.view)
+            {
+                return;
+            }
+
             let w = self.px(PANEL_WIDTH);
+            // 当前窗口矩形一次取回：拖动定位、动画起点与跳变判定共用
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let cur_h = wr.bottom - wr.top;
+            // 拖过（含拖动中）保持完整高、允许遮住任务栏——移动与重排交替
+            // 改高会闪跳；锚点弹出仍以工作区为界压扁，防矮屏出屏
+            let target_h = if moved {
+                self.px(logical_h)
+            } else {
+                let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
+                self.px(logical_h).min(max_h)
+            };
+            // 展开走过渡动画渐扩揭露；收缩由切换点收窗渐裁不经此路。
+            // 弹出、拖动中与减动效直接落位；拖过照常过渡，帧保持位置。
+            let animate = !show
+                && self.drag_offset.is_none()
+                && cur_h < target_h
+                && IsWindowVisible(hwnd).as_bool()
+                && anim::animations_allowed();
+            if animate {
+                self.height_anim = Some(HeightAnim {
+                    from: cur_h,
+                    to: target_h,
+                    tween: anim::Tween::now(150),
+                    view: self.view,
+                });
+                let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
+                self.anim_period = 16;
+            } else {
+                self.height_anim = None;
+            }
+            let h = if animate { cur_h } else { target_h };
             let (x, y) = if moved {
-                let mut wr = RECT::default();
-                let _ = GetWindowRect(hwnd, &mut wr);
                 (wr.left, wr.top)
             } else if let Some(anchor) = self.anchor {
                 let ax = (anchor.left + anchor.right) / 2;
                 let mut x = ax - w / 2;
-                let mut y = anchor.top - self.px(logical_h) - self.px(8);
+                let mut y = anchor.top - h - self.px(8);
                 if x < mi.rcWork.left + 8 {
                     x = mi.rcWork.left + 8;
                 }
@@ -428,24 +485,69 @@ impl Panel {
             } else {
                 (0, 0)
             };
-            // 拖过（含拖动中）保持完整高、允许遮住任务栏——移动与重排交替
-            // 改高会闪跳；锚点弹出仍以工作区为界压扁，防矮屏出屏
-            let h = if moved {
+            // 落位带 SWP_NOCOPYBITS：CopyBits 先写屏再被重绘覆盖，两次
+            // 写屏错位即闪影；拖动平移正需内容跟随，例外不带。
+            let flags = if show {
+                SWP_SHOWWINDOW | SWP_NOCOPYBITS
+            } else if moved {
+                SWP_NOACTIVATE
+            } else {
+                SWP_NOACTIVATE | SWP_NOCOPYBITS
+            };
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
+            // 可见高按屏幕内真实视口计，越出屏幕底的部分不算；展开动画
+            // 首帧停旧位，顶边须按目标高反推终态，否则估小放出假滚动。
+            let final_y = if moved {
+                y
+            } else if let Some(anchor) = self.anchor {
+                (anchor.top - target_h - self.px(8)).max(mi.rcWork.top + 8)
+            } else {
+                y
+            };
+            let visible = target_h.min((mi.rcMonitor.bottom - final_y).max(0));
+            self.refresh_scroll(logical_h, visible);
+        }
+    }
+
+    /// 目标更矮且动效可用时启动收缩过渡：布局保持出发态、窗口先收
+    /// 渐裁，结束或打断由调用方追平。`logical_h` 接逻辑高度。
+    pub(crate) fn begin_shrink_anim(&mut self, hwnd: HWND, logical_h: i32) -> bool {
+        unsafe {
+            // 拖动进行中不启动：拖动帧即时落位，与过渡帧互相打架；
+            // 拖过（非拖动中）照常过渡，动画帧保持当前位置
+            if self.drag_offset.is_some() {
+                return false;
+            }
+            // 拖动态与 place 的 moved 分支同款完整高；锚点弹出以工作区
+            // 为界压扁，防矮屏出屏
+            let target_h = if self.dragged {
                 self.px(logical_h)
             } else {
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                let _ = GetMonitorInfoW(monitor, &mut mi);
                 let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
                 self.px(logical_h).min(max_h)
             };
-            let flags = if show {
-                SWP_SHOWWINDOW | SWP_NOCOPYBITS
-            } else {
-                SWP_NOCOPYBITS
-            };
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
-            // 滚动按屏幕内真实可见高度计：面板浮于任务栏之上，遮住任务
-            // 栏的部分同样可见，仅视口越出屏幕底的部分不算可见
-            let visible = h.min((mi.rcMonitor.bottom - y).max(0));
-            self.refresh_scroll(logical_h, visible);
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let cur_h = wr.bottom - wr.top;
+            if target_h >= cur_h || !IsWindowVisible(hwnd).as_bool() || !anim::animations_allowed()
+            {
+                return false;
+            }
+            self.height_anim = Some(HeightAnim {
+                from: cur_h,
+                to: target_h,
+                tween: anim::Tween::now(150),
+                view: self.view,
+            });
+            let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
+            self.anim_period = 16;
+            true
         }
     }
 
@@ -524,6 +626,10 @@ impl Panel {
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
             let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
+            self.height_anim = None;
+            // 收起即追平：下次开门的高度与行集按所选值走，不携带冻结残留
+            self.layout_team = self.pending_team;
+            self.layout_customizing = self.customizing_interval;
             self.minute_period.set(0);
         }
         // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积；
@@ -789,11 +895,11 @@ impl Panel {
             }
             InputField::Proxy => {
                 let (has_account, auth_error) = self.caret_ctx;
-                layout::proxy_input_y(has_account, auth_error, self.customizing_interval)
+                layout::proxy_input_y(has_account, auth_error, self.layout_customizing)
             }
             InputField::PeakStart | InputField::PeakEnd => {
                 let (has_account, auth_error) = self.caret_ctx;
-                layout::peak_input_y(has_account, auth_error, self.customizing_interval)
+                layout::peak_input_y(has_account, auth_error, self.layout_customizing)
             }
             InputField::Name => layout::ADD_NAME_Y,
             InputField::Key => layout::ADD_KEY_Y,
@@ -1549,6 +1655,19 @@ pub extern "system" fn panel_wndproc(
                     if hit_none {
                         let mut wr = RECT::default();
                         let _ = GetWindowRect(hwnd, &mut wr);
+                        // 拖动接管位置，进行中的过渡让位并追平、调和焦点；
+                        // 平移靠 CopyBits 不重绘，须显式失效防停在出发布局。
+                        // 追平即落位：原地松开不走拖动路径，窗口会卡在
+                        // 动画中间高度。
+                        app.panel.height_anim = None;
+                        app.panel.layout_team = app.panel.pending_team;
+                        app.panel.layout_customizing = app.panel.customizing_interval;
+                        crate::app::reconcile_fading_focus(app, hwnd);
+                        let n = app.config.accounts.len();
+                        let logical_h = app.panel.view_height(n);
+                        app.panel.place(hwnd, logical_h, false);
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        let _ = GetWindowRect(hwnd, &mut wr);
                         app.panel.drag_offset = Some((cursor.x - wr.left, cursor.y - wr.top));
                         let _ = SetCapture(hwnd);
                     }
@@ -1586,7 +1705,10 @@ pub extern "system" fn panel_wndproc(
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                     app.panel.dpi = ((wparam.0 >> 16) & 0xFFFF) as u32 as f32 / 96.0;
-                    // 视口物理高变了，滚动上限随新 dpi 重算
+                    app.panel.height_anim = None;
+                    app.panel.layout_team = app.panel.pending_team;
+                    app.panel.layout_customizing = app.panel.customizing_interval;
+                    crate::app::reconcile_fading_focus(app, hwnd);
                     let logical_h = app.panel.view_height(app.config.accounts.len());
                     app.panel
                         .refresh_scroll(logical_h, suggested.bottom - suggested.top);
@@ -1660,6 +1782,65 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             // 页脚换装独占时帧率减半：文字滑动 30fps 足够，整窗重绘的
             // CPU 砍半；淡入/旋转在场维持满帧
             footer_only = footer_active && !appear_active && !spin_active;
+        }
+        // 高度过渡：逐帧插值，锚定与夹取同 place，结束帧即终值；
+        // NOCOPYBITS 防每帧 CopyBits 双写屏闪影，展开缓出、收缩缓入。
+        if let Some(a) = app.panel.height_anim {
+            done = false;
+            footer_only = false;
+            let p = if a.to > a.from {
+                anim::ease_out_cubic(a.tween.progress())
+            } else {
+                anim::ease_in_cubic(a.tween.progress())
+            };
+            let h = a.from + ((a.to - a.from) as f32 * p).round() as i32;
+            let mut wr = RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            // 拖动态保持当前位置只改高度；锚点弹出按托盘锚定、顶边夹取
+            // 与 place 同款
+            if app.panel.dragged || app.panel.drag_offset.is_some() {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    wr.left,
+                    wr.top,
+                    wr.right - wr.left,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+                repaint = true;
+            } else if let Some(anchor) = app.panel.anchor {
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                let mut mi = MONITORINFO {
+                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                    ..Default::default()
+                };
+                let _ = GetMonitorInfoW(monitor, &mut mi);
+                let y = (anchor.top - h - app.panel.px(8)).max(mi.rcWork.top + 8);
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    wr.left,
+                    y,
+                    wr.right - wr.left,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
+                repaint = true;
+            }
+            if a.tween.finished() {
+                app.panel.height_anim = None;
+                // 收缩到位：生效布局追平所选值。窗口已在终点高度，
+                // 重排直接落位不产生二次动画
+                if app.panel.layout_team != app.panel.pending_team
+                    || app.panel.layout_customizing != app.panel.customizing_interval
+                {
+                    app.panel.layout_team = app.panel.pending_team;
+                    app.panel.layout_customizing = app.panel.customizing_interval;
+                    crate::app::reconcile_fading_focus(app, hwnd);
+                    crate::app::relayout_panel(app, hwnd);
+                }
+            }
         }
         let anim_active = !done;
         // 输入态光标闪烁：时钟保活，仅相位跨过翻转点才整窗重绘；
@@ -1819,7 +2000,7 @@ mod tests {
         p.view = PanelView::Settings;
         assert_eq!(p.view_height(0), 797);
         assert_eq!(p.view_height(1), 845);
-        p.customizing_interval = true;
+        p.layout_customizing = true;
         assert_eq!(p.view_height(0), 835);
         assert_eq!(p.view_height(1), 883);
         p.account_error = true;

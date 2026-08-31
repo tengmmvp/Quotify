@@ -716,14 +716,14 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
-            relayout_panel(app, panel_hwnd);
+            sync_layout_effective(app, panel_hwnd);
         }
         Hit::CustomizeInterval => {
             app.panel.customizing_interval = true;
             if app.panel.input.interval.trim().is_empty() {
                 prefill_interval(app);
             }
-            relayout_panel(app, panel_hwnd);
+            sync_layout_effective(app, panel_hwnd);
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Interval);
         }
@@ -836,8 +836,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 // 团队版仅国内站：类型切团队时平台同步回国内
                 app.panel.pending_platform = crate::api::Platform::Cn;
             }
-            collapse_team_focus(app, panel_hwnd);
-            relayout_panel(app, panel_hwnd);
+            reconcile_fading_focus(app, panel_hwnd);
+            sync_layout_effective(app, panel_hwnd);
         }
         Hit::InputName => {
             app.panel
@@ -873,8 +873,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 // 团队版仅国内站：切到国际版时类型同步回个人版
                 app.panel.pending_team = false;
             }
-            collapse_team_focus(app, panel_hwnd);
-            relayout_panel(app, panel_hwnd);
+            reconcile_fading_focus(app, panel_hwnd);
+            sync_layout_effective(app, panel_hwnd);
         }
 
         // ── 设置 · 配置管理与关于 ──
@@ -1037,15 +1037,18 @@ pub(crate) fn select_account(app: &mut App, i: usize) {
     }
 }
 
-/// 团队输入行收起时清除残留焦点，避免键盘输入写入已隐藏的缓冲。
-fn collapse_team_focus(app: &mut App, panel_hwnd: HWND) {
+/// 焦点落在已收起的输入行上时清输入态，防孤儿光标与误写入；
+/// 切换即时与过渡追平两处调用
+pub(crate) fn reconcile_fading_focus(app: &mut App, panel_hwnd: HWND) {
     use crate::ui::panel::InputField;
-    if !app.panel.pending_team
+    let fading_team = !app.panel.pending_team
         && matches!(
             app.panel.input.field,
             Some(InputField::Org) | Some(InputField::Project)
-        )
-    {
+        );
+    let fading_custom =
+        !app.panel.customizing_interval && app.panel.input.field == Some(InputField::Interval);
+    if fading_team || fading_custom {
         app.panel.clear_input(panel_hwnd);
     }
 }
@@ -1128,7 +1131,7 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     }
     sync_customizing(app);
     app.panel.clear_input(panel_hwnd);
-    relayout_panel(app, panel_hwnd);
+    sync_layout_effective(app, panel_hwnd);
 }
 
 /// 应用高峰区间：未编辑的框沿用当前配置值；两值合法且不相等才写入
@@ -1534,8 +1537,37 @@ fn sync_main_height(app: &mut App) {
     );
 }
 
+/// 生效布局切换：展开立即生效渐扩揭露；收缩保持出发布局收窗渐裁，结束追平。
+fn sync_layout_effective(app: &mut App, panel_hwnd: HWND) {
+    app.panel.height_anim = None;
+    let target_h = app.panel.view_height_for(
+        app.panel.pending_team,
+        app.panel.customizing_interval,
+        app.config.accounts.len(),
+    );
+    if app.panel.begin_shrink_anim(panel_hwnd, target_h) {
+        unsafe {
+            let _ = InvalidateRect(Some(panel_hwnd), None, true);
+        }
+        return;
+    }
+    relayout_panel(app, panel_hwnd);
+}
+
 /// 同步状态并重定位面板
-fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
+pub(crate) fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
+    // 生效布局默认随重排追平；同视图收缩过渡例外——出发布局归动画
+    // 独占，跨视图过渡终止后照常追平。
+    let frozen = app
+        .panel
+        .height_anim
+        .is_some_and(|a| a.view == app.panel.view);
+    if !frozen {
+        app.panel.height_anim = None;
+        app.panel.layout_team = app.panel.pending_team;
+        app.panel.layout_customizing = app.panel.customizing_interval;
+        reconcile_fading_focus(app, panel_hwnd);
+    }
     sync_main_height(app);
     app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth));
     app.panel.caret_ctx = (!app.config.accounts.is_empty(), app.panel.account_error);

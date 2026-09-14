@@ -159,11 +159,11 @@ mod tests {
         let zh = Lang::Zh;
         let now = Utc::now();
         let t = now + chrono::Duration::seconds(90);
-        assert_eq!(countdown_from(t, now, zh), "1 分");
+        assert_eq!(countdown_from(t, now, zh), "1 分钟");
         let t = now + chrono::Duration::seconds(30);
         assert!(countdown_from(t, now, zh).ends_with("秒"));
         let t = now + chrono::Duration::hours(2) + chrono::Duration::minutes(13);
-        assert_eq!(countdown_from(t, now, zh), "2 小时 13 分");
+        assert_eq!(countdown_from(t, now, zh), "2 小时 13 分钟");
         let t = now + chrono::Duration::days(3);
         assert_eq!(countdown_from(t, now, zh), "3 天");
         // 已过期 → 0 秒，不出现负数

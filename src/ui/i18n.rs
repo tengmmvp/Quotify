@@ -195,7 +195,7 @@ const ZH: Strings = Strings {
     // ── 时间单位 ──
     unit_day: "天",
     unit_hour: "小时",
-    unit_minute: "分",
+    unit_minute: "分钟",
     unit_second: "秒",
 
     // ── 主视图 · 指标 ──
@@ -430,7 +430,7 @@ const EN: Strings = Strings {
     // ── 设置 · 用量通知 ──
     notifications: "Notifications",
     notify_threshold: "Usage alert",
-    notify_threshold_desc: "Alerts once above {p}%; re-arms after usage falls back",
+    notify_threshold_desc: "Alerts once above {p}%, then re-arms",
     notify_reset_5h_opt: "5-hour session reset alerts",
     notify_reset_5h_desc: "Alerts when the 5-hour window resets",
     notify_reset_weekly_opt: "Weekly session reset alerts",

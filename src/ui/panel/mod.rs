@@ -1050,7 +1050,7 @@ pub(crate) fn retune_minute(app: &crate::app::App, hwnd: HWND) {
 }
 
 /// 周期判定与时间源解耦，供测试钉位。切分点与 countdown 显示切分
-/// 对齐：剩余整 60 秒仍显示「N 分」走分拍，59 秒起切秒拍。
+/// 对齐：剩余整 60 秒仍显示「N 分钟」走分拍，59 秒起切秒拍。
 fn minute_period(
     soonest: Option<chrono::DateTime<chrono::Utc>>,
     now: chrono::DateTime<chrono::Utc>,

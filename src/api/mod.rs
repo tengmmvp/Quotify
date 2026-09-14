@@ -155,6 +155,16 @@ impl UsageSnapshot {
     pub fn has_mcp_details(&self) -> bool {
         self.mcp.as_ref().is_some_and(|m| !m.details.is_empty())
     }
+
+    /// 等级显示文案：tier 标签优先，缺则回退套餐标签，两者皆空返回空串
+    pub fn tier_label(&self) -> &str {
+        let t = self.tier.label();
+        if t.is_empty() {
+            self.plan_label.as_deref().unwrap_or("")
+        } else {
+            t
+        }
+    }
 }
 
 /// 快照 → 主视图高度特征的唯一事实源：(指标行数, 构成区, Token 统计,
@@ -175,11 +185,27 @@ pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> (usize, bool, bool,
     }
 }
 
-/// Token 消耗合计：今日（本地 0 点起）与近 7 天（7 天前 0 点起）
+/// Token 统计档位
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TokenLeg {
+    Today,
+    Week,
+    Month,
+}
+
+/// Token 统计三档：档位、起点回退天数与日志标签；档序即卡片序
+pub(crate) const TOKEN_LEGS: [(TokenLeg, u64, &str); 3] = [
+    (TokenLeg::Today, 0, "today"),
+    (TokenLeg::Week, 6, "week"),
+    (TokenLeg::Month, 29, "month"),
+];
+
+/// Token 消耗合计：今日（本地 0 点起）与近 7 / 30 个自然日；legs 档序
+/// 与 TOKEN_LEGS 一致；逐档独立，单档拉取失败为 None，不拖垮
+/// 其余档。
 #[derive(Debug, Clone, Copy)]
 pub struct TokenStats {
-    pub today: f64,
-    pub week: f64,
+    pub legs: [Option<f64>; TOKEN_LEGS.len()],
 }
 
 /// 账户余额，仅国内版
@@ -555,8 +581,7 @@ mod tests {
                     .collect(),
             }),
             token_stats: stats.then_some(TokenStats {
-                today: 1.0,
-                week: 2.0,
+                legs: [Some(1.0), Some(2.0), Some(3.0)],
             }),
             balance: bal.then_some(Balance::default()),
             queried_at: Local::now(),

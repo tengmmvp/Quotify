@@ -1,4 +1,10 @@
-//! 面板布局的单一事实源
+//! 面板布局的单一事实源。
+//! 间距取 2/4/6/8/12/16/20 的 4px 网格档位，高度一律偶数保证 DPI
+//! 缩放落整像素；同类语义同档（行后 8、输入后 6、段头 12、边距
+//! 20），≤2px 光学修正豁免。
+
+use crate::api::TOKEN_LEGS;
+use crate::ui::panel::theme::PANEL_WIDTH;
 
 /// 轮询间隔预设档（秒）
 pub const INTERVAL_PRESETS: [u64; 4] = [60, 300, 900, 1800];
@@ -6,15 +12,17 @@ pub const INTERVAL_PRESETS: [u64; 4] = [60, 300, 900, 1800];
 /// 顶部导航栏高度
 pub const NAV_H: f32 = 30.0;
 /// section_label 返回值内含的段高
-pub const SECTION_LABEL_H: f32 = 21.0;
+pub const SECTION_LABEL_H: f32 = 22.0;
 /// segmented_raw 段体高度
 pub const SEGMENTED_H: f32 = 30.0;
 /// segmented_raw 返回值内含的段后间距
-pub const SEGMENTED_GAP: f32 = 9.0;
+pub const SEGMENTED_GAP: f32 = 8.0;
 /// 自绘输入框高度
 pub const INPUT_H: f32 = 26.0;
 /// 设置/主视图内容区左右留白
 pub const CONTENT_PAD: f32 = 20.0;
+/// 内容区宽：面板宽去左右留白
+pub const CONTENT_W: f32 = PANEL_WIDTH as f32 - 2.0 * CONTENT_PAD;
 /// 输入框左侧 x，与内容区 pad 一致
 pub const INPUT_X: f32 = CONTENT_PAD;
 /// 输入框后到下一 sub_label 的间距
@@ -27,7 +35,7 @@ pub(crate) const MAIN_TOP_PAD: f32 = 16.0;
 /// 顶栏行高（账号刊头与右侧双钮所在行）
 pub(crate) const MAIN_TOPBAR_H: f32 = 52.0;
 /// 刊头：段起点到标题的上隙[实线分隔线低 2px 挂在段起点]
-pub(crate) const MAIN_MASTHEAD_RULE_GAP: f32 = 14.0;
+pub(crate) const MAIN_MASTHEAD_RULE_GAP: f32 = 12.0;
 /// 刊头：标题行占高
 pub(crate) const MAIN_MASTHEAD_ROW_H: f32 = 26.0;
 /// 刊头段整高：段起点到首个指标行
@@ -35,16 +43,16 @@ pub(crate) const MAIN_MASTHEAD_H: f32 = MAIN_MASTHEAD_RULE_GAP + MAIN_MASTHEAD_R
 /// 指标行高
 pub(crate) const MAIN_METRIC_ROW_H: f32 = 52.0;
 /// MCP 构成区：框顶到 MCP 指标行底的下隙
-pub(crate) const MAIN_MCP_COMP_TOP_GAP: f32 = 6.0;
+pub(crate) const MAIN_MCP_COMP_TOP_GAP: f32 = 8.0;
 /// MCP 构成框内边距（左右 8 上下 6）
 pub(crate) const MAIN_MCP_COMP_PAD_X: f32 = 8.0;
 pub(crate) const MAIN_MCP_COMP_PAD_Y: f32 = 6.0;
-/// 能量格高（格宽 12、右斜切 4、缝 2 在渲染侧）
+/// 能量格高（格宽 12、圆角 2、缝 2 在渲染侧）
 pub(crate) const MAIN_MCP_CELL_H: f32 = 10.0;
 /// 能量条行到图例行的推进
 pub(crate) const MAIN_MCP_LEGEND_ADV: f32 = 4.0;
 /// 图例行高（11px 徽标文本所在行）
-pub(crate) const MAIN_MCP_LEGEND_H: f32 = 15.0;
+pub(crate) const MAIN_MCP_LEGEND_H: f32 = 16.0;
 /// MCP 构成区整高：下隙 + 框线 2 + 上下边距 + 条 + 推进 + 图例行
 pub(crate) const MAIN_MCP_COMP_H: f32 = MAIN_MCP_COMP_TOP_GAP
     + 2.0
@@ -55,14 +63,22 @@ pub(crate) const MAIN_MCP_COMP_H: f32 = MAIN_MCP_COMP_TOP_GAP
 /// 数据段（Token/余额）段前隙：到虚线分隔线
 pub(crate) const MAIN_SECTION_GAP: f32 = 6.0;
 /// 数据段：虚线分隔线到段标题的推进
-pub(crate) const MAIN_SECTION_HEAD: f32 = 14.0;
-/// Token 块：标题行到首条票据行的推进
-pub(crate) const MAIN_TOKEN_ROWS_ADV: f32 = 22.0;
-/// 票据合计行高
-pub(crate) const MAIN_LEADER_ROW_H: f32 = 19.0;
-/// Token 消耗块整高：段前隙 + 段头 + 标题推进 + 两行票据
+pub(crate) const MAIN_SECTION_HEAD: f32 = 12.0;
+/// Token 块：段头文字底到卡片顶的推进
+pub(crate) const MAIN_TOKEN_CARD_ADV: f32 = 20.0;
+/// Token 卡片几何：卡宽由面板宽推导，与卡距 12 让三卡缘 20/124/228
+/// 均为 4 的倍数——x/y 缘在所有 DPI 缩放下描边皆整像素；卡高由
+/// 数值带、标签带、上下留白推导
+pub(crate) const TOKEN_CARD_NUM_Y: f32 = 8.0;
+pub(crate) const TOKEN_CARD_NUM_H: f32 = 24.0;
+pub(crate) const TOKEN_CARD_LABEL_Y: f32 = TOKEN_CARD_NUM_Y + TOKEN_CARD_NUM_H + 4.0;
+pub(crate) const TOKEN_CARD_LABEL_H: f32 = 16.0;
+pub(crate) const TOKEN_CARD_H: f32 = TOKEN_CARD_LABEL_Y + TOKEN_CARD_LABEL_H + 8.0;
+pub(crate) const TOKEN_CARD_GAP: f32 = 12.0;
+pub(crate) const TOKEN_CARD_W: f32 = (CONTENT_W - 2.0 * TOKEN_CARD_GAP) / TOKEN_LEGS.len() as f32;
+/// Token 消耗块整高：段前隙 + 段头 + 卡片推进 + 卡高
 pub(crate) const MAIN_TOKEN_BLOCK_H: f32 =
-    MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_TOKEN_ROWS_ADV + 2.0 * MAIN_LEADER_ROW_H;
+    MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_TOKEN_CARD_ADV + TOKEN_CARD_H;
 /// 余额行文本占高
 pub(crate) const MAIN_BALANCE_ROW_H: f32 = 18.0;
 /// 余额块整高：可视为段前隙 + 段头 + 文本行，另含 2px 底部呼吸隙入高
@@ -88,13 +104,23 @@ pub const ACCOUNT_CARD_H: f32 = 48.0;
 /// 鉴权失败提示行高
 pub const AUTH_ERROR_H: f32 = 18.0;
 /// 常驻添加账号按钮行高：按钮 30 含上下余量
-pub const ADD_BTN_ROW_H: f32 = 36.0;
+pub const ADD_BTN_ROW_H: f32 = SAVE_BTN_H + 6.0;
 /// 自定义间隔展开增量：输入框 26 + 框后尾隙 12[值同 rule 上隙，语义各自独立]
 pub const CUSTOMIZE_EXTRA_H: f32 = INPUT_H + 12.0;
-/// 开关行高（带描述）：标题 19 + 描述 14 + 行后 9
-pub const TOGGLE_ROW_H: f32 = 42.0;
-/// 开关行高（无描述）：标题 19 + 行后 9
-pub const TOGGLE_ROW_PLAIN_H: f32 = 28.0;
+/// 设置页常驻按钮高（应用/导出/导入/检查更新）
+pub const BTN_H: f32 = 28.0;
+/// 添加页保存/取消与设置页添加账号按钮高
+pub const SAVE_BTN_H: f32 = 30.0;
+/// 开关行内部三段：标题、描述、行后隙；行高由求和推导
+pub const TOGGLE_TITLE_H: f32 = 20.0;
+/// 开关行标题绘制盒高：比推进量内收 2px，与推进量成对存放
+pub const TOGGLE_TITLE_DRAW_H: f32 = TOGGLE_TITLE_H - 2.0;
+pub const TOGGLE_DESC_H: f32 = 12.0;
+/// 开关行描述绘制盒高：12px 字的下伸部需高出推进量 2px，与推进量成对存放
+pub const TOGGLE_DESC_DRAW_H: f32 = TOGGLE_DESC_H + 2.0;
+pub const TOGGLE_TAIL: f32 = 8.0;
+pub const TOGGLE_ROW_H: f32 = TOGGLE_TITLE_H + TOGGLE_DESC_H + TOGGLE_TAIL;
+pub const TOGGLE_ROW_PLAIN_H: f32 = TOGGLE_TITLE_H + TOGGLE_TAIL;
 /// 高峰输入行后的下隙
 pub const PEAK_TAIL_GAP: f32 = 8.0;
 /// 选择行（语言/外观）行后余隙
@@ -103,21 +129,25 @@ pub const CHOICE_ROW_TAIL: f32 = 2.0;
 pub const CHOICE_ROW_H: f32 = SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP + CHOICE_ROW_TAIL;
 /// 代理输入框后的下隙[提示文字为框内占位，不另占行]
 pub const PROXY_TAIL_GAP: f32 = 6.0;
-/// 配置管理按钮行高：按钮 28 + 行后 9
-pub const BACKUP_ROW_H: f32 = 37.0;
+/// 配置管理按钮行高：按钮 28 + 行后 8
+pub const BACKUP_ROW_H: f32 = BTN_H + 8.0;
 /// 关于区纯分隔（空标题）：rule 上隙 + 尾隙 6
 pub const ABOUT_DIVIDER_H: f32 = SECTION_RULE_GAP + 6.0;
-/// 版本行高：按钮顶偏移 1 + 按钮 28
-pub const VERSION_ROW_H: f32 = 29.0;
+/// 版本行高：按钮顶偏移 1 + 按钮 28 + 底部余量 1
+pub const VERSION_ROW_H: f32 = 1.0 + BTN_H + 1.0;
 
-/// 添加页：名称输入框顶部 y
-pub const ADD_NAME_Y: f32 = 206.0;
+/// 添加页输入行步进：标签 + 输入框 + 框后隙
+const ADD_ROW_STEP: f32 = SECTION_LABEL_H + INPUT_H + INPUT_GAP;
+/// 添加页：名称输入框顶部 y，「账号信息」标题 + 平台/类型两枚分段
+/// 控件 + 名称子标签的推导链和
+pub const ADD_NAME_Y: f32 =
+    SETTINGS_EDGE_PAD + NAV_H + 4.0 * SECTION_LABEL_H + 2.0 * (SEGMENTED_H + SEGMENTED_GAP);
 /// 添加页：API Key 输入框顶部 y
-pub const ADD_KEY_Y: f32 = 259.0;
+pub const ADD_KEY_Y: f32 = ADD_NAME_Y + ADD_ROW_STEP;
 /// 添加页团队版：组织 ID 输入框顶部 y
-pub const ADD_ORG_Y: f32 = 312.0;
+pub const ADD_ORG_Y: f32 = ADD_KEY_Y + ADD_ROW_STEP;
 /// 添加页团队版：项目 ID 输入框顶部 y
-pub const ADD_PROJECT_Y: f32 = 365.0;
+pub const ADD_PROJECT_Y: f32 = ADD_ORG_Y + ADD_ROW_STEP;
 
 /// caret 高 16 在 26 高框内垂直居中的偏移
 pub const CARET_Y_OFFSET: f32 = 5.0;
@@ -174,9 +204,17 @@ pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bo
         + SETTINGS_EDGE_PAD) as i32 // 底部余量
 }
 
-/// 添加页总高（逻辑像素），团队版追加组织/项目两行
+/// 添加页总高（逻辑像素）
+///
+/// 底链 = 末行输入框 + 保存按钮 + 底部余量 10；团队版末行是项目
+/// ID 框（尾隙 12），非团队是 KEY 框（框后隙 + 尾隙 6）。
 pub fn add_page_height(team: bool) -> i32 {
-    338 + if team { 106 } else { 0 }
+    let y = if team {
+        ADD_PROJECT_Y + INPUT_H + 12.0
+    } else {
+        ADD_KEY_Y + INPUT_H + INPUT_GAP + 6.0
+    };
+    (y + SAVE_BTN_H + 10.0) as i32
 }
 
 /// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态由上方主视图段
@@ -209,19 +247,19 @@ mod tests {
 
     #[test]
     fn interval_input_y_pinned() {
-        assert_eq!(interval_input_y(false, false), 171.0);
-        assert_eq!(interval_input_y(false, true), 171.0);
-        assert_eq!(interval_input_y(true, false), 219.0);
-        assert_eq!(interval_input_y(true, true), 237.0);
+        assert_eq!(interval_input_y(false, false), 172.0);
+        assert_eq!(interval_input_y(false, true), 172.0);
+        assert_eq!(interval_input_y(true, false), 220.0);
+        assert_eq!(interval_input_y(true, true), 238.0);
     }
 
     #[test]
     fn peak_input_y_pinned() {
-        assert_eq!(peak_input_y(false, false, false), 363.0);
-        assert_eq!(peak_input_y(true, false, false), 411.0);
-        assert_eq!(peak_input_y(true, true, false), 429.0);
-        assert_eq!(peak_input_y(true, true, true), 467.0);
-        assert_eq!(peak_input_y(false, false, true), 401.0);
+        assert_eq!(peak_input_y(false, false, false), 360.0);
+        assert_eq!(peak_input_y(true, false, false), 408.0);
+        assert_eq!(peak_input_y(true, true, false), 426.0);
+        assert_eq!(peak_input_y(true, true, true), 464.0);
+        assert_eq!(peak_input_y(false, false, true), 398.0);
     }
 
     #[test]
@@ -236,19 +274,27 @@ mod tests {
     #[test]
     fn add_page_height_pinned() {
         assert_eq!(add_page_height(false), 338);
-        assert_eq!(add_page_height(true), 444);
+        assert_eq!(add_page_height(true), 446);
+    }
+
+    #[test]
+    fn token_card_geometry_pinned() {
+        // 期望值由面板宽 340 与渲染带推导，几何改动须同步更新
+        assert_eq!(TOKEN_CARD_W, 92.0);
+        assert_eq!(TOKEN_CARD_H, 60.0);
+        assert_eq!(TOKEN_CARD_LABEL_Y, 36.0);
     }
 
     #[test]
     fn main_view_height_pinned() {
         assert_eq!(main_view_height(false, 0, false, false, false), 300);
-        assert_eq!(main_view_height(true, 0, false, false, false), 146);
-        assert_eq!(main_view_height(true, 1, false, false, false), 198);
-        assert_eq!(main_view_height(true, 3, false, false, true), 342);
-        assert_eq!(main_view_height(true, 3, false, true, true), 422);
-        assert_eq!(main_view_height(true, 2, false, true, false), 330);
-        // MCP 构成区：无数据明细时零增量，有则 +49
-        assert_eq!(main_view_height(true, 3, true, false, false), 351);
-        assert_eq!(main_view_height(true, 1, true, false, false), 247);
+        assert_eq!(main_view_height(true, 0, false, false, false), 144);
+        assert_eq!(main_view_height(true, 1, false, false, false), 196);
+        assert_eq!(main_view_height(true, 3, false, false, true), 338);
+        assert_eq!(main_view_height(true, 3, false, true, true), 436);
+        assert_eq!(main_view_height(true, 2, false, true, false), 346);
+        // MCP 构成区：无数据明细时零增量，有则 +52
+        assert_eq!(main_view_height(true, 3, true, false, false), 352);
+        assert_eq!(main_view_height(true, 1, true, false, false), 248);
     }
 }

@@ -16,6 +16,9 @@ use windows_numerics::{Matrix3x2, Vector2};
 use super::{Align, Hit, Renderer};
 use crate::ui::panel::theme::RADIUS;
 
+/// 名牌高：与账号卡高同为偶数，垂直居中落整像素
+pub(super) const BADGE_H: f32 = 16.0;
+
 impl Renderer {
     /// 名牌
     #[allow(clippy::too_many_arguments)]
@@ -36,7 +39,7 @@ impl Renderer {
                 left: x,
                 top: y,
                 right: x + w,
-                bottom: y + 17.0,
+                bottom: y + BADGE_H,
             },
             radiusX: 2.5,
             radiusY: 2.5,
@@ -47,7 +50,7 @@ impl Renderer {
             left: x,
             top: y,
             right: x + w,
-            bottom: y + 17.0,
+            bottom: y + BADGE_H,
         };
         self.text_aligned_vc(
             target,
@@ -485,37 +488,6 @@ impl Renderer {
         target.FillGeometry(&ring, &qb, None);
         target.FillGeometry(&tail, &qb, None);
         target.SetTransform(&Matrix3x2::identity());
-    }
-
-    /// 圆点带几何
-    pub(super) fn dots_geo(&mut self, n: u32) -> Option<ID2D1PathGeometry> {
-        if let Some(g) = self.dots_geos.get(&n) {
-            return Some(g.clone());
-        }
-        let geo = unsafe {
-            let geo = self.factory.CreatePathGeometry().ok()?;
-            let sink = geo.Open().ok()?;
-            const R: f32 = 0.75;
-            for i in 0..n {
-                let cx = i as f32 * 5.0;
-                let mut pts = (0..8).map(|k| {
-                    let a = k as f32 / 8.0 * std::f32::consts::TAU;
-                    (cx + R * a.cos(), R * a.sin())
-                });
-                let Some((x0, y0)) = pts.next() else {
-                    continue;
-                };
-                sink.BeginFigure(Vector2 { X: x0, Y: y0 }, D2D1_FIGURE_BEGIN_FILLED);
-                for (x, y) in pts {
-                    sink.AddLine(Vector2 { X: x, Y: y });
-                }
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            }
-            sink.Close().ok()?;
-            geo
-        };
-        self.dots_geos.insert(n, geo.clone());
-        Some(geo)
     }
 
     /// 多组封闭折线 → 单份填充几何；不相交轮廓为并集

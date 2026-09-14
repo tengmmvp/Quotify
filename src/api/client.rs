@@ -6,12 +6,11 @@ use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
-use chrono::Timelike;
 use serde_json::Value;
 
 use super::{
-    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, TokenStats, UsageSnapshot,
-    parse_response, parse_token_total,
+    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, TOKEN_LEGS, TokenStats,
+    UsageSnapshot, parse_response, parse_token_total,
 };
 
 /// body 读取硬上限
@@ -184,46 +183,55 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     } else {
         (plain, bearer.as_str())
     };
-    let params = token_params(chrono::Local::now());
-    // 四路全并行：主数据不被慢附加端点拖住。附加三路用记忆形态首发：
-    // 切换轮可能 401 丢块（下轮即对）、主路失败轮照发白费（可忽略）、
-    // 端点失败只缺块不拖垮主用量
-    let (quota, today, week, balance) = std::thread::scope(|scope| {
+    let TokenWindows { starts, end } = token_params(chrono::Local::now());
+    // 五路全并行：主数据不被慢附加端点拖住；附加路失败只缺块不拖垮
+    // 主用量，切换轮 401 丢块下轮即对。
+    let (quota, legs, balance) = std::thread::scope(|scope| {
         let quota = scope.spawn(|| match fetch_quota(spec.platform, first, team) {
             Ok(snap) => Ok(snap),
             Err(FetchError::Auth) => {
                 let snap = fetch_quota(spec.platform, second, team)?;
-                // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用
+                // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用。
                 set_needs_bearer(plain, !remembered);
                 Ok(snap)
             }
             Err(e) => Err(e),
         });
-        // 时间窗换算失败时两路区间请求都不发
-        let (today, week) = match params.as_ref() {
-            Some((today, week, end)) => (
-                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, today, end))),
-                Some(scope.spawn(|| fetch_token_window(spec.platform, first, team, week, end))),
-            ),
-            None => (None, None),
-        };
+        let end = end.as_str();
+        // 档机制单源：增删档位只改 TOKEN_LEGS
+        let legs: [_; TOKEN_LEGS.len()] = starts.map(|s| {
+            s.map(|s| scope.spawn(move || fetch_token_window(spec.platform, first, team, &s, end)))
+        });
         // 余额端点仅国内版有
         let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
         let quota = quota
             .join()
             .unwrap_or_else(|p| std::panic::resume_unwind(p));
-        (quota, join(today), join(week), join(balance))
+        (quota, legs.map(join), join(balance))
     });
     let mut snap = quota?;
-    // 两区间要么都有要么都没有
-    snap.token_stats = match (today, week) {
-        (Some(Ok(today)), Some(Ok(week))) => Some(TokenStats { today, week }),
-        (Some(Err(e)), _) | (_, Some(Err(e))) => {
-            crate::platform::log(&format!("[Quotify] Token 统计拉取失败: {e}"));
-            None
-        }
-        _ => None,
+    // 逐档独立：单档失败画占位不拖垮其余档，三档全无数据才整体隐藏；
+    // 失败档聚合一行，持久故障不逐档刷屏。
+    let failed: Vec<String> = TOKEN_LEGS
+        .iter()
+        .zip(&legs)
+        .filter_map(|((_, _, tag), leg)| match leg {
+            Some(Err(e)) => Some(format!("{tag}: {e}")),
+            _ => None,
+        })
+        .collect();
+    if !failed.is_empty() {
+        crate::platform::log(&format!(
+            "[Quotify] Token 档拉取失败: {}",
+            failed.join("; ")
+        ));
+    }
+    let stats = TokenStats {
+        legs: legs.map(|l| l.and_then(Result::ok)),
     };
+    if stats.legs.iter().any(Option::is_some) {
+        snap.token_stats = Some(stats);
+    }
     if let Some(balance) = balance {
         match balance {
             Ok(b) => snap.balance = b,
@@ -233,23 +241,38 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     Ok(snap)
 }
 
-/// Token 统计区间参数：今日与 7 天前 0 点两起点 + 当前小时末终点，
-/// 空格已编码可直拼 URL；起点换算失败如 DST 交界返 None，两路请求
-/// 都不发，终点失败则退化为当前刻。
-fn token_params(now: chrono::DateTime<chrono::Local>) -> Option<(String, String, String)> {
-    let end = now
-        .with_minute(59)
-        .and_then(|t| t.with_second(59))
-        .unwrap_or(now);
-    let today_start = now
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).single());
-    let week_start = today_start.map(|t| t - chrono::Duration::days(7));
-    let (Some(today_start), Some(week_start)) = (today_start, week_start) else {
-        return None;
+/// Token 统计的三区间时间窗：三起点按 TOKEN_LEGS 档序、终点共用；
+/// 单窗起点本地化失败仅该窗缺席，不牵连其余窗。
+struct TokenWindows {
+    starts: [Option<String>; TOKEN_LEGS.len()],
+    end: String,
+}
+
+/// Token 统计区间参数：今日 / 6 天前 / 29 天前 0 点三起点 + 当天末
+/// 终点；周/月窗含今天共 7 / 30 个自然日（月非自然月）。起点须在
+/// 日期侧减天数再本地化——DateTime 直接减 Duration 是 UTC 瞬时
+/// 运算，夏令时交界会漂移一小时。
+fn token_params(now: chrono::DateTime<chrono::Local>) -> TokenWindows {
+    // 夏令时回拨致 0 点歧义时取早侧：宁早一小时，不缺整窗。
+    let day_start = |offset: u64, tag: &str| {
+        let t = (now.date_naive() - chrono::Days::new(offset))
+            .and_hms_opt(0, 0, 0)
+            .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).earliest());
+        if t.is_none() {
+            crate::platform::log(&format!("[Quotify] Token {tag} 窗口起点本地化失败，跳过"));
+        }
+        t
     };
-    Some((stamp(&today_start), stamp(&week_start), stamp(&end)))
+    // 夏令时回拨致当天末歧义时取晚侧：宁晚一小时，不短整窗。
+    let end = now
+        .date_naive()
+        .and_hms_opt(23, 59, 59)
+        .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).latest())
+        .unwrap_or(now);
+    TokenWindows {
+        starts: TOKEN_LEGS.map(|(_, back, tag)| day_start(back, tag).map(|t| stamp(&t))),
+        end: stamp(&end),
+    }
 }
 
 /// 拉取单个区间的 token 总消耗，合计优先取服务端 totalUsage
@@ -457,11 +480,13 @@ mod tests {
         let now = chrono::Local
             .with_ymd_and_hms(2026, 8, 29, 20, 15, 30)
             .unwrap();
-        let (today, week, end) = token_params(now).unwrap();
-        // 三值均已百分号编码；终点取当前小时末
-        assert_eq!(today, "2026-08-29%2000:00:00");
-        assert_eq!(week, "2026-08-22%2000:00:00");
-        assert_eq!(end, "2026-08-29%2020:59:59");
+        let w = token_params(now);
+        // 四值均已百分号编码；档序 = TOKEN_LEGS 今日/周/月，终点取当天
+        // 末，周/月起点含今天共 7 / 30 个自然日
+        assert_eq!(w.starts[0].as_deref(), Some("2026-08-29%2000:00:00"));
+        assert_eq!(w.starts[1].as_deref(), Some("2026-08-23%2000:00:00"));
+        assert_eq!(w.starts[2].as_deref(), Some("2026-07-31%2000:00:00"));
+        assert_eq!(w.end, "2026-08-29%2023:59:59");
     }
 
     #[test]

@@ -34,10 +34,15 @@ pub struct Theme {
     pub peak: [f32; 4],
     /// logo 磁贴底色，与主按钮同源
     pub logo_tile: [f32; 4],
+    /// 卡片描边
+    pub card_border: [f32; 4],
 }
 
 pub const PANEL_WIDTH: i32 = 340;
+/// 控件级圆角
 pub const RADIUS: f32 = 4.0;
+/// 卡片级圆角
+pub const CARD_RADIUS: f32 = 6.0;
 
 /// 配置外观字符串的显式值：Some 为显式 light/dark，None 为跟随系统；
 /// 先 trim 再忽略大小写，是字面量解析的唯一事实源，控件高亮与生效同引。
@@ -75,6 +80,7 @@ impl Theme {
                 danger: rgba(0xCF, 0x2D, 0x56, 1.0),
                 peak: rgba(0xD9, 0x94, 0x00, 1.0),
                 logo_tile: rgba(0x26, 0x25, 0x1E, 1.0),
+                card_border: rgba(0xD8, 0xD7, 0xD2, 1.0),
             },
             Appearance::Dark => Self {
                 bg: rgba(0x20, 0x1F, 0x1B, 1.0),
@@ -90,6 +96,7 @@ impl Theme {
                 danger: rgba(0xE2, 0x5A, 0x77, 1.0),
                 peak: rgba(0xFF, 0xC1, 0x4D, 1.0),
                 logo_tile: rgba(0x2D, 0x2D, 0x2D, 1.0),
+                card_border: rgba(0x45, 0x44, 0x3E, 1.0),
             },
         }
     }

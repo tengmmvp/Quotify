@@ -193,7 +193,7 @@ pub(crate) fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<I
 /// 调用点同源，眼睛让位 26、余量收边 4。臂穷尽无兜底：新增 InputField
 /// 变体即编译错误
 pub(crate) fn field_geo(field: InputField) -> (f32, f32, f32) {
-    let cw = PANEL_WIDTH as f32 - 2.0 * layout::CONTENT_PAD;
+    let cw = layout::CONTENT_W;
     match field {
         InputField::Interval => (layout::INPUT_X, 96.0, 4.0),
         InputField::Proxy => (layout::INPUT_X, cw, 4.0),
@@ -1998,13 +1998,13 @@ mod tests {
     fn settings_view_height_pinned() {
         let mut p = Panel::new();
         p.view = PanelView::Settings;
-        assert_eq!(p.view_height(0), 797);
-        assert_eq!(p.view_height(1), 845);
+        assert_eq!(p.view_height(0), 798);
+        assert_eq!(p.view_height(1), 846);
         p.layout_customizing = true;
-        assert_eq!(p.view_height(0), 835);
-        assert_eq!(p.view_height(1), 883);
+        assert_eq!(p.view_height(0), 836);
+        assert_eq!(p.view_height(1), 884);
         p.account_error = true;
-        assert_eq!(p.view_height(1), 901);
+        assert_eq!(p.view_height(1), 902);
     }
 
     /// 光标点击定位：等宽最近边界、越界钳入、零宽平局取末位、

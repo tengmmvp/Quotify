@@ -2,22 +2,20 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use windows::Win32::Graphics::Direct2D::Common::{
-    D2D_RECT_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_END_CLOSED,
-};
+use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget,
 };
-use windows_numerics::{Matrix3x2, Vector2};
+use windows_numerics::Matrix3x2;
 
 use super::widgets::PACMAN_R;
 use super::{Align, Hit, Renderer};
-use crate::api::FetchError;
+use crate::api::{FetchError, TOKEN_LEGS, TokenLeg};
 use crate::ui::fmt;
 use crate::ui::i18n::Strings;
 use crate::ui::panel::layout;
 use crate::ui::panel::model::PanelModel;
-use crate::ui::panel::theme::RADIUS;
+use crate::ui::panel::theme::CARD_RADIUS;
 
 /// MCP 工具色板
 const MCP_PALETTE: [[f32; 4]; 4] = [
@@ -31,7 +29,15 @@ const MCP_PALETTE: [[f32; 4]; 4] = [
 const MCP_CELLS: usize = 20;
 const MCP_CELL_W: f32 = 12.0;
 const MCP_CELL_GAP: f32 = 2.0;
-const MCP_CELL_SKEW: f32 = 4.0;
+const MCP_CELL_R: f32 = 2.0;
+
+/// Token 卡片排版规格：数字与单位的字号、数字字重、单位间隙、卡内
+/// 截断边距——测宽与绘制两侧同引
+const TOKEN_NUM_SIZE: f32 = 20.0;
+const TOKEN_NUM_WEIGHT: u16 = 700;
+const TOKEN_UNIT_SIZE: f32 = 11.0;
+const TOKEN_UNIT_GAP: f32 = 1.0;
+const TOKEN_CARD_INSET: f32 = 4.0;
 
 /// 能量条的待填区间序列（段序即绘制序）：数据段间未覆盖格位补
 /// 轨道空格段；颜色由调用侧配对——数据段用段色、空格段用轨道色。
@@ -65,15 +71,29 @@ struct McpBadge {
 }
 
 /// MCP 构成区按 (快照时间, 内宽) 缓存的数据侧产物，命中时跳过排序、
-/// 分段与全部测宽。待填几何随缓存建好，仅空格色与落位平移绘制时现算。
+/// 分段与全部测宽；绘制按缓存分段逐格填圆角矩形。
 pub(super) struct McpCompCache {
     key: chrono::DateTime<chrono::Local>,
     inner_w: f32,
     segs: Vec<(usize, usize, [f32; 4])>,
-    geos: Vec<((usize, usize), ID2D1PathGeometry)>,
     badges: Vec<McpBadge>,
     shown: usize,
     plus_w: f32,
+}
+
+/// Token 卡片按快照时间缓存的排版产物：文本与测宽随轮询变，
+/// 动画帧不重算
+pub(super) struct TokenCells {
+    key: chrono::DateTime<chrono::Local>,
+    cells: [TokenCell; TOKEN_LEGS.len()],
+}
+
+/// 单卡排版产物：数字串、单位与各自测宽
+struct TokenCell {
+    num: String,
+    unit: &'static str,
+    nw: f32,
+    uw: f32,
 }
 
 impl Renderer {
@@ -98,18 +118,11 @@ impl Renderer {
         let title = model.account.map(|a| a.name).unwrap_or("Quotify");
         let meta = snap.and_then(|s| {
             let v = s.plan_version.label();
-            let tier = {
-                let t = s.tier.label();
-                if t.is_empty() {
-                    s.plan_label.clone().unwrap_or_default()
-                } else {
-                    t.to_string()
-                }
-            };
+            let tier = s.tier_label();
             match (v.is_empty(), tier.is_empty()) {
                 (false, false) => Some(format!("{v} · {tier}")),
                 (false, true) => Some(v.to_string()),
-                (true, false) => Some(tier),
+                (true, false) => Some(tier.to_string()),
                 (true, true) => None,
             }
         });
@@ -239,8 +252,8 @@ impl Renderer {
                         right: w - pad,
                         bottom: card_top + card_h,
                     },
-                    radiusX: RADIUS,
-                    radiusY: RADIUS,
+                    radiusX: CARD_RADIUS,
+                    radiusY: CARD_RADIUS,
                 };
                 let fill = self.brush(
                     target,
@@ -387,23 +400,7 @@ impl Renderer {
                             alpha,
                             true,
                         );
-                        y = ty + layout::MAIN_TOKEN_ROWS_ADV;
-                        y = self.leader_row(
-                            target,
-                            s.today_tokens,
-                            &fmt::compact_number(ts.today),
-                            y,
-                            w,
-                            alpha,
-                        );
-                        y = self.leader_row(
-                            target,
-                            s.week_tokens,
-                            &fmt::compact_number(ts.week),
-                            y,
-                            w,
-                            alpha,
-                        );
+                        y = self.token_section(target, s, ts, snap.queried_at, ty, alpha);
                     }
 
                     if let Some(b) = &snap.balance {
@@ -593,7 +590,7 @@ impl Renderer {
     }
 
     /// 数据段区块头：分隔线 + 强调条 + 标题；返回标题行顶 y，段内后续
-    /// 推进（usage 叠高峰徽标后走刊头行高、Token 接票据行、余额即文本
+    /// 推进（usage 叠高峰徽标后走刊头行高、Token 接卡片、余额即文本
     /// 行）由调用点自定。刊头用实线且低 2px 挂段起点，数据段虚线贴段起点
     #[allow(clippy::too_many_arguments)]
     unsafe fn section_header(
@@ -612,7 +609,7 @@ impl Renderer {
         } else {
             self.divider(target, pad, y + 2.0, w - pad * 2.0, alpha);
         }
-        // 两种段的标题距段起点同为 14：刊头是段起点起算，数据段是分隔线起算
+        // 两种段的标题距段起点同为 12：刊头是段起点起算，数据段是分隔线起算
         let ty = y + if dashed {
             layout::MAIN_SECTION_HEAD
         } else {
@@ -739,7 +736,7 @@ impl Renderer {
             );
         }
         if let Some(d) = detail {
-            self.text_rect_opts(
+            self.text_aligned(
                 target,
                 &d,
                 &D2D_RECT_F {
@@ -759,7 +756,7 @@ impl Renderer {
         y + layout::MAIN_METRIC_ROW_H
     }
 
-    /// MCP 工具构成区：直角外框内一条右斜平行四边形能量格条[满串 = 工具
+    /// MCP 工具构成区：直角外框内一条圆角格能量条[满串 = 工具
     /// 消耗合计]加一行三格徽标图例[色块|名称|次数]。格段与徽标色块按用量
     /// 降序取低饱和四色板，第 5+ 工具并入第四色；图例装不下整枚徽标截尾
     /// +N、首枚超宽截名称。数据只随轮询变化，分段/徽标/装填结果按
@@ -808,44 +805,49 @@ impl Renderer {
         let bar_w = MCP_CELLS as f32 * MCP_CELL_W + (MCP_CELLS - 1) as f32 * MCP_CELL_GAP;
         let x0 = inner_x + (inner_w - bar_w) / 2.0;
         // 待填段：区间序列与缓存建时同源（mcp_job_ranges），数据段取
-        // 段色、空格段取轨道色；几何查缓存平移绘制，帧内零重建。
+        // 段色、空格段取轨道色，逐格填圆角矩形。
         let track = self.theme.track;
         for r in mcp_job_ranges(segs) {
             let color = segs
                 .iter()
                 .find(|(s, e, _)| (*s, *e) == r)
                 .map_or(track, |(_, _, c)| *c);
-            if let Some((_, geo)) = c.geos.iter().find(|(k, _)| *k == r) {
-                let b = self.brush(target, color, alpha);
-                let m = Matrix3x2 {
-                    M11: 1.0,
-                    M12: 0.0,
-                    M21: 0.0,
-                    M22: 1.0,
-                    M31: x0,
-                    M32: bar_y,
+            let b = self.brush(target, color, alpha);
+            for i in r.0..r.1 {
+                let left = x0 + i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
+                let cell = D2D1_ROUNDED_RECT {
+                    rect: D2D_RECT_F {
+                        left,
+                        top: bar_y,
+                        right: left + MCP_CELL_W,
+                        bottom: bar_y + cell_h,
+                    },
+                    radiusX: MCP_CELL_R,
+                    radiusY: MCP_CELL_R,
                 };
-                target.SetTransform(&m);
-                target.FillGeometry(geo, &b, None);
-                target.SetTransform(&Matrix3x2::identity());
+                target.FillRoundedRectangle(&cell, &b);
             }
         }
 
         let leg_y = bar_y + cell_h + layout::MAIN_MCP_LEGEND_ADV;
         let leg_h = layout::MAIN_MCP_LEGEND_H;
-        let sw_top = leg_y + 3.5;
-        let swatch_rect = |x: f32| D2D_RECT_F {
-            left: x,
-            top: sw_top,
-            right: x + MCP_SWATCH,
-            bottom: sw_top + MCP_SWATCH,
+        let sw_top = leg_y + 4.0;
+        let swatch = |x: f32| D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: x,
+                top: sw_top,
+                right: x + MCP_SWATCH,
+                bottom: sw_top + MCP_SWATCH,
+            },
+            radiusX: MCP_CELL_R,
+            radiusY: MCP_CELL_R,
         };
         let mut x = inner_x;
         if shown == 0 && !badges.is_empty() {
             // 首枚即超宽：截文本兜底，最大工具保底可见
             let b = &badges[0];
             let sw = self.brush(target, b.color, alpha);
-            target.FillRectangle(&swatch_rect(x), &sw);
+            target.FillRoundedRectangle(&swatch(x), &sw);
             let avail = inner_w - MCP_SWATCH - MCP_SWATCH_GAP;
             let (t, _) = self.ellipsize(&b.text, MCP_BADGE_SIZE, avail, 400, true);
             self.text_nosnap(
@@ -866,7 +868,7 @@ impl Renderer {
                     x += MCP_BADGE_GAP;
                 }
                 let sw = self.brush(target, b.color, alpha);
-                target.FillRectangle(&swatch_rect(x), &sw);
+                target.FillRoundedRectangle(&swatch(x), &sw);
                 x += MCP_SWATCH + MCP_SWATCH_GAP;
                 self.text_nosnap(
                     target,
@@ -990,20 +992,91 @@ impl Renderer {
         } else {
             0.0
         };
-        // 段几何随缓存建好（原点系，绘制时平移），帧内不再重建
-        let geos = mcp_job_ranges(&segs)
-            .into_iter()
-            .filter_map(|r| self.build_mcp_cells(r.0, r.1).map(|g| (r, g)))
-            .collect();
         McpCompCache {
             key: queried_at,
             inner_w,
             segs,
-            geos,
             badges,
             shown,
             plus_w,
         }
+    }
+
+    /// 重建 Token 卡片缓存：格式化、测宽与超宽截断一次成型
+    unsafe fn build_token_cells(
+        &mut self,
+        ts: &crate::api::TokenStats,
+        queried_at: chrono::DateTime<chrono::Local>,
+    ) -> TokenCells {
+        let avail = layout::TOKEN_CARD_W - TOKEN_CARD_INSET;
+        let cells = ts.legs.map(|v| {
+            let (num, unit) = match v {
+                Some(v) => fmt::compact_number_split(v),
+                None => (fmt::MISSING.to_string(), ""),
+            };
+            // Consolas 只有 400/700 两档字重，700 明示粗体
+            let nw = self.measure(&num, TOKEN_NUM_SIZE, TOKEN_NUM_WEIGHT, true);
+            let uw = if unit.is_empty() {
+                0.0
+            } else {
+                self.measure_static(unit, TOKEN_UNIT_SIZE, 400, false)
+            };
+            // 荒谬大值可超卡宽：截尾入宽，不越描边压邻卡
+            let (num, nw) = if nw + uw + TOKEN_UNIT_GAP > avail {
+                self.ellipsize(
+                    &num,
+                    TOKEN_NUM_SIZE,
+                    avail - uw - TOKEN_UNIT_GAP,
+                    TOKEN_NUM_WEIGHT,
+                    true,
+                )
+            } else {
+                (num, nw)
+            };
+            TokenCell { num, unit, nw, uw }
+        });
+        TokenCells {
+            key: queried_at,
+            cells,
+        }
+    }
+
+    /// Token 三卡区块：排版缓存按快照命中，重建一次成型；单一出口，
+    /// take 出的缓存函数尾必放回。返回区块底 y
+    unsafe fn token_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        s: &Strings,
+        ts: &crate::api::TokenStats,
+        queried_at: chrono::DateTime<chrono::Local>,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let pad = layout::CONTENT_PAD;
+        let cy = y + layout::MAIN_TOKEN_CARD_ADV;
+        let mut cells = self.token_cells.take();
+        if cells.as_ref().is_none_or(|c| c.key != queried_at) {
+            cells = Some(self.build_token_cells(ts, queried_at));
+        }
+        let cells = cells.unwrap();
+        // 标签按档位穷尽分派：配对内聚，增删档编译器背书
+        for (i, (leg, _, _)) in TOKEN_LEGS.iter().enumerate() {
+            let label = match leg {
+                TokenLeg::Today => s.today_tokens,
+                TokenLeg::Week => s.week_tokens,
+                TokenLeg::Month => s.month_tokens,
+            };
+            self.token_card(
+                target,
+                label,
+                &cells.cells[i],
+                pad + i as f32 * (layout::TOKEN_CARD_W + layout::TOKEN_CARD_GAP),
+                cy,
+                alpha,
+            );
+        }
+        self.token_cells = Some(cells);
+        cy + layout::TOKEN_CARD_H
     }
 
     /// 禁用像素吸附的文本绘制：吸附偏移随位置独立抖动，会拉花链式
@@ -1044,99 +1117,79 @@ impl Renderer {
         );
     }
 
-    /// 一段能量格的合成路径
-    fn build_mcp_cells(&self, from: usize, to: usize) -> Option<ID2D1PathGeometry> {
-        unsafe {
-            let geo = self.factory.CreatePathGeometry().ok()?;
-            let sink = geo.Open().ok()?;
-            for i in from..to {
-                let s = i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
-                let h = layout::MAIN_MCP_CELL_H;
-                sink.BeginFigure(
-                    Vector2 {
-                        X: s + MCP_CELL_SKEW,
-                        Y: 0.0,
-                    },
-                    D2D1_FIGURE_BEGIN_FILLED,
-                );
-                sink.AddLine(Vector2 {
-                    X: s + MCP_CELL_SKEW + MCP_CELL_W,
-                    Y: 0.0,
-                });
-                sink.AddLine(Vector2 {
-                    X: s + MCP_CELL_W,
-                    Y: h,
-                });
-                sink.AddLine(Vector2 { X: s, Y: h });
-                sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-            }
-            sink.Close().ok()?;
-            Some(geo)
-        }
-    }
-
-    /// 票据合计行：左 label、右数值，中间引导点自动填满；返回下一行 y。
-    /// label 恒为 i18n 静态文案，测宽走帧内去重缓存。
-    unsafe fn leader_row(
+    /// Token 卡片：透明底细描边容器；数字与单位分离排版，标签沉底。
+    unsafe fn token_card(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &'static str,
-        value: &str,
+        label: &str,
+        cell: &TokenCell,
+        x: f32,
         y: f32,
-        w: f32,
         alpha: f32,
-    ) -> f32 {
-        let pad = layout::CONTENT_PAD;
-        let row_h = layout::MAIN_LEADER_ROW_H;
-        self.text(
+    ) {
+        let cw = layout::TOKEN_CARD_W;
+        let rect = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + cw,
+                bottom: y + layout::TOKEN_CARD_H,
+            },
+            radiusX: CARD_RADIUS,
+            radiusY: CARD_RADIUS,
+        };
+        let edge = self.brush(target, self.theme.card_border, alpha);
+        target.DrawRoundedRectangle(&rect, &edge, 1.0, None);
+        // 数字与单位组合整体居中；单位上标挂数字右上角
+        let nx = x + (cw - cell.nw - cell.uw - TOKEN_UNIT_GAP) / 2.0;
+        let num_rect = D2D_RECT_F {
+            left: nx,
+            top: y + layout::TOKEN_CARD_NUM_Y,
+            right: nx + cell.nw,
+            bottom: y + layout::TOKEN_CARD_NUM_Y + layout::TOKEN_CARD_NUM_H,
+        };
+        self.text_aligned(
+            target,
+            &cell.num,
+            &num_rect,
+            TOKEN_NUM_SIZE,
+            TOKEN_NUM_WEIGHT,
+            self.theme.text_primary,
+            alpha,
+            Align::Left,
+            true,
+        );
+        if !cell.unit.is_empty() {
+            self.text(
+                target,
+                cell.unit,
+                nx + cell.nw + TOKEN_UNIT_GAP,
+                y + layout::TOKEN_CARD_NUM_Y,
+                cell.uw + 2.0,
+                16.0,
+                TOKEN_UNIT_SIZE,
+                400,
+                self.theme.text_secondary,
+                alpha,
+            );
+        }
+        let label_rect = D2D_RECT_F {
+            left: x,
+            top: y + layout::TOKEN_CARD_LABEL_Y,
+            right: x + cw,
+            bottom: y + layout::TOKEN_CARD_LABEL_Y + layout::TOKEN_CARD_LABEL_H,
+        };
+        self.text_aligned(
             target,
             label,
-            pad,
-            y + 1.0,
-            (w - pad * 2.0) * 0.4,
-            row_h,
-            12.0,
+            &label_rect,
+            10.0,
             400,
             self.theme.text_secondary,
             alpha,
+            Align::Center,
+            false,
         );
-        let vw = self.measure(value, 12.0, 500, true) + 6.0;
-        self.text_mono_r(
-            target,
-            value,
-            w - pad - vw,
-            y,
-            vw,
-            row_h,
-            12.0,
-            500,
-            self.theme.text_primary,
-            alpha,
-        );
-        // 引导点铺在 label 右端到数值左端之间的行视觉中心上
-        let label_w = self.measure_static(label, 12.0, 400, false);
-        let cy = y + 10.0;
-        let dot = self.brush(target, self.theme.text_tertiary, alpha * 0.55);
-        let x = pad + label_w + 8.0;
-        let end = w - pad - vw - 8.0;
-        let span = end - x;
-        if span >= 0.0
-            && let Some(geo) = self.dots_geo((span / 5.0).floor() as u32 + 1)
-        {
-            // 点带整条一次填充，几何按点数缓存
-            let m = Matrix3x2 {
-                M11: 1.0,
-                M12: 0.0,
-                M21: 0.0,
-                M22: 1.0,
-                M31: x,
-                M32: cy,
-            };
-            target.SetTransform(&m);
-            target.FillGeometry(&geo, &dot, None);
-            target.SetTransform(&Matrix3x2::identity());
-        }
-        y + row_h
     }
 
     /// 「高峰」徽标：闪电 + 文字居标题行右侧，悬停命中登记 UsageInfo
@@ -1219,13 +1272,13 @@ impl Renderer {
                 right: cx + cw,
                 bottom: y + 48.0,
             },
-            radiusX: 6.0,
-            radiusY: 6.0,
+            radiusX: CARD_RADIUS,
+            radiusY: CARD_RADIUS,
         };
         let [r, g, b, _] = self.theme.bg;
         let fill = self.brush(target, [r, g, b, 1.0], 1.0);
         target.FillRoundedRectangle(&card, &fill);
-        let line = self.brush(target, self.theme.border, alpha);
+        let line = self.brush(target, self.theme.card_border, alpha);
         target.DrawRoundedRectangle(&card, &line, 1.0, None);
         self.text_wrapped(
             target,
@@ -1270,6 +1323,14 @@ mod tests {
     use super::*;
 
     const C: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+
+    /// 档位与回退天数、日志标签配对钉位
+    #[test]
+    fn token_legs_pinned() {
+        assert_eq!(TOKEN_LEGS[0], (TokenLeg::Today, 0, "today"));
+        assert_eq!(TOKEN_LEGS[1], (TokenLeg::Week, 6, "week"));
+        assert_eq!(TOKEN_LEGS[2], (TokenLeg::Month, 29, "month"));
+    }
 
     /// 能量条待填区间：数据段原样保留，未覆盖格位补轨道段，
     /// 首尾按需补齐，段序即绘制序

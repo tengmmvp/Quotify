@@ -58,6 +58,7 @@ pub struct Strings {
     pub token_usage_section: &'static str,
     pub today_tokens: &'static str,
     pub week_tokens: &'static str,
+    pub month_tokens: &'static str,
     pub balance_label: &'static str,
 
     // ── 主视图 · 峰谷 ──
@@ -208,6 +209,7 @@ const ZH: Strings = Strings {
     token_usage_section: "Token 消耗",
     today_tokens: "今日",
     week_tokens: "本周",
+    month_tokens: "本月",
     balance_label: "账户余额",
 
     // ── 主视图 · 峰谷 ──
@@ -352,7 +354,8 @@ const EN: Strings = Strings {
     used_of: "{cur} of {tot} used",
     token_usage_section: "TOKEN",
     today_tokens: "Today",
-    week_tokens: "Week",
+    week_tokens: "Weekly",
+    month_tokens: "Monthly",
     balance_label: "BALANCE",
 
     // ── 主视图 · 峰谷 ──

@@ -277,10 +277,10 @@ pub struct Renderer {
     eye_geo: Option<ID2D1PathGeometry>,
     pacman_geo: Option<(ID2D1PathGeometry, ID2D1PathGeometry)>,
     refresh_geo: Option<ID2D1PathGeometry>,
-    dots_geos: HashMap<u32, ID2D1PathGeometry>,
     u16_buf: std::cell::RefCell<Vec<u16>>,
     dash_style: Option<ID2D1StrokeStyle>,
     mcp_cache: Option<main::McpCompCache>,
+    token_cells: Option<main::TokenCells>,
 }
 
 impl Renderer {
@@ -315,10 +315,10 @@ impl Renderer {
                 eye_geo: None,
                 pacman_geo: None,
                 refresh_geo: None,
-                dots_geos: HashMap::new(),
                 u16_buf: std::cell::RefCell::new(Vec::new()),
                 dash_style: None,
                 mcp_cache: None,
+                token_cells: None,
             })
         }
     }
@@ -713,7 +713,7 @@ impl Renderer {
             right: x + w,
             bottom: y + h,
         };
-        self.text_rect_opts(
+        self.text_aligned(
             target,
             s,
             &rect,
@@ -737,7 +737,7 @@ impl Renderer {
         color: [f32; 4],
         alpha: f32,
     ) {
-        self.text_rect_opts(
+        self.text_aligned(
             target,
             s,
             rect,
@@ -812,25 +812,6 @@ impl Renderer {
             let _ = fmt.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         }
         let _ = fmt.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
-    }
-
-    /// 文本绘制的完整选项版：对齐 + 字体族
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn text_rect_opts(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        s: &str,
-        rect: &D2D_RECT_F,
-        size: f32,
-        weight: u16,
-        color: [f32; 4],
-        alpha: f32,
-        align: Align,
-        mono: bool,
-    ) {
-        self.text_raw(
-            target, s, rect, size, weight, color, alpha, align, mono, false, false, false,
-        );
     }
 
     /// 按枚举对齐绘制文本，段落对齐保持顶部；mono 选择等宽字体。

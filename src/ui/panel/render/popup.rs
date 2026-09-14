@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarge
 use super::{Align, Hit, Renderer};
 use crate::ui::panel::anim::ease_out_cubic;
 use crate::ui::panel::model::PanelModel;
+use crate::ui::panel::theme::CARD_RADIUS;
 
 /// 弹窗逻辑宽
 pub const POPUP_W: f32 = 220.0;
@@ -109,8 +110,8 @@ impl Renderer {
                         right: w - pad + 4.0,
                         bottom: y + ROW_H - 2.0,
                     },
-                    radiusX: 6.0,
-                    radiusY: 6.0,
+                    radiusX: CARD_RADIUS,
+                    radiusY: CARD_RADIUS,
                 };
                 let fill = self.brush(target, self.theme.track, alpha);
                 target.FillRoundedRectangle(&row, &fill);

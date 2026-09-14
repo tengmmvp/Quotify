@@ -5,10 +5,11 @@
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
+use super::widgets::BADGE_H;
 use super::{Align, AppearanceChoice, Hit, LanguageChoice, Renderer, ScopeChoice};
 use crate::api::Platform;
 use crate::ui::panel::model::PanelModel;
-use crate::ui::panel::theme::RADIUS;
+use crate::ui::panel::theme::{CARD_RADIUS, RADIUS};
 use crate::ui::panel::{InputField, Panel, layout};
 
 impl Renderer {
@@ -176,7 +177,7 @@ impl Renderer {
                 bx,
                 y,
                 88.0,
-                30.0,
+                layout::SAVE_BTN_H,
                 s.save,
                 alpha,
                 true,
@@ -187,7 +188,7 @@ impl Renderer {
                 bx + 100.0,
                 y,
                 88.0,
-                30.0,
+                layout::SAVE_BTN_H,
                 s.cancel,
                 alpha,
                 false,
@@ -209,26 +210,25 @@ impl Renderer {
             } else {
                 platform
             };
-            // 版本 / 等级来自用量数据，无数据时占位
+            // 版本 / 等级来自用量数据，缺则不画徽标；全借用快照字段，重绘零分配
             let (version, tier) = match model.snapshot {
                 Some(snap) => {
-                    let t = snap.tier.label();
-                    let tier = if t.is_empty() {
-                        snap.plan_label.clone().unwrap_or_else(|| "—".into())
-                    } else {
-                        t.to_string()
-                    };
-                    (snap.plan_version.label().to_string(), tier)
+                    let tier = snap.tier_label();
+                    let v = snap.plan_version.label();
+                    (
+                        (!v.is_empty()).then_some(v),
+                        (!tier.is_empty()).then_some(tier),
+                    )
                 }
-                None => ("—".to_string(), "—".to_string()),
+                None => (None, None),
             };
             self.account_card(
                 target,
                 Hit::RemoveAccount(acc.index),
                 acc.name,
                 platform,
-                &version,
-                &tier,
+                version,
+                tier,
                 pad,
                 y,
                 cw,
@@ -258,7 +258,7 @@ impl Renderer {
             pad,
             y + 2.0,
             cw,
-            30.0,
+            layout::SAVE_BTN_H,
             s.add_account,
             alpha,
             false,
@@ -334,7 +334,7 @@ impl Renderer {
                 w - pad - 56.0,
                 iy - 1.0,
                 56.0,
-                28.0,
+                layout::BTN_H,
                 s.apply,
                 alpha,
             );
@@ -455,7 +455,7 @@ impl Renderer {
             w - pad - 48.0,
             pky - 1.0,
             48.0,
-            28.0,
+            layout::BTN_H,
             s.apply,
             alpha,
         );
@@ -559,7 +559,7 @@ impl Renderer {
             bx,
             y,
             104.0,
-            28.0,
+            layout::BTN_H,
             s.export_config,
             alpha,
         );
@@ -569,7 +569,7 @@ impl Renderer {
             bx + 116.0,
             y,
             104.0,
-            28.0,
+            layout::BTN_H,
             s.import_config,
             alpha,
         );
@@ -619,7 +619,7 @@ impl Renderer {
             w - pad - btn_w,
             y + 1.0,
             btn_w,
-            28.0,
+            layout::BTN_H,
             btn_label,
             alpha,
         );
@@ -773,7 +773,7 @@ impl Renderer {
             bottom: y + 22.0,
         };
         if content.is_empty() && !placeholder.is_empty() {
-            self.text_rect_opts(
+            self.text_aligned(
                 target,
                 placeholder,
                 &text_rect,
@@ -817,7 +817,7 @@ impl Renderer {
                     );
                 }
             }
-            self.text_rect_opts(
+            self.text_aligned(
                 target,
                 &vis,
                 &text_rect,
@@ -851,7 +851,7 @@ impl Renderer {
                     vis = chars[k..].iter().collect();
                 }
             }
-            self.text_rect_opts(
+            self.text_aligned(
                 target,
                 &vis,
                 &text_rect,
@@ -915,13 +915,13 @@ impl Renderer {
             x,
             y + 1.0,
             w - 56.0,
-            18.0,
+            layout::TOGGLE_TITLE_DRAW_H,
             13.0,
             400,
             self.theme.text_primary,
             alpha,
         );
-        let mut ty = y + 19.0;
+        let mut ty = y + layout::TOGGLE_TITLE_H;
         if !desc.is_empty() {
             self.text(
                 target,
@@ -929,13 +929,13 @@ impl Renderer {
                 x,
                 ty,
                 w - 56.0,
-                14.0,
+                layout::TOGGLE_DESC_DRAW_H,
                 12.0,
                 400,
                 self.theme.text_tertiary,
                 alpha,
             );
-            ty += 14.0;
+            ty += layout::TOGGLE_DESC_H;
         }
         let (tw, th) = (38.0, 22.0);
         let tx = x + w - tw;
@@ -975,7 +975,7 @@ impl Renderer {
                 bottom: cy + th + 6.0,
             },
         ));
-        ty + 9.0
+        ty + layout::TOGGLE_TAIL
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1064,8 +1064,8 @@ impl Renderer {
         remove: Hit,
         name: &str,
         platform: &str,
-        version: &str,
-        tier: &str,
+        version: Option<&str>,
+        tier: Option<&str>,
         x: f32,
         y: f32,
         w: f32,
@@ -1079,24 +1079,24 @@ impl Renderer {
                 right: x + w,
                 bottom: y + h,
             },
-            radiusX: RADIUS,
-            radiusY: RADIUS,
+            radiusX: CARD_RADIUS,
+            radiusY: CARD_RADIUS,
         };
         let fill = self.brush(target, self.theme.track, alpha);
         target.FillRoundedRectangle(&card, &fill);
-        let edge = self.brush(target, self.theme.border, alpha * 0.8);
+        let edge = self.brush(target, self.theme.card_border, alpha);
         target.DrawRoundedRectangle(&card, &edge, 1.0, None);
         // 徽标与关闭钮居右对齐，名称吃左侧剩余空间；从右界向左依次排 tier/version/platform
-        let by = y + (h - 17.0) / 2.0;
+        let by = y + (h - BADGE_H) / 2.0;
         let mut bx = x + w - 56.0; // 徽标区右界，给右侧 × 留位
-        if tier != "—" {
+        if let Some(tier) = tier {
             let tw = self.measure(tier, 10.5, 400, false) + 14.0;
             bx -= tw;
             let (edge, fg) = self.tier_badge_colors(tier);
             self.badge(target, tier, bx, by, tw, edge, fg, alpha, false);
             bx -= 6.0;
         }
-        if version != "—" {
+        if let Some(version) = version {
             let vw = self.measure(version, 10.5, 400, true) + 14.0;
             bx -= vw;
             self.badge(

@@ -4,32 +4,47 @@ use chrono::{DateTime, Local, Utc};
 
 use crate::ui::i18n::Lang;
 
+/// 缺失值占位符
+pub const MISSING: &str = "—";
+
 /// 大数字紧凑缩写
+///
+/// ≥1000 缩为 k/M/B 保留一位小数，跨档进位升后缀。
 pub fn compact_number(v: f64) -> String {
+    let (mut num, unit) = compact_number_split(v);
+    if !unit.is_empty() {
+        num.push_str(unit);
+    }
+    num
+}
+
+/// 分离式大数字紧凑缩写
+///
+/// 数字与单位分离返回，卡片排版用大数字配小单位。
+pub fn compact_number_split(v: f64) -> (String, &'static str) {
+    if !v.is_finite() {
+        return ("0".to_string(), "");
+    }
     let abs = v.abs();
-    if !v.is_finite() || abs < 1000.0 {
-        return format!("{}", v as i64);
+    if abs < 1000.0 {
+        return (format!("{}", v as i64), "");
     }
-    let (scaled, suffix) = if abs >= 1e9 {
-        (v / 1e9, "B")
+    let (mut div, mut suffix) = if abs >= 1e9 {
+        (1e9, "B")
     } else if abs >= 1e6 {
-        (v / 1e6, "M")
+        (1e6, "M")
     } else {
-        (v / 1e3, "k")
+        (1e3, "k")
     };
-    let s = format!("{scaled:.1}");
-    if suffix != "B" && s.parse::<f64>().is_ok_and(|n| n >= 1000.0) {
-        let (scaled, suffix) = if suffix == "k" {
-            (v / 1e6, "M")
-        } else {
-            (v / 1e9, "B")
-        };
-        let s = format!("{scaled:.1}");
-        let s = s.trim_end_matches('0').trim_end_matches('.');
-        return format!("{s}{suffix}");
+    let mut s = format!("{:.1}", v / div);
+    // 进位跨档：按绝对值判定，负值同升档，不出 "1000k"/"1000M"
+    if suffix != "B" && s.parse::<f64>().is_ok_and(|n| n.abs() >= 1000.0) {
+        div *= 1000.0;
+        suffix = if suffix == "k" { "M" } else { "B" };
+        s = format!("{:.1}", v / div);
     }
-    let s = s.trim_end_matches('0').trim_end_matches('.');
-    format!("{s}{suffix}")
+    let s = s.trim_end_matches('0').trim_end_matches('.').to_string();
+    (s, suffix)
 }
 
 /// 百分比显示
@@ -43,6 +58,9 @@ pub fn countdown(until: DateTime<Utc>, lang: Lang) -> String {
     countdown_from(until, Utc::now(), lang)
 }
 
+/// 倒计时主体
+///
+/// 时间源注入解耦，供测试钉位。
 fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> String {
     let s = i18n_units(lang);
     let u = |unit: &str| -> String {
@@ -76,8 +94,10 @@ pub fn as_of_time(at: DateTime<Local>) -> String {
     at.format("%H:%M").to_string()
 }
 
-/// 页脚「数据更新」文案：60 秒内「刚刚更新」，否则相对时长；换装
-/// 动画的 old_text 与静态页脚共用本函数，防两份实现漂移致动画起点错。
+/// 页脚「数据更新」文案
+///
+/// 60 秒内「刚刚更新」，否则相对时长；换装动画的 old_text 与静态
+/// 页脚共用本函数，防两份实现漂移致动画起点错。
 pub fn updated_text(s: &crate::ui::i18n::Strings, lang: Lang, at: DateTime<Local>) -> String {
     if (Local::now() - at).num_seconds() < 60 {
         s.updated_just_now.to_string()
@@ -111,6 +131,7 @@ pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
     }
 }
 
+/// 倒计时单位文案
 struct Units {
     day: &'static str,
     hour: &'static str,
@@ -118,6 +139,7 @@ struct Units {
     second: &'static str,
 }
 
+/// 按语言取倒计时单位文案
 fn i18n_units(lang: Lang) -> Units {
     let s = lang.strings();
     Units {
@@ -144,6 +166,13 @@ mod tests {
         // 进位跨档：后缀随之升档，不出 "1000k"/"1000M"
         assert_eq!(compact_number(999_960.0), "1M");
         assert_eq!(compact_number(999_950_000.0), "1B");
+        // 负值按绝对值同升档
+        assert_eq!(compact_number(-4233.0), "-4.2k");
+        assert_eq!(compact_number(-999_960.0), "-1M");
+        assert_eq!(compact_number(-999_950_000.0), "-1B");
+        // 非有限值归零：饱和转换会产出 19 位整数撑爆卡片
+        assert_eq!(compact_number(f64::INFINITY), "0");
+        assert_eq!(compact_number(f64::NAN), "0");
     }
 
     #[test]

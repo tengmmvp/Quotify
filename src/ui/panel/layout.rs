@@ -27,6 +27,10 @@ pub const CONTENT_W: f32 = PANEL_WIDTH as f32 - 2.0 * CONTENT_PAD;
 pub const INPUT_X: f32 = CONTENT_PAD;
 /// 输入框后到下一 sub_label 的间距
 pub const INPUT_GAP: f32 = 6.0;
+/// 代理行应用按钮宽与其左侧间隙：输入框右界按两者之和让位，
+/// 按钮绘制与 field_geo 两方同引
+pub const APPLY_BTN_W: f32 = 48.0;
+pub const APPLY_BTN_GAP: f32 = 12.0;
 
 // ── 主视图段高：draw_main 的 y 推进链与 main_view_height 两方同引一组常量 ──
 
@@ -66,9 +70,9 @@ pub(crate) const MAIN_SECTION_GAP: f32 = 6.0;
 pub(crate) const MAIN_SECTION_HEAD: f32 = 12.0;
 /// Token 块：段头文字底到卡片顶的推进
 pub(crate) const MAIN_TOKEN_CARD_ADV: f32 = 20.0;
-/// Token 卡片几何：卡宽由面板宽推导，与卡距 12 让三卡缘 20/124/228
-/// 均为 4 的倍数——x/y 缘在所有 DPI 缩放下描边皆整像素；卡高由
-/// 数值带、标签带、上下留白推导
+/// Token 卡片几何：卡宽由面板宽推导，与卡距让三卡缘均为 4 的倍数，
+/// x/y 缘在所有 DPI 缩放下描边皆整像素。卡高由数值带、标签带、
+/// 上下留白推导。
 pub(crate) const TOKEN_CARD_NUM_Y: f32 = 8.0;
 pub(crate) const TOKEN_CARD_NUM_H: f32 = 24.0;
 pub(crate) const TOKEN_CARD_LABEL_Y: f32 = TOKEN_CARD_NUM_Y + TOKEN_CARD_NUM_H + 4.0;
@@ -103,20 +107,22 @@ pub const SECTION_RULE_H: f32 = SECTION_RULE_GAP + SECTION_LABEL_H;
 pub const ACCOUNT_CARD_H: f32 = 48.0;
 /// 鉴权失败提示行高
 pub const AUTH_ERROR_H: f32 = 18.0;
-/// 常驻添加账号按钮行高：按钮 30 含上下余量
-pub const ADD_BTN_ROW_H: f32 = SAVE_BTN_H + 6.0;
+/// 常驻添加账号按钮高
+pub const ADD_BTN_H: f32 = 28.0;
+/// 常驻添加账号按钮行高：按钮含上下余量
+pub const ADD_BTN_ROW_H: f32 = ADD_BTN_H + 6.0;
 /// 自定义间隔展开增量：输入框 26 + 框后尾隙 12[值同 rule 上隙，语义各自独立]
 pub const CUSTOMIZE_EXTRA_H: f32 = INPUT_H + 12.0;
 /// 设置页常驻按钮高（应用/导出/导入/检查更新）
 pub const BTN_H: f32 = 28.0;
-/// 添加页保存/取消与设置页添加账号按钮高
+/// 添加页保存/取消按钮高
 pub const SAVE_BTN_H: f32 = 30.0;
 /// 开关行内部三段：标题、描述、行后隙；行高由求和推导
 pub const TOGGLE_TITLE_H: f32 = 20.0;
 /// 开关行标题绘制盒高：比推进量内收 2px，与推进量成对存放
 pub const TOGGLE_TITLE_DRAW_H: f32 = TOGGLE_TITLE_H - 2.0;
 pub const TOGGLE_DESC_H: f32 = 12.0;
-/// 开关行描述绘制盒高：12px 字的下伸部需高出推进量 2px，与推进量成对存放
+/// 开关行描述绘制盒高：12px 字的下伸部需高出推进量 2px，与推进量成对存放。
 pub const TOGGLE_DESC_DRAW_H: f32 = TOGGLE_DESC_H + 2.0;
 pub const TOGGLE_TAIL: f32 = 8.0;
 pub const TOGGLE_ROW_H: f32 = TOGGLE_TITLE_H + TOGGLE_DESC_H + TOGGLE_TAIL;
@@ -149,30 +155,30 @@ pub const ADD_ORG_Y: f32 = ADD_KEY_Y + ADD_ROW_STEP;
 /// 添加页团队版：项目 ID 输入框顶部 y
 pub const ADD_PROJECT_Y: f32 = ADD_ORG_Y + ADD_ROW_STEP;
 
-/// caret 高 16 在 26 高框内垂直居中的偏移
+/// caret 在输入框内垂直居中的偏移
 pub const CARET_Y_OFFSET: f32 = 5.0;
 
-/// 高峰起/止输入框 x，跟随各自文本标签右侧；设置页内容区 pad = 20
+/// 高峰起/止输入框 x，跟随各自文本标签右侧。
 pub const PEAK_START_X: f32 = 48.0;
 pub const PEAK_END_X: f32 = 148.0;
 
 /// 设置页自定义间隔输入框顶 y，随账号块与错误行伸缩
 pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
     let mut y = SETTINGS_EDGE_PAD + NAV_H + SECTION_LABEL_H;
-    // 有账号：卡片 + 可选错误行；随后常驻的添加按钮行
+    // 有账号：卡片 + 可选错误行；随后常驻的添加按钮行。
     y += if has_account {
         ACCOUNT_CARD_H + if auth_error { AUTH_ERROR_H } else { 0.0 } + ADD_BTN_ROW_H
     } else {
         ADD_BTN_ROW_H
     };
-    // 尾段：轮询区标题 + 分段体 + 段后隙
+    // 尾段：轮询区标题 + 分段体 + 段后隙。
     y + SECTION_RULE_H + SEGMENTED_H + SEGMENTED_GAP
 }
 
 /// 设置页高峰区间输入行顶 y，位于通知区之后
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
     // 展开自定义间隔时渲染链从 interval_input_y + CUSTOMIZE_EXTRA_H 续走；
-    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点
+    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点。
     let after_interval = if customizing { CUSTOMIZE_EXTRA_H } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
@@ -194,7 +200,7 @@ pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> 
 }
 
 /// 设置页总高（逻辑像素）：从代理输入框续走配置管理、关于、版本行收尾，
-/// 消除 view_height 里独立的整页求和
+/// 消除 view_height 里独立的整页求和。
 pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bool) -> i32 {
     (proxy_input_y(has_account, auth_error, customizing)
         + INPUT_H + PROXY_TAIL_GAP // 代理输入框
@@ -206,8 +212,8 @@ pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bo
 
 /// 添加页总高（逻辑像素）
 ///
-/// 底链 = 末行输入框 + 保存按钮 + 底部余量 10；团队版末行是项目
-/// ID 框（尾隙 12），非团队是 KEY 框（框后隙 + 尾隙 6）。
+/// 底链 = 末行输入框 + 保存按钮 + 底部余量；团队版末行是项目
+/// ID 框，非团队是 KEY 框。
 pub fn add_page_height(team: bool) -> i32 {
     let y = if team {
         ADD_PROJECT_Y + INPUT_H + 12.0
@@ -217,9 +223,9 @@ pub fn add_page_height(team: bool) -> i32 {
     (y + SAVE_BTN_H + 10.0) as i32
 }
 
-/// 主视图总高（逻辑像素）：加载/失败态固定 300；数据态由上方主视图段
+/// 主视图总高（逻辑像素）：加载/失败态固定高；数据态由上方主视图段
 /// 常量链求和，与 draw_main 的 y 推进同源——两侧同引一组常量，几何改动
-/// 不再可能出现绘制侧与高度公式各改一半的漂移
+/// 不再可能出现绘制侧与高度公式各改一半的漂移。
 pub fn main_view_height(
     has_data: bool,
     rows: usize,
@@ -247,28 +253,28 @@ mod tests {
 
     #[test]
     fn interval_input_y_pinned() {
-        assert_eq!(interval_input_y(false, false), 172.0);
-        assert_eq!(interval_input_y(false, true), 172.0);
-        assert_eq!(interval_input_y(true, false), 220.0);
-        assert_eq!(interval_input_y(true, true), 238.0);
+        assert_eq!(interval_input_y(false, false), 170.0);
+        assert_eq!(interval_input_y(false, true), 170.0);
+        assert_eq!(interval_input_y(true, false), 218.0);
+        assert_eq!(interval_input_y(true, true), 236.0);
     }
 
     #[test]
     fn peak_input_y_pinned() {
-        assert_eq!(peak_input_y(false, false, false), 360.0);
-        assert_eq!(peak_input_y(true, false, false), 408.0);
-        assert_eq!(peak_input_y(true, true, false), 426.0);
-        assert_eq!(peak_input_y(true, true, true), 464.0);
-        assert_eq!(peak_input_y(false, false, true), 398.0);
+        assert_eq!(peak_input_y(false, false, false), 358.0);
+        assert_eq!(peak_input_y(true, false, false), 406.0);
+        assert_eq!(peak_input_y(true, true, false), 424.0);
+        assert_eq!(peak_input_y(true, true, true), 462.0);
+        assert_eq!(peak_input_y(false, false, true), 396.0);
     }
 
     #[test]
     fn proxy_input_y_pinned() {
-        assert_eq!(proxy_input_y(false, false, false), 636.0);
-        assert_eq!(proxy_input_y(true, false, false), 684.0);
-        assert_eq!(proxy_input_y(true, true, false), 702.0);
-        assert_eq!(proxy_input_y(true, true, true), 740.0);
-        assert_eq!(proxy_input_y(false, false, true), 674.0);
+        assert_eq!(proxy_input_y(false, false, false), 634.0);
+        assert_eq!(proxy_input_y(true, false, false), 682.0);
+        assert_eq!(proxy_input_y(true, true, false), 700.0);
+        assert_eq!(proxy_input_y(true, true, true), 738.0);
+        assert_eq!(proxy_input_y(false, false, true), 672.0);
     }
 
     #[test]

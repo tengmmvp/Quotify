@@ -376,6 +376,7 @@ impl Renderer {
     }
 
     /// 下拉小箭头
+    /// 收起朝下，展开翻转朝上。
     pub(super) unsafe fn chevron(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -383,19 +384,13 @@ impl Renderer {
         cy: f32,
         color: [f32; 4],
         alpha: f32,
+        up: bool,
     ) {
         let b = self.brush(target, color, alpha);
         let half = 5.0;
-        self.line(target, x, cy - 3.0, x + half, cy + 3.0, &b, 1.8);
-        self.line(
-            target,
-            x + half,
-            cy + 3.0,
-            x + half * 2.0,
-            cy - 3.0,
-            &b,
-            1.8,
-        );
+        let d = if up { -3.0 } else { 3.0 };
+        self.line(target, x, cy - d, x + half, cy + d, &b, 1.8);
+        self.line(target, x + half, cy + d, x + half * 2.0, cy - d, &b, 1.8);
     }
 
     /// 眼睛图标
@@ -638,7 +633,7 @@ impl Renderer {
                 sink.Close().ok()?;
                 Some(geo)
             };
-            // 屏幕坐标 y 向下：上半圆走顺时针小弧（经顶部），下半圆对称
+            // 屏幕坐标 y 向下：上半圆走顺时针小弧（经顶部），下半圆对称。
             let upper = build_half(true)?;
             let lower = build_half(false)?;
             Some((upper, lower))

@@ -6,17 +6,22 @@ use std::hash::{Hash, Hasher};
 use std::sync::{LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    AccountSpec, Balance, ERR_BODY_CHARS, FetchError, Platform, TOKEN_LEGS, TokenStats,
+    AccountSpec, Balance, ERR_BODY_CHARS, ErrorInfo, FetchError, Platform, TOKEN_LEGS, TokenStats,
     UsageSnapshot, parse_response, parse_token_total,
 };
 
-/// body 读取硬上限
+/// 响应体读取硬上限
 pub(crate) const MAX_BODY_BYTES: u64 = 1024 * 1024;
+/// 错误响应体读取上限
+const ERR_BODY_BYTES: u64 = 64 * 1024;
+/// 官方提示的字符上限
+const ERR_MSG_CHARS: usize = 100;
 
-/// 双超时 Agent 缓存
+/// 长短超时双 Agent 缓存
 struct AgentCache {
     proxy: Option<String>,
     short: ureq::Agent,
@@ -34,7 +39,8 @@ fn agents_write() -> RwLockWriteGuard<'static, Option<AgentCache>> {
 }
 
 impl AgentCache {
-    /// Agent 内部是 Arc 句柄，clone 只复制引用
+    /// Agent 缓存的廉价克隆
+    /// 内部是 Arc 句柄，克隆只复制引用。
     fn cloned(&self) -> AgentCache {
         AgentCache {
             proxy: self.proxy.clone(),
@@ -44,13 +50,14 @@ impl AgentCache {
     }
 }
 
-/// 缓存缺失时按无代理构建；读锁判空到取写锁之间可能被并发回填，须双检
+/// 取全局 Agent 缓存
+/// 缓存缺失时按无代理构建。
 fn agents() -> AgentCache {
     if let Some(c) = agents_read().as_ref() {
         return c.cloned();
     }
     let mut guard = agents_write();
-    // 双检：等写锁期间别的线程可能已构建，直接复用避免重复建 Agent
+    // 双检：等写锁期间别的线程可能已构建，直接复用避免重复建 Agent。
     if let Some(c) = guard.as_ref() {
         return c.cloned();
     }
@@ -71,8 +78,9 @@ pub(crate) fn agent_long() -> ureq::Agent {
     agents().long
 }
 
-/// 校验代理地址形态：显式 http:// 或 socks5:// 前缀、host 非空、
-/// 端口 1–65535。ureq 会默认补前缀且不校验端口，须自行解析。
+/// 校验代理地址形态
+/// 显式 http:// 或 socks5:// 前缀、host 非空、端口 1–65535。
+/// ureq 会默认补前缀且不校验端口，须自行解析。
 pub fn proxy_valid(s: &str) -> Result<(), String> {
     let lower = s.trim().to_ascii_lowercase();
     let rest = lower
@@ -119,13 +127,14 @@ pub fn set_proxy(proxy: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// 统一配置：全局超时 + https_only；状态码不转错误，集中在 `http_get_text` 分类
+/// Agent 统一配置
+/// 全局超时与 https_only。状态码不转错误，集中在 `http_get_text` 分类。
 fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
     let mut builder = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_secs)))
         .https_only(true)
         .http_status_as_error(false)
-        // 空闲连接默认 15s 回收，短于轮询间隔致每轮重建连接；放宽让池子跨轮询存活
+        // 空闲连接默认 15s 回收，短于轮询间隔致每轮重建连接；放宽让池子跨轮询存活。
         .max_idle_age(Duration::from_secs(86400));
     builder = match proxy {
         Some(p) => builder.proxy(Some(p.clone())),
@@ -134,18 +143,18 @@ fn build_agent(timeout_secs: u64, proxy: Option<&ureq::Proxy>) -> ureq::Agent {
     builder.build().into()
 }
 
-/// 需要 Bearer 前缀的 key 集合[进程内记忆，存 key 的稳定 hash]：
-/// 401 换形态重试成功后更新，下轮首轮即用对的凭证形态，免去每轮一次
-/// 注定 401 的白费请求；切账号后 hash 不同自然隔离，无需清理
+/// 需要 Bearer 前缀的 key 集合
+/// 401 换形态重试成功后记忆，下轮首轮即用对的凭证形态。
 static NEEDS_BEARER: LazyLock<Mutex<HashSet<u64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// key → 稳定 hash。仅作进程内集合去重，无安全要求。
+/// key → 稳定 hash
 fn key_hash(key: &str) -> u64 {
     let mut h = DefaultHasher::new();
     key.hash(&mut h);
     h.finish()
 }
 
+/// 查询 key 是否已记忆为需 Bearer 形态
 fn needs_bearer(key: &str) -> bool {
     NEEDS_BEARER
         .lock()
@@ -153,7 +162,8 @@ fn needs_bearer(key: &str) -> bool {
         .contains(&key_hash(key))
 }
 
-/// 记忆/遗忘 key 的 Bearer 形态；锁中毒沿 AGENTS 惯例取内部数据继续用
+/// 记忆或遗忘 key 的 Bearer 形态
+/// 锁中毒时数据仍完好，取内部数据继续用。
 fn set_needs_bearer(key: &str, on: bool) {
     let mut set = NEEDS_BEARER.lock().unwrap_or_else(|e| e.into_inner());
     if on {
@@ -163,7 +173,8 @@ fn set_needs_bearer(key: &str, on: bool) {
     }
 }
 
-/// join 作用域线程；线程 panic 原样上抛，等价于无线程时的直接传播
+/// join 作用域线程
+/// 线程 panic 原样上抛，等价于无线程时的直接传播。
 fn join<T: Send>(handle: Option<std::thread::ScopedJoinHandle<'_, T>>) -> Option<T> {
     handle.map(|h| match h.join() {
         Ok(v) => v,
@@ -171,10 +182,25 @@ fn join<T: Send>(handle: Option<std::thread::ScopedJoinHandle<'_, T>>) -> Option
     })
 }
 
+/// 余额端点日志状态变化才记：同账号同状态不重复记，恢复清底再故障
+/// 重记；键含 key 指纹，账号间互不遮蔽
+fn log_balance_state(key: &str, line: Option<String>) {
+    static LAST: LazyLock<Mutex<(u64, Option<String>)>> = LazyLock::new(|| Mutex::new((0, None)));
+    let id = key_hash(key);
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.0 == id && last.1 == line {
+        return;
+    }
+    if let Some(line) = line.as_deref() {
+        crate::platform::log(line);
+    }
+    *last = (id, line);
+}
+
 /// 查询一次用量快照
 pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     let team = spec.team_scope();
-    // quota 是主数据，失败语义独立：Auth 换凭证形态重试，其余错误直接上抛
+    // quota 是主数据，失败语义独立。Auth 换凭证形态重试，其余错误直接上抛。
     let plain = spec.api_key.as_str();
     let bearer = format!("Bearer {plain}");
     let remembered = needs_bearer(plain);
@@ -184,12 +210,14 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         (plain, bearer.as_str())
     };
     let TokenWindows { starts, end } = token_params(chrono::Local::now());
-    // 五路全并行：主数据不被慢附加端点拖住；附加路失败只缺块不拖垮
-    // 主用量，切换轮 401 丢块下轮即对。
+    // 五路并行：主数据不被慢附加端点拖住，附加路失败只缺块不拖垮主用量。
+    // 换形态那轮附加端点可能 401 丢块，下轮记忆形态后恢复。
     let (quota, legs, balance) = std::thread::scope(|scope| {
         let quota = scope.spawn(|| match fetch_quota(spec.platform, first, team) {
             Ok(snap) => Ok(snap),
-            Err(FetchError::Auth) => {
+            // 换形态重试只认 401/403 状态：信封鉴权失败发生在 HTTP 200，
+            // 凭证形态已被接受，重试无意义。
+            Err(FetchError::Unauthenticated(info)) if is_auth_status(info.status) => {
                 let snap = fetch_quota(spec.platform, second, team)?;
                 // 换形态重试成功：记忆本轮生效的形态，下轮首轮直用。
                 set_needs_bearer(plain, !remembered);
@@ -198,11 +226,11 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
             Err(e) => Err(e),
         });
         let end = end.as_str();
-        // 档机制单源：增删档位只改 TOKEN_LEGS
+        // 档机制单源：增删档位只改 TOKEN_LEGS。
         let legs: [_; TOKEN_LEGS.len()] = starts.map(|s| {
             s.map(|s| scope.spawn(move || fetch_token_window(spec.platform, first, team, &s, end)))
         });
-        // 余额端点仅国内版有
+        // 余额端点仅国内版有。
         let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
         let quota = quota
             .join()
@@ -210,8 +238,8 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         (quota, legs.map(join), join(balance))
     });
     let mut snap = quota?;
-    // 逐档独立：单档失败画占位不拖垮其余档，三档全无数据才整体隐藏；
-    // 失败档聚合一行，持久故障不逐档刷屏。
+    // 逐档独立：单档失败不拖垮其余档，三档全缺才整体隐藏。
+    // 失败档聚合一行日志，持久故障不刷屏。
     let failed: Vec<String> = TOKEN_LEGS
         .iter()
         .zip(&legs)
@@ -226,32 +254,41 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
             failed.join("; ")
         ));
     }
+    // 子端点 429 不单独退避：主端点健康即按常规节奏，下一轮自然重试。
+    // 任一档在场即块的活跃时刻。
     let stats = TokenStats {
         legs: legs.map(|l| l.and_then(Result::ok)),
+        as_of: chrono::Utc::now(),
     };
     if stats.legs.iter().any(Option::is_some) {
         snap.token_stats = Some(stats);
     }
     if let Some(balance) = balance {
         match balance {
-            Ok(b) => snap.balance = b,
-            Err(e) => crate::platform::log(&format!("[Quotify] 余额拉取失败: {e}")),
+            Ok(Some(b)) => {
+                snap.balance = Some(b);
+                log_balance_state(plain, None);
+            }
+            // 信封失败与形态不符同按无数据处理：日志留痕，旧值由回填沿用。
+            Ok(None) => log_balance_state(plain, Some("[Quotify] 余额响应无有效数据".into())),
+            Err(e) => log_balance_state(plain, Some(format!("[Quotify] 余额拉取失败: {e}"))),
         }
     }
     Ok(snap)
 }
 
-/// Token 统计的三区间时间窗：三起点按 TOKEN_LEGS 档序、终点共用；
-/// 单窗起点本地化失败仅该窗缺席，不牵连其余窗。
+/// Token 统计的三区间时间窗
+/// 三起点按 TOKEN_LEGS 档序、终点共用。单窗起点本地化失败仅该窗缺席，
+/// 不牵连其余窗。
 struct TokenWindows {
     starts: [Option<String>; TOKEN_LEGS.len()],
     end: String,
 }
 
-/// Token 统计区间参数：今日 / 6 天前 / 29 天前 0 点三起点 + 当天末
-/// 终点；周/月窗含今天共 7 / 30 个自然日（月非自然月）。起点须在
-/// 日期侧减天数再本地化——DateTime 直接减 Duration 是 UTC 瞬时
-/// 运算，夏令时交界会漂移一小时。
+/// Token 统计区间参数
+/// 今日、6 天前、29 天前 0 点三起点加当天末终点，周/月窗含今天
+/// 共 7 / 30 个自然日，月非自然月。起点须在日期侧减天数再本地化，
+/// DateTime 直接减 Duration 是 UTC 瞬时运算，夏令时交界会漂移一小时。
 fn token_params(now: chrono::DateTime<chrono::Local>) -> TokenWindows {
     // 夏令时回拨致 0 点歧义时取早侧：宁早一小时，不缺整窗。
     let day_start = |offset: u64, tag: &str| {
@@ -275,7 +312,8 @@ fn token_params(now: chrono::DateTime<chrono::Local>) -> TokenWindows {
     }
 }
 
-/// 拉取单个区间的 token 总消耗，合计优先取服务端 totalUsage
+/// 拉取单个区间的 token 总消耗
+/// 合计优先取服务端 totalUsage。
 fn fetch_token_window(
     platform: Platform,
     api_key: &str,
@@ -300,23 +338,29 @@ fn fetch_token_window(
     parse_token_total(&body)
 }
 
-/// 时间戳 → `YYYY-MM-DD HH:mm:ss`，空格百分号编码后可直接拼 URL
+/// 时间戳转 `YYYY-MM-DD HH:mm:ss`
+/// 空格百分号编码后可直接拼 URL。
 fn stamp(dt: &chrono::DateTime<chrono::Local>) -> String {
     dt.format("%Y-%m-%d %H:%M:%S")
         .to_string()
         .replace(' ', "%20")
 }
 
-/// 账户余额[仅国内版]
+/// 账户余额查询[仅国内版]
 fn fetch_balance(api_key: &str) -> Result<Option<Balance>, FetchError> {
     let url = "https://www.bigmodel.cn/api/biz/account/query-customer-account-report";
     let body = http_get(url, api_key)?;
     Ok(parse_balance(&body))
 }
 
-/// 余额报告响应解析：availableBalance 优先、balance 回退，两者皆缺
-/// 说明形态未知宁缺毋假；数值字段非有限数按缺处理。
+/// 余额报告响应解析
+/// 信封校验与配额侧 envelope_check 同源，标记失败即丢弃，由落库
+/// 回填沿用旧值。availableBalance 优先、balance 回退，非有限数与
+/// 两值皆缺按无数据处理。
 fn parse_balance(v: &Value) -> Option<Balance> {
+    if super::envelope_check(v).is_err() {
+        return None;
+    }
     let data = v.get("data").filter(|d| d.is_object())?;
     let num = |k: &str| {
         data.get(k)
@@ -326,18 +370,21 @@ fn parse_balance(v: &Value) -> Option<Balance> {
     let available = num("availableBalance").or_else(|| num("balance"))?;
     Some(Balance {
         available,
+        as_of: Utc::now(),
         recharged: num("rechargeAmount"),
         granted: num("giveAmount"),
         spent: num("totalSpendAmount"),
     })
 }
 
+/// GET 并解析 JSON
 fn http_get(url: &str, api_key: &str) -> Result<Value, FetchError> {
     let body = http_get_text(&agent_short(), url, api_key, &[])?;
-    serde_json::from_str(&body).map_err(|e| FetchError::Api(format!("parse failed: {e}")))
+    serde_json::from_str(&body)
+        .map_err(|e| FetchError::Failure(ErrorInfo::local(format!("parse failed: {e}"))))
 }
 
-/// 共用请求底层
+/// 发送 GET 返回响应体文本
 fn http_get_text(
     agent: &ureq::Agent,
     url: &str,
@@ -355,44 +402,126 @@ fn http_get_text(
     let resp = req.call().map_err(|e| FetchError::Network(e.to_string()))?;
     let status = resp.status().as_u16();
     if !(200..=299).contains(&status) {
-        // 错误路径 body 只进消息前缀，读取失败按空串处理
-        let body = read_body_capped(resp.into_body()).unwrap_or_default();
-        let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
-        // 分类函数只在 2xx 返回 None，此处必非 2xx；兜底防分类逻辑与分支漂移后 panic
-        return Err(classify_status(status, &prefix)
-            .unwrap_or_else(|| FetchError::Api(format!("HTTP {status}"))));
+        // 429 单独归类，Retry-After 头须在 into_body 消费前读取。
+        let retry_after_secs = (status == 429)
+            .then(|| {
+                resp.headers()
+                    .get("Retry-After")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(parse_retry_after)
+            })
+            .flatten();
+        let body = read_body_prefix(resp.into_body(), ERR_BODY_BYTES);
+        let (code, message) = error_body_fields(&body);
+        return Err(classify_status(status, code, message, retry_after_secs));
     }
-    read_body_capped(resp.into_body()).map_err(|e| FetchError::Network(e.to_string()))
+    read_body_capped(resp.into_body(), MAX_BODY_BYTES)
+        .map_err(|e| FetchError::Network(e.to_string()))
 }
 
-/// 非 2xx 状态分类：401/403 → `Auth`，429/5xx → `Network`，其余 → `Api`
-fn classify_status(status: u16, detail: &str) -> Option<FetchError> {
-    if status == 401 || status == 403 {
-        return Some(FetchError::Auth);
+/// 非 2xx 响应体的字段提取
+/// 官方形态为 `{"error":{"code","message"}}`，code 解析同引
+/// code_value 单源，message 截到字符上限。形态不符回退截断原文。
+fn error_body_fields(body: &str) -> (Option<i64>, String) {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| {
+            // 非对象 error 形态与缺失同走原文回退。
+            let e = v.get("error")?.as_object()?;
+            let code = e.get("code").and_then(crate::api::code_value);
+            // message 缺失为空串走只有码降级。
+            let message: String = e
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|m| m.chars().take(ERR_MSG_CHARS).collect())
+                .unwrap_or_default();
+            // 码与提示全空的空壳对象与形态不符同走原文回退。
+            (code.is_some() || !message.is_empty()).then_some((code, message))
+        })
+        .unwrap_or_else(|| (None, body.chars().take(ERR_BODY_CHARS).collect()))
+}
+
+/// 429 退避等待的封顶秒数
+pub(crate) const RATE_LIMIT_BACKOFF_MAX_SECS: u64 = 300;
+
+/// Retry-After 头解析
+/// 支持整数秒与 HTTP-date 两种格式，负偏移归零并钳到退避上限。
+fn parse_retry_after(v: &str) -> Option<u64> {
+    if let Ok(secs) = v.trim().parse::<i64>() {
+        return Some(secs.clamp(0, RATE_LIMIT_BACKOFF_MAX_SECS as i64) as u64);
     }
-    if (200..=299).contains(&status) {
-        return None;
-    }
-    let text = if detail.is_empty() {
-        format!("HTTP {status}")
-    } else {
-        format!("HTTP {status}: {detail}")
-    };
-    Some(if status == 429 || status >= 500 {
-        FetchError::Network(text)
-    } else {
-        FetchError::Api(text)
+    DateTime::parse_from_rfc2822(v.trim()).ok().map(|t| {
+        (t.timestamp() - Utc::now().timestamp()).clamp(0, RATE_LIMIT_BACKOFF_MAX_SECS as i64) as u64
     })
 }
 
-/// 按上限读 body；无效 UTF-8 以 `?` 替换，对齐 ureq 默认行为
-fn read_body_capped(body: ureq::Body) -> Result<String, ureq::Error> {
+/// 鉴权状态判定：401/403。
+/// 换形态重试守卫与 classify_status 的变体选择同引此谓词；
+/// 两侧码集一旦分叉，重试对新生效的状态就静默失效。
+fn is_auth_status(status: u16) -> bool {
+    matches!(status, 401 | 403)
+}
+
+/// 非 2xx 状态分类：429 全部归类的单点。
+/// 401/403 归 Unauthenticated；429 先看身体码——账户与订阅状态类
+/// 不是速率限制，退避等不来恢复，1309 与信封路径同判空态，其余
+/// 账户态归 Failure，无码或其余码按 Throttled 携带 Retry-After 退避；
+/// 其余状态归 Failure，大类由 category 按状态类判定。鉴权判定只按
+/// 状态：非 401/403 的故障即使回显鉴权码也不换形态重试。
+fn classify_status(
+    status: u16,
+    code: Option<i64>,
+    message: String,
+    retry_after_secs: Option<u64>,
+) -> FetchError {
+    if is_auth_status(status) {
+        return FetchError::Unauthenticated(ErrorInfo {
+            status,
+            code,
+            message,
+        });
+    }
+    if status == 429 {
+        if code == Some(1309) {
+            return FetchError::Empty;
+        }
+        if !code.is_some_and(crate::api::is_account_state) {
+            return FetchError::Throttled {
+                info: ErrorInfo {
+                    status,
+                    code,
+                    message,
+                },
+                retry_after_secs,
+            };
+        }
+    }
+    FetchError::Failure(ErrorInfo {
+        status,
+        code,
+        message,
+    })
+}
+
+/// 按上限读 body
+/// 无效 UTF-8 以 `?` 替换，对齐 ureq 默认行为。
+fn read_body_capped(body: ureq::Body, limit: u64) -> Result<String, ureq::Error> {
     body.into_with_config()
-        .limit(MAX_BODY_BYTES)
+        .limit(limit)
         .lossy_utf8(true)
         .read_to_string()
 }
 
+/// 按上限读错误体前缀
+/// 达到上限保留已读部分继续走提取，不因超限整体丢弃。
+fn read_body_prefix(body: ureq::Body, limit: u64) -> String {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let _ = body.into_reader().take(limit).read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// 拉取主用量 quota/limit
 fn fetch_quota(
     platform: Platform,
     auth: &str,
@@ -413,7 +542,7 @@ fn fetch_quota(
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_status, parse_balance, proxy_valid, token_params};
+    use super::{parse_balance, proxy_valid, token_params};
     use crate::api::FetchError;
     use serde_json::json;
 
@@ -443,6 +572,39 @@ mod tests {
         // data 非对象 / 缺失同 None
         assert!(parse_balance(&json!({ "data": 3 })).is_none());
         assert!(parse_balance(&json!({})).is_none());
+        // 信封 success/code 显式失败视为无数据，落库回填沿用旧值
+        assert!(parse_balance(&json!({ "success": false, "data": { "balance": 7.0 } })).is_none());
+        assert!(
+            parse_balance(&json!({ "code": 500, "success": true, "data": { "balance": 7.0 } }))
+                .is_none()
+        );
+        assert!(parse_balance(&json!({ "success": true, "data": { "balance": 7.0 } })).is_some());
+        // 真实响应形态钉位：null 次级字段、科学计数法与
+        // 字符串字段并存，充值+赠送-花费=可用。
+        let b = parse_balance(&json!({
+            "code": 200,
+            "msg": "操作成功",
+            "data": {
+                "balance": 137.66,
+                "rechargeAmount": 100.0,
+                "giveAmount": 50.0,
+                "totalSpendAmount": 12.34,
+                "todaySpendAmount": null,
+                "availableBalance": 137.66,
+                "frozenBalance": 0e-9,
+                "creditBalance": null,
+                "availableCreditBalance": null,
+                "creditStatus": "NOT_OPEN",
+                "modelSpendAmountList": null,
+                "isKA": false
+            },
+            "success": true
+        }))
+        .unwrap();
+        assert_eq!(b.available, 137.66);
+        assert_eq!(b.recharged, Some(100.0));
+        assert_eq!(b.granted, Some(50.0));
+        assert_eq!(b.spent, Some(12.34));
         // 非有限数按缺处理
         let b =
             parse_balance(&json!({ "data": { "balance": 3.0, "rechargeAmount": null } })).unwrap();
@@ -491,35 +653,109 @@ mod tests {
 
     #[test]
     fn status_classification() {
-        assert!(classify_status(200, "").is_none());
-        assert!(classify_status(204, "").is_none());
+        use super::classify_status;
         assert!(matches!(
-            classify_status(401, "denied"),
-            Some(FetchError::Auth)
-        ));
-        assert!(matches!(classify_status(403, ""), Some(FetchError::Auth)));
-        assert!(matches!(
-            classify_status(429, "Too Many Requests"),
-            Some(FetchError::Network(_))
+            classify_status(401, Some(1000), "denied".into(), None),
+            FetchError::Unauthenticated(_)
         ));
         assert!(matches!(
-            classify_status(500, ""),
-            Some(FetchError::Network(_))
+            classify_status(403, None, String::new(), None),
+            FetchError::Unauthenticated(_)
+        ));
+        // 429 单点分流：1309 与信封同判空态，账户态不走退避，其余
+        // 含无码按 Throttled 携带 Retry-After
+        assert!(matches!(
+            classify_status(429, Some(1309), "expired".into(), None),
+            FetchError::Empty
         ));
         assert!(matches!(
-            classify_status(503, "busy"),
-            Some(FetchError::Network(_))
+            classify_status(429, Some(1314), "企业套餐已失效".into(), Some(45)),
+            FetchError::Failure(_)
         ));
-        // 其余非 2xx 为确定性业务错误
         assert!(matches!(
-            classify_status(404, "nope"),
-            Some(FetchError::Api(_))
+            classify_status(429, Some(1302), "限速".into(), Some(45)),
+            FetchError::Throttled {
+                retry_after_secs: Some(45),
+                ..
+            }
         ));
-        assert!(matches!(classify_status(400, ""), Some(FetchError::Api(_))));
-        // detail 拼接格式
+        assert!(matches!(
+            classify_status(429, None, String::new(), None),
+            FetchError::Throttled { .. }
+        ));
+        // 其余非 2xx 归 Failure，大类由 category 按状态类判
+        for status in [400, 404, 500, 503] {
+            assert!(matches!(
+                classify_status(status, None, String::new(), None),
+                FetchError::Failure(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn error_body_fields_shapes() {
+        use super::error_body_fields;
+        // 官方错误形态：码与提示成对提取，字符串形态统一收数字
         assert_eq!(
-            classify_status(429, "slow down").unwrap().to_string(),
-            "HTTP 429: slow down"
+            error_body_fields(
+                r#"{"error":{"code":"1113","message":"您的账户已欠费，请充值后重试"}}"#
+            ),
+            (Some(1113), "您的账户已欠费，请充值后重试".to_string())
+        );
+        // code 数字形态也兼容
+        assert_eq!(
+            error_body_fields(r#"{"error":{"code":1309,"message":"expired"}}"#),
+            (Some(1309), "expired".to_string())
+        );
+        // 非 JSON / 形态不符：回退截断原文
+        assert_eq!(
+            error_body_fields("gateway html"),
+            (None, "gateway html".into())
+        );
+        assert_eq!(error_body_fields(""), (None, String::new()));
+        // error 无 message 字段：只有码降级，不整体回退
+        assert_eq!(
+            error_body_fields(r#"{"error":{"code":"1000"}}"#),
+            (Some(1000), String::new())
+        );
+        // 非对象 error：原文回退，响应内容不丢
+        assert_eq!(
+            error_body_fields(r#"{"error":"bad gateway"}"#),
+            (None, r#"{"error":"bad gateway"}"#.to_string())
+        );
+        assert_eq!(
+            error_body_fields(r#"{"error":null}"#),
+            (None, r#"{"error":null}"#.to_string())
+        );
+        // 超长提示截到字符上限
+        let long = "x".repeat(300);
+        let body = format!(r#"{{"error":{{"code":"1113","message":"{long}"}}}}"#);
+        let (_, msg) = error_body_fields(&body);
+        assert_eq!(msg.chars().count(), super::ERR_MSG_CHARS);
+    }
+
+    #[test]
+    fn retry_after_shapes() {
+        use super::parse_retry_after;
+        // 整数秒与带空白
+        assert_eq!(parse_retry_after("30"), Some(30));
+        assert_eq!(parse_retry_after(" 120 \r\n"), Some(120));
+        // 负偏移归零：立即即可重试
+        assert_eq!(parse_retry_after("-5"), Some(0));
+        // 病态大值钳到退避上限
+        assert_eq!(parse_retry_after("999999999"), Some(300));
+        assert_eq!(parse_retry_after("17600000000000"), Some(300));
+        // 超出 i64 的垃圾值解析失败归 None，走无头退避
+        assert_eq!(parse_retry_after("99999999999999999999"), None);
+        // 不可解析
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // HTTP-date（RFC 1123）绝对时刻：远过去归零、远未来按差值钳上限。
+        // 星期几须与日期相符，chrono 的 RFC 2822 解析校验一致性
+        assert_eq!(parse_retry_after("Mon, 01 Jan 2001 00:00:00 GMT"), Some(0));
+        assert_eq!(
+            parse_retry_after("Sat, 15 Sep 2096 12:00:00 GMT"),
+            Some(300)
         );
     }
 }

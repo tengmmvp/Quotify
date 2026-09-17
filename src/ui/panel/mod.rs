@@ -40,11 +40,95 @@ const TIMER_MINUTE_TICK: usize = 4;
 /// 巡检离面到自动收回的等待窗口
 const OUTSIDE_HIDE_MS: u64 = 2000;
 
+/// 弹窗重对位的挂起标志：几何变化高频（拖动逐 move），合并成至多
+/// 一条在途消息，处理端首行清零放行下一条。
+static REPOSITION_PENDING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// DPI 探测失败时的兜底值
 pub(crate) const FALLBACK_DPI: f32 = 1.5;
 
 /// 单字段输入缓冲的字节上限
 const INPUT_MAX_BYTES: usize = 128;
+
+/// 两点曼哈顿距离：与 DRAG_SLOP 配套的共用工件
+pub(crate) fn manhattan(ax: i32, ay: i32, bx: i32, by: i32) -> i32 {
+    (ax - bx).abs() + (ay - by).abs()
+}
+
+/// 按下→位移的拖动生效阈值（物理像素，曼哈顿距离）：各手势判定共用，
+/// 独立漂移会让同次手势得出分裂结论
+pub(crate) const DRAG_SLOP: i32 = 8;
+
+/// 按下手势门闩：按下坐标与命中一起锁存、一起复位，面板与浮窗共用；
+/// 漏清任一字段都会复活幻影点击类缺陷
+pub(crate) struct PressGesture {
+    /// 按下屏幕坐标；None 即无进行中的按下
+    pub at: Option<(i32, i32)>,
+    /// 按下瞬间的命中项：UP 用按下时判定，按住期间窗口被移动时释放
+    /// 坐标已错位，重算会选中相邻项
+    pub hit: Option<crate::ui::panel::render::Hit>,
+}
+
+impl PressGesture {
+    pub(crate) fn new() -> Self {
+        Self {
+            at: None,
+            hit: None,
+        }
+    }
+
+    /// 记录一次按下
+    pub(crate) fn record(&mut self, at: (i32, i32), hit: Option<crate::ui::panel::render::Hit>) {
+        self.at = Some(at);
+        self.hit = hit;
+    }
+
+    /// 整体复位
+    pub(crate) fn clear(&mut self) {
+        self.at = None;
+        self.hit = None;
+    }
+
+    /// 释放点距按下点超阈值即拖动
+    pub(crate) fn dragged_far(&self, cursor: (i32, i32)) -> bool {
+        self.at
+            .is_some_and(|(px, py)| manhattan(cursor.0, cursor.1, px, py) > DRAG_SLOP)
+    }
+
+    /// 释放判定：本窗按下且释放点命中与按下锁存一致才成立；空白按
+    /// 下免重验——拖动中窗口被工作区钳制后光标相对客户区漂移，重
+    /// 验会连拖动收尾一并否决。位移超阈以 dragged 携带，点击分派
+    /// 与拖动收尾一次判定双消费。判定即消费：锁存命中取走、门闩
+    /// 整体复位；调用点须在泵点（捕获释放与命中分派）之前完成判
+    /// 定，复位后不得再读门闩。
+    pub(crate) fn release(
+        &mut self,
+        cursor: (i32, i32),
+        release_hit: Option<crate::ui::panel::render::Hit>,
+    ) -> Release {
+        let pressed = self.at.is_some();
+        let hit = self.hit.take();
+        let dragged = self.dragged_far(cursor);
+        self.clear();
+        if pressed && (hit.is_none() || release_hit == hit) {
+            Release::Accept { hit, dragged }
+        } else {
+            Release::Reject
+        }
+    }
+}
+
+/// 释放判定的结果
+pub(crate) enum Release {
+    /// 判定成立：按下时锁存的命中（空白命中为 None）与位移超阈标志
+    Accept {
+        hit: Option<crate::ui::panel::render::Hit>,
+        dragged: bool,
+    },
+    /// 不成立：非本窗按下，或控件按下的释放点命中与锁存不一致
+    Reject,
+}
 
 /// 面板的展示模式：只有锁定与隐藏两态，由左键单击切换
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,17 +236,17 @@ pub(crate) fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<I
         Hit::InputKey => Some(InputField::Key),
         Hit::InputOrg => Some(InputField::Org),
         Hit::InputProject => Some(InputField::Project),
-        // 文本区之外的命中一概不映射输入字段
+        // 文本区之外的命中一概不映射输入字段。
         Hit::Refresh
         | Hit::Settings
         | Hit::AccountSwitch
-        | Hit::Retry
         | Hit::UsageInfo
         | Hit::Back
         | Hit::ClosePanel
         | Hit::IntervalPreset(_)
         | Hit::CustomizeInterval
         | Hit::ApplyInterval
+        | Hit::ApplyProxy
         | Hit::Language(_)
         | Hit::Appearance(_)
         | Hit::ToggleAutostart
@@ -190,13 +274,17 @@ pub(crate) fn input_field_of_hit(hit: crate::ui::panel::render::Hit) -> Option<I
 }
 
 /// 激活字段的输入框几何（x、宽、右端让位）；与 settings.rs 各 input_field
-/// 调用点同源，眼睛让位 26、余量收边 4。臂穷尽无兜底：新增 InputField
-/// 变体即编译错误
+/// 调用点同源，眼睛让位 26、代理行为应用按钮让位（APPLY_BTN_W 加
+/// 间隙）、余量收边 4。臂穷尽无兜底：新增 InputField 变体即编译错误
 pub(crate) fn field_geo(field: InputField) -> (f32, f32, f32) {
     let cw = layout::CONTENT_W;
     match field {
         InputField::Interval => (layout::INPUT_X, 96.0, 4.0),
-        InputField::Proxy => (layout::INPUT_X, cw, 4.0),
+        InputField::Proxy => (
+            layout::INPUT_X,
+            cw - layout::APPLY_BTN_W - layout::APPLY_BTN_GAP,
+            4.0,
+        ),
         InputField::PeakStart => (layout::PEAK_START_X, 64.0, 4.0),
         InputField::PeakEnd => (layout::PEAK_END_X, 64.0, 4.0),
         InputField::Name => (layout::INPUT_X, cw, 4.0),
@@ -252,7 +340,7 @@ pub struct Panel {
     blink_drawn: std::cell::Cell<bool>,
     ime_owned: bool,
     pub(crate) dragged: bool,
-    pub(crate) press_at: Option<(i32, i32)>,
+    pub(crate) gesture: PressGesture,
     pub(crate) drag_offset: Option<(i32, i32)>,
     class_registered: bool,
     pub(crate) main_h: i32,
@@ -297,7 +385,7 @@ impl Panel {
             blink_drawn: std::cell::Cell::new(true),
             ime_owned: false,
             dragged: false,
-            press_at: None,
+            gesture: PressGesture::new(),
             drag_offset: None,
             class_registered: false,
             outside_since: None,
@@ -312,6 +400,36 @@ impl Panel {
         (logical as f32 * self.dpi).round() as i32
     }
 
+    /// 定位基准屏：非拖动态按锚点中心取屏（首开窗口悬在主屏原点，按
+    /// 窗口取会错屏），拖动态按窗口所在屏。高度与定位的取屏判定统一
+    /// 走此单源
+    fn place_monitor(&self, hwnd: HWND) -> HMONITOR {
+        let moved = self.dragged || self.drag_offset.is_some();
+        unsafe {
+            if !moved && let Some(a) = self.anchor {
+                MonitorFromPoint(
+                    POINT {
+                        x: (a.left + a.right) / 2,
+                        y: a.top,
+                    },
+                    MONITOR_DEFAULTTONEAREST,
+                )
+            } else {
+                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+            }
+        }
+    }
+
+    /// 逻辑高 → 物理目标高：拖动态用完整高，锚点弹出按工作区压扁，
+    /// place、收缩启动与动画收尾比对三方同引，取屏统一走 place_monitor
+    pub(crate) fn target_h(&self, mi: &MONITORINFO, logical: i32, moved: bool) -> i32 {
+        if moved {
+            return self.px(logical);
+        }
+        let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
+        self.px(logical).min(max_h)
+    }
+
     /// 面板当前视图的逻辑高度
     pub(crate) fn view_height(&self, accounts: usize) -> i32 {
         self.view_height_for(self.layout_team, self.layout_customizing, accounts)
@@ -320,10 +438,10 @@ impl Panel {
     /// 指定布局组合的逻辑高度：收缩过渡启动时按目标布局求终点
     pub(crate) fn view_height_for(&self, team: bool, customizing: bool, accounts: usize) -> i32 {
         match self.view {
-            // 动态：随指标行数 / 余额 / 副标题伸缩，由 sync_main_height 维护
+            // 动态：随指标行数 / 余额 / 副标题伸缩，由 sync_main_height 维护。
             PanelView::Main => self.main_h,
             PanelView::AddForm => layout::add_page_height(team),
-            // 整页高度由 layout 的段常量链求和，与 draw_settings 的 y 推进链同源
+            // 整页高度由 layout 的段常量链求和，与 draw_settings 的 y 推进链同源。
             PanelView::Settings => {
                 layout::settings_view_height(accounts > 0, self.account_error, customizing)
             }
@@ -373,8 +491,8 @@ impl Panel {
                     return None;
                 }
             };
-            // 剥掉最大化框：Win11 对可最大化窗口的「拖到顶边 = 贴靠最大化」
-            // 会把拖动中的窗口弹回，无最大化能力则不参与
+            // 去掉最大化框：Win11 对可最大化窗口的「拖到顶边 = 贴靠最大化」
+            // 会把拖动中的窗口弹回，无最大化能力则不参与。
             let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
             let nosnap = style & !(WS_MAXIMIZEBOX.0 as isize);
             let _ = SetWindowLongPtrW(hwnd, GWL_STYLE, nosnap);
@@ -386,7 +504,7 @@ impl Panel {
                 std::mem::size_of::<windows::Win32::Graphics::Dwm::DWM_WINDOW_CORNER_PREFERENCE>()
                     as u32,
             );
-            // 禁用 DWM 位置过渡：弹出/拖动时的系统平滑会与自绘动画叠加显卡顿
+            // 禁用 DWM 位置过渡：弹出/拖动时的系统平滑会与自绘动画叠加显卡顿。
             let disable: i32 = 1;
             let _ = DwmSetWindowAttribute(
                 hwnd,
@@ -402,26 +520,9 @@ impl Panel {
     /// 计算并应用面板几何
     pub(crate) fn place(&mut self, hwnd: HWND, logical_h: i32, show: bool) {
         unsafe {
-            // 拖动进行中（drag_offset）与拖过（dragged）都保持当前位置；
-            // 首开前隐藏窗口悬在默认位（主屏），托盘在副屏时按窗口取屏
-            // 首帧会用错 DPI 与工作区，非拖动态一律按锚点定屏
             let moved = self.dragged || self.drag_offset.is_some();
-            let monitor = if !moved && let Some(a) = self.anchor {
-                MonitorFromPoint(
-                    POINT {
-                        x: (a.left + a.right) / 2,
-                        y: a.top,
-                    },
-                    MONITOR_DEFAULTTONEAREST,
-                )
-            } else {
-                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-            };
-            let mut mi = MONITORINFO {
-                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                ..Default::default()
-            };
-            let _ = GetMonitorInfoW(monitor, &mut mi);
+            let monitor = self.place_monitor(hwnd);
+            let mi = monitor_info(monitor);
             self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
 
             // 高度过渡进行中窗口几何归动画帧独占，外部重排让位；
@@ -434,18 +535,13 @@ impl Panel {
             }
 
             let w = self.px(PANEL_WIDTH);
-            // 当前窗口矩形一次取回：拖动定位、动画起点与跳变判定共用
+            // 当前窗口矩形一次取回：拖动定位、动画起点与跳变判定共用。
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let cur_h = wr.bottom - wr.top;
             // 拖过（含拖动中）保持完整高、允许遮住任务栏——移动与重排交替
-            // 改高会闪跳；锚点弹出仍以工作区为界压扁，防矮屏出屏
-            let target_h = if moved {
-                self.px(logical_h)
-            } else {
-                let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
-                self.px(logical_h).min(max_h)
-            };
+            // 改高会闪跳；锚点弹出仍以工作区为界压扁，防矮屏出屏。
+            let target_h = self.target_h(&mi, logical_h, moved);
             // 展开走过渡动画渐扩揭露；收缩由切换点收窗渐裁不经此路。
             // 弹出、拖动中与减动效直接落位；拖过照常过渡，帧保持位置。
             let animate = !show
@@ -460,8 +556,7 @@ impl Panel {
                     tween: anim::Tween::now(150),
                     view: self.view,
                 });
-                let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
-                self.anim_period = 16;
+                self.retune_anim(hwnd, 16);
             } else {
                 self.height_anim = None;
             }
@@ -514,24 +609,14 @@ impl Panel {
     pub(crate) fn begin_shrink_anim(&mut self, hwnd: HWND, logical_h: i32) -> bool {
         unsafe {
             // 拖动进行中不启动：拖动帧即时落位，与过渡帧互相打架；
-            // 拖过（非拖动中）照常过渡，动画帧保持当前位置
+            // 拖过（非拖动中）照常过渡，动画帧保持当前位置。
             if self.drag_offset.is_some() {
                 return false;
             }
             // 拖动态与 place 的 moved 分支同款完整高；锚点弹出以工作区
-            // 为界压扁，防矮屏出屏
-            let target_h = if self.dragged {
-                self.px(logical_h)
-            } else {
-                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                let mut mi = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                let _ = GetMonitorInfoW(monitor, &mut mi);
-                let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
-                self.px(logical_h).min(max_h)
-            };
+            // 为界压扁，防矮屏出屏。取屏与 place 同源。
+            let mi = monitor_info(self.place_monitor(hwnd));
+            let target_h = self.target_h(&mi, logical_h, self.dragged);
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             let cur_h = wr.bottom - wr.top;
@@ -545,8 +630,7 @@ impl Panel {
                 tween: anim::Tween::now(150),
                 view: self.view,
             });
-            let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
-            self.anim_period = 16;
+            self.retune_anim(hwnd, 16);
             true
         }
     }
@@ -562,31 +646,48 @@ impl Panel {
         };
     }
 
+    /// TIMER_ANIM 调节单源：周期变化才动系统定时器并同步记录——
+    /// 裸 SetTimer/KillTimer 绕开记录会让影子漂移，跑马灯保活与
+    /// 帧率重挂按影子判定失准。0 即撤时钟。
+    pub(crate) fn retune_anim(&mut self, hwnd: HWND, period: u32) {
+        if self.anim_period == period {
+            return;
+        }
+        unsafe {
+            if period == 0 {
+                let _ = KillTimer(Some(hwnd), TIMER_ANIM);
+            } else {
+                SetTimer(Some(hwnd), TIMER_ANIM, period, None);
+            }
+        }
+        self.anim_period = period;
+    }
+
     /// 定位并显示，淡入由 TIMER_ANIM 推进。
     pub fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
         let Some(hwnd) = self.ensure_window(parent) else {
             return;
         };
-        // 先于 place 读取：place 的 SetWindowPos 带 SWP_SHOWWINDOW 会置可见位
+        // 先于 place 读取：place 的 SetWindowPos 带 SWP_SHOWWINDOW 会置可见位。
         let fresh = unsafe { !IsWindowVisible(hwnd).as_bool() };
         self.anchor = Some(anchor);
-        // 新的开合周期：首帧淡入资格重置
+        // 新的开合周期：首帧淡入资格重置。
         self.painted = false;
-        // 拖动仅临时查看；面板重新弹出时回到托盘锚点，拖动残留一并清除
+        // 拖动仅临时查看；面板重新弹出时回到托盘锚点，拖动残留一并清除。
         self.dragged = false;
         self.drag_offset = None;
         let logical_h = self.view_height(accounts);
         self.place(hwnd, logical_h, true);
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            // 整窗不用 layered alpha——与 HwndRenderTarget 交换链呈现不兼容
+            // 整窗不用 layered alpha——与 HwndRenderTarget 交换链呈现不兼容。
             if fresh {
                 if let Some(r) = self.renderer.as_mut() {
                     r.anim.appear = Some(anim::Tween::now(180));
                 }
                 start_anim(hwnd);
             }
-            // 巡检首延给足弹出宽限，防弹出瞬间即被误收回
+            // 巡检首延给足弹出宽限，防弹出瞬间即被误收回。
             SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 1200, None);
             SetTimer(Some(hwnd), TIMER_MINUTE_TICK, 60_000, None);
             self.minute_period.set(60_000);
@@ -617,53 +718,51 @@ impl Panel {
         self.outside_since = None;
         self.drag_offset = None;
         self.selecting = false;
-        self.press_at = None;
+        self.gesture.clear();
         self.text_clicks = None;
         self.clear_input(hwnd);
-        // 直接隐藏：自绘收缩/淡出会与 DWM 过渡叠加闪烁
+        // 状态写全部先于隐藏泵：SW_HIDE 同步派发 KILLFOCUS 等消息，
+        // 泵内重取引用会使本帧引用失效。
         unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
             let _ = KillTimer(Some(hwnd), TIMER_OUTSIDE_CHECK);
-            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
             let _ = KillTimer(Some(hwnd), TIMER_MINUTE_TICK);
             self.height_anim = None;
-            // 收起即追平：下次开门的高度与行集按所选值走，不携带冻结残留
+            // 收起即追平：下次开门的高度与行集按所选值走，不携带冻结残留。
             self.layout_team = self.pending_team;
             self.layout_customizing = self.customizing_interval;
             self.minute_period.set(0);
         }
-        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积；
-        // 悬停高亮与命中区一并清，重开首帧不带旧状态
+        // 动画时钟随时钟组一并撤，周期记录同步清零（WM_PAINT 收尾的
+        // 重挂闸门按 0 判定）。
+        self.retune_anim(hwnd, 0);
+        // 悬停高亮、命中区与页脚跑马灯一并清，重开首帧不带旧状态；
+        // alpha 档位画刷缓存不跨开合累积。
         if let Some(r) = self.renderer.as_mut() {
             r.hover = None;
             r.hits.clear();
+            r.anim.error_scroll = None;
             r.clear_brush_cache();
         }
-        // 收起后到下次打开前不再绘制，归还工作集把静止内存压回托盘档；
-        // 重开时的软缺页按次一次性发生，换常驻低占用
+        // 直接隐藏：自绘收缩/淡出会与 DWM 过渡叠加闪烁；泵放最后。
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        // 收起后不再绘制，归还工作集把静止内存压回托盘档；不碰 self，
+        // 泵后安全。
         crate::platform::trim_working_set();
     }
 
-    /// 左键：隐藏 → 锁定；已锁定 → 收起
-    pub fn toggle_pin(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
-        match self.mode {
-            PanelMode::Pinned => {
-                if let Some(h) = self.hwnd {
-                    self.begin_hide(h);
-                }
-            }
-            PanelMode::Hidden => {
-                // 从隐藏重开才回主视图，不停留在上次滚动的旧设置页
-                self.reset_to_main();
-                self.show_at(parent, anchor, accounts);
-                // 置 Pinned 须在窗口就位后：建窗失败保持 Hidden，状态机可重试
-                if let Some(h) = self.hwnd {
-                    self.mode = PanelMode::Pinned;
-                    // 显示后立即激活——后台窗口拿不到键盘焦点，IME 异常
-                    unsafe {
-                        let _ = SetForegroundWindow(h);
-                    }
-                }
+    /// 从隐藏展开：复位主视图、定位显示、置锁定并抢前台
+    pub fn show_from_hidden(&mut self, parent: HWND, anchor: RECT, accounts: usize) {
+        // 从隐藏重开才回主视图，不停留在上次滚动的旧设置页。
+        self.reset_to_main();
+        self.show_at(parent, anchor, accounts);
+        // 置 Pinned 须在窗口就位后：建窗失败保持 Hidden，状态机可重试。
+        if let Some(h) = self.hwnd {
+            self.mode = PanelMode::Pinned;
+            // 显示后立即激活——后台窗口拿不到键盘焦点，IME 异常。
+            unsafe {
+                let _ = SetForegroundWindow(h);
             }
         }
     }
@@ -693,12 +792,12 @@ impl Panel {
         self.input.surrogate = None;
         self.vis_start.set(0);
         unsafe {
-            // 摘除 IME 上下文：裸窗口挂上后要收回，避免游离
+            // 摘除 IME 上下文：裸窗口挂上后要收回，避免游离。
             use windows::Win32::UI::Input::Ime::{
                 HIMC, ImmAssociateContext, ImmDestroyContext, ImmGetContext,
             };
             let ctx = ImmGetContext(hwnd);
-            // 仅回收自建上下文；从未进入过输入态时窗口挂的是线程默认上下文，销毁会坏全局 IME
+            // 仅回收自建上下文；从未进入过输入态时窗口挂的是线程默认上下文，销毁会坏全局 IME。
             if self.ime_owned && !ctx.is_invalid() {
                 let _ = ImmAssociateContext(hwnd, HIMC(std::ptr::null_mut()));
                 let _ = ImmDestroyContext(ctx);
@@ -719,7 +818,7 @@ impl Panel {
                 let _ = InvalidateRect(Some(hwnd), None, false);
             }
             self.input.edit.reset();
-            // 陈旧高代理半区跨字段残留会与低半区错拼增补平面字符
+            // 陈旧高代理半区跨字段残留会与低半区错拼增补平面字符。
             self.input.surrogate = None;
             self.vis_start.set(0);
         }
@@ -732,8 +831,7 @@ impl Panel {
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
             // 动画时钟保活：光标闪烁的翻转重绘由 TIMER_ANIM 驱动。
-            let _ = SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
-            self.anim_period = 16;
+            self.retune_anim(hwnd, 16);
             // 布局只算一次：光标 x 与 IME 组合窗定位共用同一产物；
             // renderer 缺席即首帧前时以 0 兜底，下次 update_caret 补正。
             let cx = if let Some(r) = self.renderer.as_ref() {
@@ -756,7 +854,7 @@ impl Panel {
                 ImmAssociateContext, ImmCreateContext, ImmDestroyContext,
             };
             let old = ImmAssociateContext(hwnd, ImmCreateContext());
-            // 换挂返回的旧上下文：自建的须销毁防泄漏；首次换下的默认上下文归系统，不可销毁
+            // 换挂返回的旧上下文：自建的须销毁防泄漏；首次换下的默认上下文归系统，不可销毁。
             if self.ime_owned && !old.is_invalid() {
                 let _ = ImmDestroyContext(old);
             }
@@ -780,7 +878,7 @@ impl Panel {
             let bx = field_geo(field).0;
             let by = self.caret_line_y(field);
             let x = bx + 6.0 + cx;
-            // 组合窗锚在框底附近，框顶 +17
+            // 组合窗锚在框底附近。
             let pt = POINT {
                 x: (x * self.dpi).round() as i32,
                 y: ((by + 12.0) * self.dpi).round() as i32,
@@ -856,7 +954,7 @@ impl Panel {
                 widths,
             };
         }
-        // 粘滞起点装不下光标才右移；宽度随起点单调不增，二分最小满足者
+        // 粘滞起点装不下光标才右移；宽度随起点单调不增，二分最小满足者。
         let mut lo = sticky;
         let mut hi = caret;
         while lo < hi {
@@ -917,7 +1015,7 @@ impl Panel {
         let (bx, _w, _tail) = field_geo(field);
         let base = bx + 6.0;
         // 前缀宽度随位次单调不减[caret_layout 二分所依赖的同一性质]：
-        // 最近边界只可能是最后一个宽度 <= x 的位次或其下一格，二分定位即可
+        // 最近边界只可能是最后一个宽度 <= x 的位次或其下一格，二分定位即可。
         let target = x - base;
         let n = cl.widths.len() - 1;
         let vis_start = cl.vis_start;
@@ -932,7 +1030,7 @@ impl Panel {
             }
         }
         // 平局取较小位次；零宽字符等宽块内取末位[原线性取首位]，
-        // 光标 x 相同仅退格/删词的语义位置不同，可视等价
+        // 光标 x 相同仅退格/删词的语义位置不同，可视等价。
         if lo < n
             && (cl.seg(vis_start, lo + 1) - target).abs() < (target - cl.seg(vis_start, lo)).abs()
         {
@@ -1003,6 +1101,23 @@ impl Panel {
     }
 }
 
+/// 指定监视器的工作区信息
+pub(crate) unsafe fn monitor_info(monitor: HMONITOR) -> MONITORINFO {
+    unsafe {
+        let mut mi = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        let _ = GetMonitorInfoW(monitor, &mut mi);
+        mi
+    }
+}
+
+/// 窗口所在监视器的工作区信息
+pub(crate) unsafe fn monitor_info_of(hwnd: HWND) -> MONITORINFO {
+    unsafe { monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) }
+}
+
 /// 取显示器有效 DPI（百分比 / 96）
 pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
     unsafe {
@@ -1020,11 +1135,24 @@ pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
 }
 
 pub(crate) unsafe fn start_anim(hwnd: HWND) {
-    unsafe {
-        SetTimer(Some(hwnd), TIMER_ANIM, 16, None);
-    }
     if let Some(app) = app_from_tray(hwnd) {
-        app.panel.anim_period = 16;
+        app.panel.retune_anim(hwnd, 16);
+    }
+}
+
+/// 前台到达本程序任意窗口时的跑马灯唤醒：面板、托盘与浮窗的激活
+/// 臂同引——激活消息只发给获前台的那个窗口，冻结期间前台可能经
+/// 托盘菜单或浮窗回来，面板自己收不到。owner 为任一可反查 App 的
+/// 本程序窗口。
+pub(crate) fn wake_frozen_marquee(owner: HWND) {
+    if let Some(app) = app_from_tray(owner) {
+        let panel = app.panel.hwnd;
+        if let Some(r) = app.panel.renderer.as_mut()
+            && r.resume_error_scroll()
+            && let Some(p) = panel
+        {
+            unsafe { start_anim(p) };
+        }
     }
 }
 
@@ -1104,14 +1232,14 @@ pub extern "system" fn panel_wndproc(
             WM_PAINT => {
                 // 不走 BeginPaint：验证客户区后直接渲染。失效一律整窗、不做
                 // 局部矩形收窄：HwndRenderTarget 呈现整窗后台缓冲，收窄省不
-                // 下绘制，编辑路径同样整窗 InvalidateRect
+                // 下绘制，编辑路径同样整窗 InvalidateRect。
                 let _ = ValidateRect(Some(hwnd), None);
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
                     let mut rect = RECT::default();
                     let _ = GetClientRect(hwnd, &mut rect);
                     // take 成局部值，避免与后续 &Panel / 模型组装的不可变借用冲突；
-                    // 首建标记同时驱动下面的主题对齐
+                    // 首建标记同时驱动下面的主题对齐。
                     let cached = app.panel.renderer.take();
                     let fresh = cached.is_none();
                     let mut renderer = cached.or_else(|| Renderer::new(hwnd, &rect, app.panel.dpi));
@@ -1120,7 +1248,7 @@ pub extern "system" fn panel_wndproc(
                         // 仅首建时对齐配置外观：Renderer::new 兜底读系统外观，
                         // 配置强制浅/深色与系统相反时首帧会用错主题；日常外观
                         // 切换由 app 侧 apply_appearance 推送，跟随系统模式下
-                        // 逐帧重建主题会反复读注册表
+                        // 逐帧重建主题会反复读注册表。
                         if fresh {
                             r.theme = crate::ui::panel::theme::Theme::new(
                                 crate::ui::panel::theme::resolved(
@@ -1130,7 +1258,7 @@ pub extern "system" fn panel_wndproc(
                             // 进程首开时 renderer 到 paint 才建，show_at 的淡入
                             // 设不上；且 TIMER_ANIM 先于 WM_PAINT 派发，空转一
                             // 拍即自灭——此处补回淡入并重挂时钟。设备丢失重建
-                            // 走的也是 fresh，但内容本就在屏，凭 painted 排除
+                            // 走的也是 fresh，但内容本就在屏，凭 painted 排除。
                             if !app.panel.painted {
                                 r.anim.appear = Some(anim::Tween::now(180));
                                 start_anim(hwnd);
@@ -1146,9 +1274,23 @@ pub extern "system" fn panel_wndproc(
                     }
                     // paint 判定设备丢失时丢弃整个 Renderer，并立即请求下一帧
                     // 走 fresh 路径全量重建、重新对齐主题——不请求的话静止面板
-                    // 要等分钟心跳才有下一帧，期间空白且命中全部失效
+                    // 要等分钟心跳才有下一帧，期间空白且命中全部失效。
                     if keep {
                         app.panel.renderer = renderer;
+                        // 跑马灯滚动创建即需时钟；paint 内持 App 引用，
+                        // 挂钟路径会重取引用使其失效，写回完毕后再挂。
+                        // 时钟已走时不重挂：SetTimer 会重置计时起点；
+                        // 冻结态不重挂，复活归激活消息。
+                        let scrolling = app
+                            .panel
+                            .renderer
+                            .as_ref()
+                            .is_some_and(|r| r.error_scrolling());
+                        if scrolling && app.panel.anim_period == 0 {
+                            // 帧率与 on_anim_tick 同源：跑马灯滚动走减帧档。
+                            let ms = crate::ui::panel::render::ERROR_SCROLL_FRAME_MS;
+                            app.panel.retune_anim(hwnd, ms);
+                        }
                     } else {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                     }
@@ -1161,7 +1303,7 @@ pub extern "system" fn panel_wndproc(
                     TIMER_ANIM => on_anim_tick(hwnd),
                     // 心跳推进全部相对时间文案：页脚[X 分钟前]在底部、指标行
                     // 重置倒计时在内容区中部，带状失效会让倒计时冻结；且
-                    // WM_PAINT 本就整窗重绘，收窄失效矩形省不下绘制开销
+                    // WM_PAINT 本就整窗重绘，收窄失效矩形省不下绘制开销。
                     TIMER_MINUTE_TICK => {
                         let _ = InvalidateRect(Some(hwnd), None, false);
                         if let Some(app) = app_from_tray(hwnd) {
@@ -1173,16 +1315,16 @@ pub extern "system" fn panel_wndproc(
                         let app = app_from_tray(hwnd);
                         if let Some(app) = app {
                             // 先判模式再重挂：收起瞬间残留的一拍不再自我续命，
-                            // 隐藏期巡检彻底停摆
+                            // 隐藏期巡检彻底停摆。
                             if app.panel.mode == PanelMode::Pinned {
                                 SetTimer(Some(hwnd), TIMER_OUTSIDE_CHECK, 200, None);
                                 // 不能调 Shell_NotifyIconGetRect——跨进程同步调用，
-                                // 高频轮询互锁卡死
+                                // 高频轮询互锁卡死。
                                 let mut pt = POINT::default();
                                 let _ = GetCursorPos(&mut pt);
                                 let w = WindowFromPoint(pt);
                                 // 子控件同样算在面板内；账号弹窗是面板的延伸，光标
-                                // 移入其中同样不能触发面板收起
+                                // 移入其中同样不能触发面板收起。
                                 let in_popup = app
                                     .popup
                                     .wnd
@@ -1191,18 +1333,18 @@ pub extern "system" fn panel_wndproc(
                                 let in_panel =
                                     in_popup || w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                                 // 正在输入则绝不收起。仅认输入态：开门即抢前台使
-                                // GetFocus 恒真，会把「离面超时自动收」整个废掉
+                                // GetFocus 恒真，会把「离面超时自动收」整个废掉。
                                 let typing = app.panel.input.field.is_some();
                                 // 鼠标在托盘图标上
                                 let near_tray = app.panel.cursor_near_anchor();
                                 // 拖动中视为在场：窗口被钳在工作区边缘时光标
-                                // 可能已滑出面板外，按住不放不该被收起
+                                // 可能已滑出面板外，按住不放不该被收起。
                                 let dragging = app.panel.drag_offset.is_some();
                                 let now =
                                     windows::Win32::System::SystemInformation::GetTickCount64();
                                 let present = in_panel || typing || near_tray || dragging;
                                 if outside_step(present, now, &mut app.panel.outside_since) {
-                                    app.panel.begin_hide(hwnd);
+                                    crate::app::hide_panel(app, hwnd);
                                 }
                             }
                         }
@@ -1213,7 +1355,7 @@ pub extern "system" fn panel_wndproc(
             }
             WM_MOUSEMOVE => {
                 let mut app = app_from_tray(hwnd);
-                // 手动拖动跟随：鼠标指针减按下偏移，钳制在工作区内
+                // 手动拖动跟随：鼠标指针减按下偏移，钳制在工作区内。
                 if let Some(app) = app.as_mut()
                     && let Some((ox, oy)) = app.panel.drag_offset
                 {
@@ -1222,14 +1364,9 @@ pub extern "system" fn panel_wndproc(
                     let mut wr = RECT::default();
                     let _ = GetWindowRect(hwnd, &mut wr);
                     let w = wr.right - wr.left;
-                    let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                    let mut mi = MONITORINFO {
-                        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                        ..Default::default()
-                    };
-                    let _ = GetMonitorInfoW(monitor, &mut mi);
+                    let mi = monitor_info_of(hwnd);
                     // 四方向都可越出屏幕，仅保留窗口一角（64 物理像素）
-                    // 在工作区内可抓回，上下左右对称
+                    // 在工作区内可抓回，上下左右对称。
                     let x = (cursor.x - ox).clamp(
                         mi.rcWork.left - w + 64,
                         (mi.rcWork.right - 64).max(mi.rcWork.left - w + 64),
@@ -1237,13 +1374,17 @@ pub extern "system" fn panel_wndproc(
                     let y_min = mi.rcWork.top - (wr.bottom - wr.top) + 64;
                     let y = (cursor.y - oy).clamp(y_min, (mi.rcWork.bottom - 64).max(y_min));
                     let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+                    // 位移超阈值才关弹窗，未超时只跟随。
+                    if app.popup.is_open() && app.panel.gesture.dragged_far((cursor.x, cursor.y)) {
+                        app.popup.close();
+                    }
                     return LRESULT(0);
                 }
                 // 拖动分支走 as_mut 的 reborrow 后提前返回；此处 move 同一
-                // 绑定——再取一次 app_from_tray 会构造两个活跃可变别名
+                // 绑定——再取一次 app_from_tray 会构造两个活跃可变别名。
                 if let Some(app) = app {
                     // 拖选中：光标随鼠标指针推进扩选区。宽表查缓存命中（缓冲
-                    // 与粘滞起点均不变），新光标 x 直接查表，不再二次布局
+                    // 与粘滞起点均不变），新光标 x 直接查表，不再二次布局。
                     if app.panel.selecting {
                         let x = x_of(lparam) / app.panel.dpi;
                         if let (Some(f), Some(r)) =
@@ -1256,7 +1397,7 @@ pub extern "system" fn panel_wndproc(
                                 // 光标随指针推进也是交互，相位归零立现。
                                 app.panel.note_caret_interaction();
                                 // 窗内查表定位；越出可视窗（捕获使框外坐标可达）
-                                // 须完整重排让窗口滚动，否则光标画出框外不自愈
+                                // 须完整重排让窗口滚动，否则光标画出框外不自愈。
                                 let (_bx, fw, tail) = field_geo(f);
                                 let avail = (fw - 6.0 - tail).max(1.0);
                                 let cx = cl.seg(cl.vis_start, pos);
@@ -1271,10 +1412,10 @@ pub extern "system" fn panel_wndproc(
                         return LRESULT(0);
                     }
                     // TME_LEAVE 一次性且会被鼠标捕获打断，每次移动重挂；
-                    // 真正离开时由 MOUSELEAVE 清悬停高亮
+                    // 真正离开时由 MOUSELEAVE 清悬停高亮。
                     track_leave(hwnd);
                     // 在场即时重置离面计时：巡检 200ms 一拍，两拍之间的短暂
-                    // 回访不该被算进离面时间
+                    // 回访不该被算进离面时间。
                     app.panel.outside_since = None;
                     let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
                     if let Some(r) = app.panel.renderer.as_mut() {
@@ -1293,29 +1434,31 @@ pub extern "system" fn panel_wndproc(
                     let mut pt = POINT::default();
                     let _ = GetCursorPos(&mut pt);
                     let w = WindowFromPoint(pt);
-                    // 校正过渡态：TME 触发瞬间光标可能恰在子控件上，误清会闪
+                    // 校正过渡态：TME 触发瞬间光标可能恰在子控件上，误清会闪。
                     let still_here = w == hwnd || GetAncestor(w, GA_ROOT) == hwnd;
                     if still_here {
-                        // 误触发，重挂跟踪等真正的离开
+                        // 误触发，重挂跟踪等真正的离开。
                         track_leave(hwnd);
-                    } else if let Some(r) = app.panel.renderer.as_mut()
-                        && r.hover.is_some()
-                    {
-                        r.hover = None;
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    } else {
+                        if let Some(r) = app.panel.renderer.as_mut()
+                            && r.hover.is_some()
+                        {
+                            r.hover = None;
+                            let _ = InvalidateRect(Some(hwnd), None, false);
+                        }
                     }
                 }
                 LRESULT(0)
             }
             WM_MOUSEWHEEL => {
                 let app = app_from_tray(hwnd);
-                // 仅设置页可滚；主视图内容恒短于视口，滚了也无内容可显
+                // 仅设置页可滚；主视图内容恒短于视口，滚了也无内容可显。
                 if let Some(app) = app
                     && app.panel.view != PanelView::Main
                 {
-                    // 高字为有符号 delta；向后滚（负）看下方内容 → scroll_dy 增大
+                    // 高字为有符号 delta；向后滚（负）看下方内容 → scroll_dy 增大。
                     let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
-                    // 三行制：每 120 delta 记 3 行 ≈ 53 逻辑 px
+                    // 三行制：每 120 delta 记 3 行 ≈ 53 逻辑 px。
                     let next = (app.panel.scroll_dy - delta / 120.0 * 53.0)
                         .clamp(0.0, app.panel.scroll_max);
                     if next != app.panel.scroll_dy {
@@ -1331,72 +1474,96 @@ pub extern "system" fn panel_wndproc(
                 LRESULT(0)
             }
             WM_LBUTTONUP => {
-                let mut app = app_from_tray(hwnd);
-                if let Some(app) = app.as_mut() {
-                    // 拖选收尾：光标定位已就位，跳过命中分派——
-                    // 拖选终点若落在别的输入框上，不应触发该框的
-                    // 命中处理造成意外的字段切换
-                    if app.panel.selecting {
-                        app.panel.selecting = false;
+                let Some(app) = app_from_tray(hwnd) else {
+                    return LRESULT(0);
+                };
+                // 拖选收尾：光标定位已就位，跳过命中分派——
+                // 拖选终点若落在别的输入框上，不应触发该框的
+                // 命中处理造成意外的字段切换。
+                if app.panel.selecting {
+                    app.panel.selecting = false;
+                    // ReleaseCapture 同步派发 CAPTURECHANGED，泵包装换新引用复位门闩。
+                    let app = pump(app, hwnd, || {
                         let _ = ReleaseCapture();
-                        app.panel.press_at = None;
-                        track_leave(hwnd);
-                        return LRESULT(0);
-                    }
-                    // 按下→松手位移超过阈值才算拖动；press_at 在 BUTTONDOWN 记录
-                    let moved_far = app.panel.press_at.take().is_some_and(|(px, py)| {
-                        let mut cursor = POINT::default();
-                        let _ = GetCursorPos(&mut cursor);
-                        (cursor.x - px).abs() + (cursor.y - py).abs() > 8
                     });
-                    // 空白处按下即进入拖动态，松手须先按位移分流：原地点击不是拖动
-                    if app.panel.drag_offset.take().is_some() {
-                        let _ = ReleaseCapture();
-                        if moved_far {
-                            // 真拖动结束：保持当前位置恢复完整高度
+                    if let Some(app) = app {
+                        app.panel.gesture.clear();
+                    }
+                    track_leave(hwnd);
+                    return LRESULT(0);
+                }
+                // 释放判定走 PressGesture 共用原语，与浮窗同规则；
+                // 释放点命中重验：按住期间滚轮或重对位可让内容移到
+                // 光标下，锁存命中与释放点不一致即取消，防误触相邻项。
+                let release_hit = {
+                    let (ux, uy) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
+                    app.panel.renderer.as_ref().and_then(|r| r.hit_at(ux, uy))
+                };
+                let mut cursor = POINT::default();
+                let _ = GetCursorPos(&mut cursor);
+                let verdict = app.panel.gesture.release((cursor.x, cursor.y), release_hit);
+                // 空白处按下即进入拖动态，原地点击不是拖动。拖动判定
+                // 先于释放：ReleaseCapture 同步派发 CAPTURECHANGED 会
+                // 清掉 drag_offset，先取走再释放。
+                let was_drag = app.panel.drag_offset.take().is_some();
+                // 捕获归还是泵点：引用 move 进泵包装，续用走新引用。
+                let app = pump(app, hwnd, || {
+                    let _ = ReleaseCapture();
+                });
+                if was_drag {
+                    if let Some(app) = app {
+                        if let Release::Accept { dragged: true, .. } = verdict {
+                            // 真拖动结束：保持当前位置恢复完整高度。
                             app.panel.dragged = true;
                             let n = app.config.accounts.len();
                             let logical_h = app.panel.view_height(n);
                             app.panel.place(hwnd, logical_h, true);
                             let _ = InvalidateRect(Some(hwnd), None, true);
                         } else if app.panel.input.field.is_some() || app.panel.key_revealed {
-                            // 空白点击结束输入态与明文查看；缓冲文本保留
+                            // 空白点击结束输入态与明文查看；缓冲文本保留。
                             app.panel.clear_input(hwnd);
                             app.panel.key_revealed = false;
                             let _ = InvalidateRect(Some(hwnd), None, false);
                         }
+                    }
+                    return LRESULT(0);
+                }
+                if let (
+                    Release::Accept {
+                        hit: Some(pressed_hit),
+                        dragged: false,
+                    },
+                    Some(_),
+                ) = (verdict, app)
+                {
+                    // 命中用按下时锁存，释放点重验一致才分派：按住期间
+                    // 窗口移动或内容滚动都会让重算选中相邻项。
+                    // 会进入/保持输入态的命中；其余点击一律结束输入，光标不再滞留框外。
+                    // 列表收敛在 Hit::is_input_hit，新增输入框时与枚举同文件维护。
+                    let refocus = pressed_hit.is_input_hit();
+                    // 模态命中路由内拦截直调两段式并返回 true：对话框
+                    // 嵌套泵会派发其他消息重取 App，泵后本臂持有的
+                    // 引用已失效，不得再触碰，下方 clear_input 同样
+                    // 不可用。输入态不跨弹框——弹框抢焦点即
+                    // KILLFOCUS 清输入，缓冲文本保留与旧路径一致。
+                    if crate::app::dispatch_hit(pressed_hit, hwnd) {
                         return LRESULT(0);
                     }
-                    if !moved_far {
-                        let (x, y) = (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi);
-                        let hit = app.panel.renderer.as_ref().and_then(|r| r.hit_at(x, y));
-                        // 会进入/保持输入态的命中；其余点击一律结束输入，光标不再滞留框外。
-                        // 列表收敛在 Hit::is_input_hit，新增输入框时与枚举同文件维护
-                        let refocus = hit.is_some_and(|h| h.is_input_hit());
-                        if let Some(hit) = hit {
-                            // 模态命中统一拦截直调两段式并提前返回：对话框
-                            // 嵌套泵会派发其他消息重取 App，泵后本臂持有的
-                            // 引用已失效，不得再触碰，下方 clear_input 同样
-                            // 不可用。输入态不跨弹框——弹框抢焦点即
-                            // KILLFOCUS 清输入，缓冲文本保留与旧路径一致。
-                            if hit.is_modal() {
-                                crate::app::dispatch_modal(hit, hwnd);
-                                return LRESULT(0);
-                            }
-                            crate::app::handle_panel_hit(app, hit, hwnd);
-                        }
-                        if !refocus && (app.panel.input.field.is_some() || app.panel.key_revealed) {
-                            app.panel.clear_input(hwnd);
-                            app.panel.key_revealed = false;
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                        }
+                    // 命中处理内含泵点，收尾输入态前重取引用。
+                    if !refocus
+                        && let Some(app) = app_from_tray(hwnd)
+                        && (app.panel.input.field.is_some() || app.panel.key_revealed)
+                    {
+                        app.panel.clear_input(hwnd);
+                        app.panel.key_revealed = false;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
                     }
                 }
                 LRESULT(0)
             }
             WM_KEYDOWN => {
                 // 编辑键位分派：移动、选区、删词、撤销重做走 EditState；
-                // 字符与组合键由 WM_CHAR 处理
+                // 字符与组合键由 WM_CHAR 处理。
                 let vk = (wparam.0 & 0xFF) as u16;
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app
@@ -1430,7 +1597,7 @@ pub extern "system" fn panel_wndproc(
                         apply_edit(input, |e, t| e.delete(t, ctrl));
                         true
                     } else if vk == VK_Z.0 && ctrl {
-                        // Shift+Z 与 Y 同为重做惯例
+                        // Shift+Z 与 Y 同为重做惯例。
                         apply_edit(input, |e, t| {
                             if shift {
                                 e.redo(t);
@@ -1453,7 +1620,7 @@ pub extern "system" fn panel_wndproc(
                 LRESULT(0)
             }
             WM_CHAR => {
-                // 字符编辑与剪贴板组合键；控制字符按 Windows 编辑控件惯例分派
+                // 字符编辑与剪贴板组合键；控制字符按 Windows 编辑控件惯例分派。
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app
                     && app.panel.input.field.is_some()
@@ -1464,7 +1631,7 @@ pub extern "system" fn panel_wndproc(
                         app.panel.input.field == Some(InputField::Key) && !app.panel.key_revealed;
                     // UTF-16 代理对按高低半区送达：高半区暂存、低半区到达时
                     // 拼出增补平面字符；普通字符到达即清暂存，防陈旧高半区
-                    // 与后续低半区错误拼合
+                    // 与后续低半区错误拼合。
                     let decoded = {
                         let cp = ch as u32;
                         if (0xD800..0xDC00).contains(&cp) {
@@ -1494,7 +1661,7 @@ pub extern "system" fn panel_wndproc(
                                 apply_edit(input, |e, t| e.backspace(t, ctrl));
                             }
                             Some('\u{7F}') => {
-                                // Ctrl+Backspace：删前一个词
+                                // Ctrl+Backspace：删前一个词。
                                 apply_edit(input, |e, t| e.backspace(t, true));
                             }
                             Some('\u{1}') => {
@@ -1502,7 +1669,7 @@ pub extern "system" fn panel_wndproc(
                                 input.edit.select_all(&t);
                             }
                             Some('\u{3}') if !key_masked => {
-                                // 单行惯例：无选区复制全部
+                                // 单行惯例：无选区复制全部。
                                 let t = input.active_str().to_string();
                                 let s = input
                                     .edit
@@ -1514,7 +1681,7 @@ pub extern "system" fn panel_wndproc(
                                 }
                             }
                             Some('\u{18}') if !key_masked => {
-                                // 单行惯例：无选区剪切全部
+                                // 单行惯例：无选区剪切全部。
                                 let mut out = None;
                                 apply_edit(input, |e, t| {
                                     if e.selection().is_none() {
@@ -1551,15 +1718,15 @@ pub extern "system" fn panel_wndproc(
             WM_KILLFOCUS => {
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app
-                    // 焦点真已转走才清；若焦点绕回本窗口则保留
+                    // 焦点真已转走才清；若焦点绕回本窗口则保留。
                     && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() != hwnd
                 {
                     // 明文查看随失焦收回，不给旁人余光；连击链一并重置：
-                    // 点框→失焦→点回不该被计为双击
+                    // 点框→失焦→点回不该被计为双击。
                     let was_revealed = app.panel.key_revealed;
                     app.panel.key_revealed = false;
                     app.panel.text_clicks = None;
-                    // 失焦不清输入会让面板被当作「正在输入」永不收起，IME 组合窗也会游离
+                    // 失焦不清输入会让面板被当作「正在输入」永不收起，IME 组合窗也会游离。
                     let was_typing = app.panel.input.field.is_some();
                     if was_typing {
                         app.panel.clear_input(hwnd);
@@ -1572,35 +1739,32 @@ pub extern "system" fn panel_wndproc(
             }
             WM_LBUTTONDOWN => {
                 // 任意空白处按下进入手动拖动，长设置页可拖到可视范围。
-                // 不用系统 HTCAPTION 模态拖动：Win11 拖到屏幕顶边会强制贴靠预览
+                // 不用系统 HTCAPTION 模态拖动：Win11 拖到屏幕顶边会强制贴靠预览。
                 let mut app = app_from_tray(hwnd);
                 let (x, y) = if let Some(app) = app.as_ref() {
                     (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi)
                 } else {
                     (0.0, 0.0)
                 };
-                let hit_none = app
+                // 命中一次算好：判定空白、按下锁存与输入字段映射共用。
+                let down_hit = app
                     .as_ref()
                     .and_then(|a| a.panel.renderer.as_ref())
-                    .map(|r| r.hit_at(x, y).is_none())
-                    .unwrap_or(true);
+                    .and_then(|r| r.hit_at(x, y));
+                let hit_none = down_hit.is_none();
                 let mut cursor = POINT::default();
                 let _ = GetCursorPos(&mut cursor);
                 if let Some(app) = app.as_mut() {
-                    app.panel.press_at = Some((cursor.x, cursor.y));
+                    app.panel.gesture.record((cursor.x, cursor.y), down_hit);
                     // 输入框文本区按下：定位光标并进入拖选，不进入空白拖动。
                     // 已聚焦的框直接定位；未聚焦的框按下即聚焦再定位点击处，
                     // 双击第二击即可选词。连击按 500ms/8px 判定：双击选词、
-                    // 三击全选；Shift 按下时点击扩选而非重置
+                    // 三击全选；Shift 按下时点击扩选而非重置。
                     let active_zone = app.panel.hit_text_zone(x, y);
                     let target = if active_zone {
                         app.panel.input.field
                     } else {
-                        app.panel
-                            .renderer
-                            .as_ref()
-                            .and_then(|r| r.hit_at(x, y))
-                            .and_then(input_field_of_hit)
+                        down_hit.and_then(input_field_of_hit)
                     };
                     if let Some(f) = target {
                         if !active_zone {
@@ -1614,21 +1778,21 @@ pub extern "system" fn panel_wndproc(
                         let count = match app.panel.text_clicks {
                             Some((t, cx, cy, n))
                                 if now.wrapping_sub(t) <= 500
-                                    && (px - cx).abs() + (py - cy).abs() <= 8 =>
+                                    && manhattan(px, py, cx, cy) <= DRAG_SLOP =>
                             {
                                 n.saturating_add(1).min(3)
                             }
                             _ => 1,
                         };
                         app.panel.text_clicks = Some((now, px, py, count));
-                        // 命中换算与光标定位共用一次宽表布局
+                        // 命中换算与光标定位共用一次宽表布局。
                         let cl = app.panel.caret_layout(r);
                         let pos = app.panel.caret_hit_test(&cl, f, x);
                         use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
                         let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
                         match count {
                             2 => {
-                                // 双击选词；Key 掩码态圆点无词义，退化为全选
+                                // 双击选词；Key 掩码态圆点无词义，退化为全选。
                                 let real = app.panel.input.active_str().to_string();
                                 if f == InputField::Key && !app.panel.key_revealed {
                                     app.panel.input.edit.select_all(&real);
@@ -1670,30 +1834,71 @@ pub extern "system" fn panel_wndproc(
                         let _ = GetWindowRect(hwnd, &mut wr);
                         app.panel.drag_offset = Some((cursor.x - wr.left, cursor.y - wr.top));
                         let _ = SetCapture(hwnd);
+                    } else {
+                        // 命中目标的按下同样捕获：拖出窗外松手 UP 仍回本窗，
+                        // 手势门闩必然随 UP 复位，无须左键状态启发式。
+                        let _ = SetCapture(hwnd);
                     }
                 }
                 LRESULT(0)
             }
             WM_CAPTURECHANGED => {
-                // lParam 为获得捕获的新窗口（wParam 未用）；空或他人持有即本窗口拖动已断线
+                // lParam 为获得捕获的新窗口（wParam 未用）；空或他人持有即本窗口拖动已断线。
                 if HWND(lparam.0 as *mut _) != hwnd {
                     let app = app_from_tray(hwnd);
                     if let Some(app) = app {
                         // 捕获被系统/他窗夺走后不会再有 WM_LBUTTONUP，拖动状态须在此终结，
-                        // 否则下次 MOUSEMOVE 仍按拖动跟随，形成幽灵拖动
+                        // 否则下次 MOUSEMOVE 仍按拖动跟随，形成幽灵拖动。
                         app.panel.drag_offset = None;
-                        app.panel.press_at = None;
+                        app.panel.gesture.clear();
                         app.panel.selecting = false;
                     }
-                    // 捕获期间 TME 离窗跟踪被取消，此处补挂；鼠标指针已在外会立即收到 MOUSELEAVE
+                    // 捕获期间 TME 离窗跟踪被取消，此处补挂；鼠标指针已在外会立即收到 MOUSELEAVE。
                     track_leave(hwnd);
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_WINDOWPOSCHANGED => {
+                // 默认处理先行：窗口内部位置状态须更新。几何变化经异步
+                // 消息重对位弹窗——本消息随每次 SetWindowPos 同步派发，
+                // 此处重取 App 会使外层调用帧的引用失效（模态泵纪律），
+                // 投递不带引用；挂起标志把拖动期的逐 move 投递合并成
+                // 至多一条在途，弹窗未开时由处理端 is_open 幂等吸收。
+                // 纯 Z 序/显隐变更（位置尺寸均未动）无须对位。
+                let r = DefWindowProcW(hwnd, msg, wparam, lparam);
+                let wp = &*(lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::WINDOWPOS);
+                let still = windows::Win32::UI::WindowsAndMessaging::SWP_NOMOVE
+                    | windows::Win32::UI::WindowsAndMessaging::SWP_NOSIZE;
+                if (wp.flags & still) != still
+                    && !REPOSITION_PENDING.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let posted = PostMessageW(
+                        Some(hwnd),
+                        crate::platform::msg::WM_APP_REPOSITION_POPUP,
+                        WPARAM(0),
+                        LPARAM(0),
+                    )
+                    .is_ok();
+                    // 投递失败回滚挂起标志：不回滚则无人清零，重对位
+                    // 从此断流，只能关开弹窗自愈。
+                    if !posted {
+                        REPOSITION_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                    }
+                }
+                r
+            }
+            msg if msg == crate::platform::msg::WM_APP_REPOSITION_POPUP => {
+                // 异步对位：队列派发时无外层引用存活，弹窗未开则幂等返回。
+                REPOSITION_PENDING.store(false, std::sync::atomic::Ordering::Release);
+                if let Some(app) = app_from_tray(hwnd) {
+                    crate::app::reposition_popup(app, hwnd);
                 }
                 LRESULT(0)
             }
             WM_DPICHANGED => {
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app {
-                    // 建议矩形已按新 DPI 算好位置尺寸，照设免内容拉伸；此时仍持旧 dpi
+                    // 建议矩形已按新 DPI 算好位置尺寸，照设免内容拉伸；此时仍持旧 dpi。
                     let suggested = &*(lparam.0 as *const RECT);
                     let _ = SetWindowPos(
                         hwnd,
@@ -1705,6 +1910,9 @@ pub extern "system" fn panel_wndproc(
                         SWP_NOZORDER | SWP_NOACTIVATE,
                     );
                     app.panel.dpi = ((wparam.0 >> 16) & 0xFFFF) as u32 as f32 / 96.0;
+                    app.popup.invalidate_monitor();
+                    // 显示缩放变化：托盘图标按新像素尺寸重建。
+                    crate::app::queue_tray_refresh(app.hwnd());
                     app.panel.height_anim = None;
                     app.panel.layout_team = app.panel.pending_team;
                     app.panel.layout_customizing = app.panel.customizing_interval;
@@ -1715,6 +1923,23 @@ pub extern "system" fn panel_wndproc(
                     let _ = InvalidateRect(Some(hwnd), None, true);
                 }
                 LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_DISPLAYCHANGE => {
+                // 分辨率或工作区变化：弹窗的监视器派生缓存失效，
+                // 下次对位重取。
+                if let Some(app) = app_from_tray(hwnd) {
+                    app.popup.invalidate_monitor();
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE => {
+                // 系统参数变更：任务栏移动或自动隐藏切换只改工作区、
+                // 不发 DISPLAYCHANGE，监视器句柄也不变——缓存只能靠
+                // 本消息失效。
+                if let Some(app) = app_from_tray(hwnd) {
+                    app.popup.invalidate_monitor();
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_ERASEBKGND => LRESULT(1),
             WM_SETCURSOR => {
@@ -1734,6 +1959,15 @@ pub extern "system" fn panel_wndproc(
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_MOUSEACTIVATE => LRESULT(MA_ACTIVATE as isize),
+            windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+                // 激活即复活冻结的跑马灯：本消息连同一进程内的前台切换
+                // 都发（托盘菜单点回面板），比 WM_ACTIVATEAPP 覆盖广。
+                // wparam 低字非零即激活（点击激活或 Alt-tab 抢占）。
+                if (wparam.0 & 0xFFFF) != 0 {
+                    wake_frozen_marquee(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_DESTROY => LRESULT(0),
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -1751,8 +1985,12 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
         let mut done = true;
         let mut footer_only = false;
         let mut repaint = false;
+        let mut appear_active = false;
+        let mut spin_active = false;
+        let mut scroll_frame = false;
+        let mut scroll_wake: Option<u32> = None;
         if let Some(r) = app.panel.renderer.as_mut() {
-            let appear_active = r.anim.appear.is_some();
+            appear_active = r.anim.appear.is_some();
             if let Some(t) = &r.anim.appear {
                 if t.finished() {
                     r.anim.appear = None;
@@ -1774,13 +2012,32 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                     repaint = true;
                 }
             }
-            let spin_active = r.spin_remaining();
+            spin_active = r.spin_remaining();
             if spin_active {
                 done = false;
                 repaint = true;
             }
+            // 页脚错误跑马灯：滚动期逐帧，暂停期一次定到恢复点。前台
+            // 门控与浮窗巡检共用谓词：前台在本程序任意窗口（托盘菜单、
+            // 弹窗）都算在场；真失焦冻结原位不保活，回焦由激活消息
+            // 重启时钟续滚，后台零唤醒零重绘。跑马灯不在场时跳过前台
+            // 查询——三系统调用不该为空帧白付。
+            let active = r.anim.error_scroll.is_some() && crate::platform::foreground_is_self();
+            match r.error_scroll_tick(active) {
+                Some(crate::ui::panel::render::ScrollTick::Frame) => {
+                    done = false;
+                    repaint = true;
+                    scroll_frame = true;
+                }
+                Some(crate::ui::panel::render::ScrollTick::Pause(w)) => {
+                    done = false;
+                    scroll_wake = Some(w);
+                }
+                Some(crate::ui::panel::render::ScrollTick::Idle) => {}
+                None => {}
+            }
             // 页脚换装独占时帧率减半：文字滑动 30fps 足够，整窗重绘的
-            // CPU 砍半；淡入/旋转在场维持满帧
+            // CPU 砍半。
             footer_only = footer_active && !appear_active && !spin_active;
         }
         // 高度过渡：逐帧插值，锚定与夹取同 place，结束帧即终值；
@@ -1797,7 +2054,7 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             let mut wr = RECT::default();
             let _ = GetWindowRect(hwnd, &mut wr);
             // 拖动态保持当前位置只改高度；锚点弹出按托盘锚定、顶边夹取
-            // 与 place 同款
+            // 与 place 同款。
             if app.panel.dragged || app.panel.drag_offset.is_some() {
                 let _ = SetWindowPos(
                     hwnd,
@@ -1810,12 +2067,7 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                 );
                 repaint = true;
             } else if let Some(anchor) = app.panel.anchor {
-                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-                let mut mi = MONITORINFO {
-                    cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                    ..Default::default()
-                };
-                let _ = GetMonitorInfoW(monitor, &mut mi);
+                let mi = monitor_info(app.panel.place_monitor(hwnd));
                 let y = (anchor.top - h - app.panel.px(8)).max(mi.rcWork.top + 8);
                 let _ = SetWindowPos(
                     hwnd,
@@ -1830,10 +2082,16 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             }
             if a.tween.finished() {
                 app.panel.height_anim = None;
-                // 收缩到位：生效布局追平所选值。窗口已在终点高度，
-                // 重排直接落位不产生二次动画
+                // 收缩到位：生效布局追平所选值，重排直接落位无二次动画。
+                // 视图高度或钳制值在动画窗口内变化时比对失配，补一次重排。
+                let want = app.panel.view_height(app.config.accounts.len());
+                let moved = app.panel.dragged || app.panel.drag_offset.is_some();
+                // 取屏与 place 同源：跨屏钳制差异不构成失配，收尾比对只
+                // 捕捉真实的目标变化。
+                let mi = monitor_info(app.panel.place_monitor(hwnd));
                 if app.panel.layout_team != app.panel.pending_team
                     || app.panel.layout_customizing != app.panel.customizing_interval
+                    || app.panel.target_h(&mi, want, moved) != a.to
                 {
                     app.panel.layout_team = app.panel.pending_team;
                     app.panel.layout_customizing = app.panel.customizing_interval;
@@ -1842,7 +2100,6 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                 }
             }
         }
-        let anim_active = !done;
         // 输入态光标闪烁：时钟保活，仅相位跨过翻转点才整窗重绘；
         // 焦点与输入态双门控，失焦不闪。
         let mut caret_wake: Option<u32> = None;
@@ -1862,23 +2119,31 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
         }
 
         if done {
-            let _ = KillTimer(Some(hwnd), TIMER_ANIM);
-            app.panel.anim_period = 0;
+            app.panel.retune_anim(hwnd, 0);
         } else {
-            // 仅光标闪烁在场时一次定到翻转点，空闲期零空转；
-            // 其余动画按原有帧率。
-            let want = if footer_only {
-                33
-            } else if anim_active {
-                16
+            // 帧率：逐帧动画 16ms，跑马灯滚动与页脚换装同档减帧；
+            // 两者皆无时用精确唤醒（跑马灯恢复点/光标翻转点），空闲期零空转。
+            let frame = if appear_active || spin_active || app.panel.height_anim.is_some() {
+                Some(16u32)
+            } else if scroll_frame || footer_only {
+                Some(crate::ui::panel::render::ERROR_SCROLL_FRAME_MS)
             } else {
-                caret_wake.unwrap_or(16).max(1)
+                None
             };
-            if app.panel.anim_period != want {
-                // 仅周期变化时重设：SetTimer 会重置计时起点
-                SetTimer(Some(hwnd), TIMER_ANIM, want, None);
-                app.panel.anim_period = want;
+            // 跑马灯恢复点与光标翻转点并存时取较早者，互不压住。
+            let wake = match (scroll_wake, caret_wake) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (a, b) => a.or(b),
+            };
+            let want = match (frame, wake) {
+                (Some(f), Some(w)) => f.min(w),
+                (Some(f), None) => f,
+                (None, Some(w)) => w.min(60_000),
+                (None, None) => 16,
             }
+            .max(1);
+            // 仅周期变化时重设：SetTimer 会重置计时起点。
+            app.panel.retune_anim(hwnd, want);
         }
         LRESULT(0)
     }
@@ -1897,6 +2162,19 @@ pub(crate) fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> 
         }
         Some(&mut *(p as *mut crate::app::App))
     }
+}
+
+/// App 引用的泵包装：f 内跑同步重入消息泵（捕获释放、前台申领等），
+/// 调用方把持有的 App 引用 move 进来换泵后的新引用——旧引用被消费，
+/// 泵后误用旧引用是编译错误。f 不得借用 App，所需数据先拷成值；
+/// 重取失败返 None，续用方按空路径早退。
+pub(crate) fn pump(
+    _app: &'static mut crate::app::App,
+    hwnd: HWND,
+    f: impl FnOnce(),
+) -> Option<&'static mut crate::app::App> {
+    f();
+    app_from_tray(hwnd)
 }
 
 /// 读剪贴板 Unicode 文本
@@ -1959,14 +2237,14 @@ pub(crate) fn write_clipboard_text(text: &str) -> bool {
             };
             let dst = GlobalLock(hg);
             if dst.is_null() {
-                // 所有权未转移给系统，须自释放防泄漏
+                // 所有权未转移给系统，须自释放防泄漏。
                 let _ = GlobalFree(Some(hg));
                 return false;
             }
             std::ptr::copy_nonoverlapping(units.as_ptr(), dst as *mut u16, units.len());
             let _ = GlobalUnlock(hg);
             if SetClipboardData(CF_UNICODETEXT, Some(HANDLE(hg.0))).is_err() {
-                // 同上：系统未接管句柄
+                // 同上：系统未接管句柄。
                 let _ = GlobalFree(Some(hg));
                 return false;
             }
@@ -1998,13 +2276,13 @@ mod tests {
     fn settings_view_height_pinned() {
         let mut p = Panel::new();
         p.view = PanelView::Settings;
-        assert_eq!(p.view_height(0), 798);
-        assert_eq!(p.view_height(1), 846);
+        assert_eq!(p.view_height(0), 796);
+        assert_eq!(p.view_height(1), 844);
         p.layout_customizing = true;
-        assert_eq!(p.view_height(0), 836);
-        assert_eq!(p.view_height(1), 884);
+        assert_eq!(p.view_height(0), 834);
+        assert_eq!(p.view_height(1), 882);
         p.account_error = true;
-        assert_eq!(p.view_height(1), 902);
+        assert_eq!(p.view_height(1), 900);
     }
 
     /// 光标点击定位：等宽最近边界、越界钳入、零宽平局取末位、

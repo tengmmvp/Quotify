@@ -62,7 +62,7 @@ impl Renderer {
         let s = model.strings;
         let pad = 10.0;
 
-        // 弹出动画：内容上浮渐入；背景必须不透明全幅绘制，否则首帧露交换链
+        // 弹出动画：内容上浮渐入；背景必须不透明全幅绘制，否则首帧露交换链。
         let (dy, alpha) = match &self.anim.appear {
             Some(t) if self.anim_allowed => {
                 let p = ease_out_cubic(t.progress());
@@ -118,12 +118,13 @@ impl Renderer {
             }
             let cur = selected == Some(i);
             if cur {
+                // 高度与账号名字号一致
                 let bar = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
                         left: pad - 4.0,
-                        top: y + 12.0,
+                        top: y + 11.25,
                         right: pad - 1.0,
-                        bottom: y + 24.0,
+                        bottom: y + 24.75,
                     },
                     radiusX: 1.5,
                     radiusY: 1.5,
@@ -131,7 +132,7 @@ impl Renderer {
                 let b = self.brush(target, self.theme.accent, alpha);
                 target.FillRoundedRectangle(&bar, &b);
             }
-            // 右端徽标：平台，团队版追加团队标；弹窗窄，放不下 key 前缀徽标
+            // 右端徽标：平台，团队版追加团队标；弹窗窄，放不下 key 前缀徽标。
             let platform = if acc.platform == crate::api::Platform::Cn {
                 s.platform_cn
             } else {

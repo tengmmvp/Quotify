@@ -19,7 +19,7 @@ fn entries() -> Option<(SetMode, Flush)> {
     static FNS: OnceLock<Option<(SetMode, Flush)>> = OnceLock::new();
     *FNS.get_or_init(|| unsafe {
         let lib = LoadLibraryW(PCWSTR(wide("uxtheme.dll").as_ptr())).ok()?;
-        // GetProcAddress 约定：名字指针数值 < 0x10000 时按序号解析
+        // GetProcAddress 约定：名字指针数值 < 0x10000 时按序号解析。
         let set = GetProcAddress(lib, PCSTR(135usize as *const u8))?;
         let flush = GetProcAddress(lib, PCSTR(136usize as *const u8))?;
         Some((
@@ -34,7 +34,7 @@ pub fn apply(dark: bool) {
     if let Some((set, flush)) = entries() {
         unsafe {
             // PreferredAppMode：Default=0/AllowDark=1/ForceDark=2/ForceLight=3，
-            // 用 Force 值直接钉住目标态，不依赖系统当前的 AppsUseLightTheme
+            // 用 Force 值直接钉住目标态，不依赖系统当前的 AppsUseLightTheme。
             set(if dark { 2 } else { 3 });
             flush();
         }

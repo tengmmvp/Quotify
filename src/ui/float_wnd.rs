@@ -1,15 +1,17 @@
 //! 浮动窗口骨架
 
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetForegroundWindow, HTCLIENT, IDC_ARROW,
-    IDC_HAND, IsWindowVisible, KillTimer, LoadCursorW, RegisterClassW, SW_HIDE, SW_SHOW,
-    SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow,
-    WM_ERASEBKGND, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
-    WNDPROC, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, GetClientRect, GetCursorPos, GetForegroundWindow,
+    GetWindowRect, HTCLIENT, IDC_ARROW, IDC_HAND, IsWindowVisible, KillTimer, LoadCursorW,
+    RegisterClassW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER, SetCursor,
+    SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, WM_CAPTURECHANGED, WM_ERASEBKGND,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDCLASSW,
+    WNDPROC, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -17,26 +19,45 @@ use crate::platform::wide;
 use crate::ui::panel::app_from_tray;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::render::Renderer;
-use crate::ui::panel::{PanelMode, track_leave};
+use crate::ui::panel::{PanelMode, PanelView, Release, pump, track_leave};
 use crate::ui::{x_of, y_of};
 
-/// 关闭巡检：前台被夺走即收起[弹窗叠加面板已收起判定]
+/// 关闭巡检
 const TIMER_SWEEP: usize = 1;
 /// 弹出动画帧时钟
 pub(crate) const TIMER_ANIM: usize = 2;
 
-/// 浮动窗口种类：wndproc 公共臂据此分派到具体窗口
+/// 浮动窗口种类
+/// 关闭策略与前台保活随种类而异，分叉点在 TIMER_SWEEP 与 show_at，
+/// 绘制与点击分派目标亦按 kind 分流。
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloatKind {
+    /// 账号弹窗
+    /// 显式关闭，面板收起或离开主视图时连带，前台切到其他应用也收。
     Popup,
+    /// 关于窗
+    /// 前台失锚即收。
     About,
 }
 
-/// 浮动窗口骨架： hwnd/renderer/dpi 与建类标记，公共生命周期方法承载
+impl FloatKind {
+    /// 是否申领前台：关于窗的保活锚定是前台，首显与重开都必须夺回，
+    /// 否则下一拍巡检会把它收掉。弹窗不抢，关闭判定按进程比对前台。
+    fn grabs_foreground(self) -> bool {
+        match self {
+            FloatKind::Popup => false,
+            FloatKind::About => true,
+        }
+    }
+}
+
+/// 浮动窗口骨架：hwnd、renderer、dpi 与建类标记，公共生命周期方法承载。
 pub struct FloatWnd {
     pub hwnd: Option<HWND>,
     pub renderer: Option<Renderer>,
     pub(crate) dpi: f32,
+    /// 按下手势门闩：按下源于本窗才分派 UP，别窗按下滑入不触发。
+    pub(crate) gesture: crate::ui::panel::PressGesture,
     class_registered: bool,
 }
 
@@ -46,6 +67,7 @@ impl FloatWnd {
             hwnd: None,
             renderer: None,
             dpi: crate::ui::panel::FALLBACK_DPI,
+            gesture: crate::ui::panel::PressGesture::new(),
             class_registered: false,
         }
     }
@@ -55,13 +77,15 @@ impl FloatWnd {
             .is_some_and(|h| unsafe { IsWindowVisible(h).as_bool() })
     }
 
-    /// 注册窗口类并建窗；类只注册一次，窗口销毁后复用注册标记
+    /// 注册窗口类并建窗；类只注册一次，窗口销毁后复用注册标记。
+    /// noactivate 控制点击是否激活窗口：不激活的窗口点击时前台不动。
     pub(crate) fn ensure_window(
         &mut self,
         parent: HWND,
         class: &str,
         wndproc: WNDPROC,
         log_tag: &str,
+        noactivate: bool,
     ) -> Option<HWND> {
         if let Some(h) = self.hwnd {
             return Some(h);
@@ -85,8 +109,12 @@ impl FloatWnd {
             }
             let hinst = GetModuleHandleW(None).ok()?;
             let name = wide(class);
+            let mut ex_style = WS_EX_TOPMOST | WS_EX_TOOLWINDOW;
+            if noactivate {
+                ex_style |= WS_EX_NOACTIVATE;
+            }
             let hwnd = CreateWindowExW(
-                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                ex_style,
                 PCWSTR(name.as_ptr()),
                 PCWSTR(name.as_ptr()),
                 WS_POPUP,
@@ -119,17 +147,59 @@ impl FloatWnd {
         }
     }
 
-    /// 定位算完后共用的现身序列：重置悬停与淡入、上屏、抢前台、起双定时器
-    pub(crate) fn show_at(&mut self, h: HWND, x: i32, y: i32, w: i32, hgt: i32) {
+    /// 定位与现身：已可见只重对位；首显重置门闩与悬停、淡入上屏、
+    /// 按需抢前台、启动巡检与动画两个定时器。
+    pub(crate) fn show_at(&mut self, kind: FloatKind, h: HWND, x: i32, y: i32, w: i32, hgt: i32) {
+        let flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS;
         unsafe {
-            let _ = SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER);
+            if self.is_open() {
+                let mut cur = RECT::default();
+                let _ = GetWindowRect(h, &mut cur);
+                let target = RECT {
+                    left: x,
+                    top: y,
+                    right: x + w,
+                    bottom: y + hgt,
+                };
+                if cur == target {
+                    // 矩形未变也重申前台：关于窗保活锚定，泵后即返不碰 self。
+                    if kind.grabs_foreground() {
+                        let _ = SetForegroundWindow(h);
+                    }
+                    return;
+                }
+                // 同尺寸且无悬停高亮走纯平移：CopyBits 随窗搬运旧内容，
+                // 全量重绘只留给要清高亮或尺寸变化的场景。
+                let same_size = cur.right - cur.left == w && cur.bottom - cur.top == hgt;
+                let had_hover = self.renderer.as_ref().is_some_and(|r| r.hover.is_some());
+                if let Some(r) = self.renderer.as_mut() {
+                    // 窗动光标静止不会有移动消息，清旧高亮防错行。
+                    r.hover = None;
+                }
+                // 前台申领是同步泵点：放自身写操作之后，泵后不再碰 self。
+                if kind.grabs_foreground() {
+                    let _ = SetForegroundWindow(h);
+                }
+                if same_size && !had_hover {
+                    let _ = SetWindowPos(h, None, x, y, w, hgt, SWP_NOZORDER | SWP_NOACTIVATE);
+                } else {
+                    let _ = SetWindowPos(h, None, x, y, w, hgt, flags);
+                    let _ = InvalidateRect(Some(h), None, false);
+                }
+                return;
+            }
+            // 门闩只在首显复位：重对位不打断进行中的按下。按住期间到来的
+            // 动画帧或轮询回包清掉门闩会吞掉本次点击。
+            self.gesture.clear();
+            let _ = SetWindowPos(h, None, x, y, w, hgt, flags);
             if let Some(r) = self.renderer.as_mut() {
                 r.hover = None;
                 r.anim.appear = Some(crate::ui::panel::anim::Tween::now(180));
             }
             let _ = ShowWindow(h, SW_SHOW);
-            // 自身必须成为前台：点击外部才构成关闭信号（同托盘菜单的前台要求）
-            let _ = SetForegroundWindow(h);
+            if kind.grabs_foreground() {
+                let _ = SetForegroundWindow(h);
+            }
             SetTimer(Some(h), TIMER_SWEEP, 200, None);
             SetTimer(Some(h), TIMER_ANIM, 16, None);
             let _ = InvalidateRect(Some(h), None, false);
@@ -137,6 +207,12 @@ impl FloatWnd {
     }
 
     pub fn close(&mut self) {
+        self.gesture.clear();
+        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积。
+        // 清理在隐藏泵点之前：SW_HIDE 同步重入后再碰 self 不可靠。
+        if let Some(r) = self.renderer.as_mut() {
+            r.clear_brush_cache();
+        }
         if let Some(h) = self.hwnd {
             unsafe {
                 let _ = ShowWindow(h, SW_HIDE);
@@ -144,14 +220,10 @@ impl FloatWnd {
                 let _ = KillTimer(Some(h), TIMER_ANIM);
             }
         }
-        // 动画期间的 alpha 档位画刷随收起清空，缓存不跨开合累积
-        if let Some(r) = self.renderer.as_mut() {
-            r.clear_brush_cache();
-        }
     }
 }
 
-/// 骨架在 App 上的落点随种类而异：弹窗挂 popup、关于窗挂 about
+/// 骨架在 App 上的落点随种类而异：弹窗挂 popup、关于窗挂 about。
 fn float_of(app: &mut crate::app::App, kind: FloatKind) -> &mut FloatWnd {
     match kind {
         FloatKind::Popup => &mut app.popup.wnd,
@@ -159,21 +231,24 @@ fn float_of(app: &mut crate::app::App, kind: FloatKind) -> &mut FloatWnd {
     }
 }
 
-/// 收起走外层 close：关于窗要连带复位展开态，不能只收骨架
-fn close_float(app: &mut crate::app::App, kind: FloatKind) {
+/// 收起走外层 close：关于窗要连带复位展开态，不能只收骨架。
+fn close_float(hwnd: HWND, app: &mut crate::app::App, kind: FloatKind) {
     match kind {
         FloatKind::Popup => app.popup.close(),
         FloatKind::About => app.about.close(),
     }
-    // 浮窗全收后面板也隐藏时即刻归还工作集——轮询回传只在数据到达时
-    // 触发，长间隔下静止窗口会一直占着内存
-    if app.panel.mode == PanelMode::Hidden && !app.popup.is_open() && !app.about.is_open() {
-        crate::platform::trim_working_set();
+    // 隐藏持捕获窗口会重入消息泵，泵后须重取引用。
+    if let Some(app) = app_from_tray(hwnd) {
+        // 浮窗全收后面板也隐藏时即刻归还工作集：轮询回传只在数据到达时
+        // 触发，长间隔下静止窗口会一直占着内存。
+        if app.panel.mode == PanelMode::Hidden && !app.popup.is_open() && !app.about.is_open() {
+            crate::platform::trim_working_set();
+        }
     }
 }
 
-/// 浮动窗口的窗口过程公共臂；差异点（stale 判定、paint 调用、点击分派
-/// 目标）按 kind 就地分流。两窗的 wndproc 是薄包装
+/// 浮动窗口的窗口过程公共臂，差异点按 kind 就地分流：stale 判定、
+/// paint 调用与点击分派目标。两窗的 wndproc 是薄包装。
 pub(crate) fn float_wndproc(
     hwnd: HWND,
     msg: u32,
@@ -184,7 +259,7 @@ pub(crate) fn float_wndproc(
     unsafe {
         match msg {
             WM_PAINT => {
-                // 不走 BeginPaint：验证客户区后直接渲染
+                // 不走 BeginPaint：验证客户区后直接渲染。
                 let _ = ValidateRect(Some(hwnd), None);
                 if let Some(app) = app_from_tray(hwnd) {
                     let mut rect = RECT::default();
@@ -201,7 +276,7 @@ pub(crate) fn float_wndproc(
                                     app.config.general.appearance.as_deref(),
                                 ),
                             );
-                            // 首开时 renderer 尚未建成，open 里的淡入没设上，这里补
+                            // 首开时 renderer 尚未建成，open 里的淡入没设上，这里补。
                             r.anim.appear = Some(crate::ui::panel::anim::Tween::now(180));
                         }
                         let model = PanelModel::from_app(app);
@@ -225,17 +300,21 @@ pub(crate) fn float_wndproc(
             }
             WM_TIMER => match wparam.0 {
                 TIMER_SWEEP => {
-                    let app = app_from_tray(hwnd);
-                    let stale = match app.as_ref() {
-                        // 前台被夺走即失锚；弹窗还锚在面板上，面板收起同判
-                        Some(app) => {
-                            GetForegroundWindow() != hwnd
-                                || (kind == FloatKind::Popup && app.panel.mode == PanelMode::Hidden)
+                    if let Some(app) = app_from_tray(hwnd) {
+                        let pressing = float_of(app, kind).gesture.at.is_some();
+                        let stale = match kind {
+                            FloatKind::About => GetForegroundWindow() != hwnd,
+                            // 按下期间豁免前台判定：点击瞬间前台归属未稳，
+                            // 误判会把点击吞成闪烁。
+                            FloatKind::Popup => {
+                                app.panel.mode == PanelMode::Hidden
+                                    || app.panel.view != PanelView::Main
+                                    || (!pressing && !crate::platform::foreground_is_self())
+                            }
+                        };
+                        if stale {
+                            close_float(hwnd, app, kind);
                         }
-                        None => true,
-                    };
-                    if stale && let Some(app) = app {
-                        close_float(app, kind);
                     }
                     LRESULT(0)
                 }
@@ -271,7 +350,7 @@ pub(crate) fn float_wndproc(
                 _ => DefWindowProcW(hwnd, msg, wparam, lparam),
             },
             WM_MOUSEMOVE => {
-                // 每次移动重挂 TME_LEAVE：一次性通知，靠反复挂载续命
+                // 每次移动重挂 TME_LEAVE：一次性通知，靠反复挂载续命。
                 track_leave(hwnd);
                 if let Some(app) = app_from_tray(hwnd) {
                     let dpi = float_of(app, kind).dpi;
@@ -296,24 +375,68 @@ pub(crate) fn float_wndproc(
                 }
                 LRESULT(0)
             }
-            WM_LBUTTONUP => {
+            WM_LBUTTONDOWN => {
                 if let Some(app) = app_from_tray(hwnd) {
                     let dpi = float_of(app, kind).dpi;
                     let (x, y) = (x_of(lparam) / dpi, y_of(lparam) / dpi);
+                    let mut cursor = POINT::default();
+                    let _ = GetCursorPos(&mut cursor);
                     let hit = float_of(app, kind)
                         .renderer
                         .as_ref()
                         .and_then(|r| r.hit_at(x, y));
-                    // 命中统一走面板的 handle_panel_hit；分派目标随窗而异：
-                    // 弹窗的 PickAccount 臂要选账号收弹窗并重排面板，目标须是
-                    // 面板 hwnd；关于窗尾部的 InvalidateRect 重绘自身，目标即自身
+                    float_of(app, kind)
+                        .gesture
+                        .record((cursor.x, cursor.y), hit);
+                    // 持捕获：拖出窗外松手 UP 仍回本窗，否则门闩无法复位。
+                    let _ = SetCapture(hwnd);
+                }
+                LRESULT(0)
+            }
+            WM_LBUTTONUP => {
+                // 判定走 PressGesture 共用原语，与面板同规则；捕获归还
+                // 是泵点：引用 move 进泵包装换新引用，分派路由内部重取。
+                let mut cursor = POINT::default();
+                let _ = GetCursorPos(&mut cursor);
+                if let Some(app) = app_from_tray(hwnd) {
+                    let f = float_of(app, kind);
+                    let (ux, uy) = (x_of(lparam) / f.dpi, y_of(lparam) / f.dpi);
+                    let release_hit = f.renderer.as_ref().and_then(|r| r.hit_at(ux, uy));
+                    let verdict = f.gesture.release((cursor.x, cursor.y), release_hit);
                     let target = match kind {
                         FloatKind::Popup => app.panel.hwnd,
                         FloatKind::About => Some(hwnd),
                     };
-                    if let (Some(hit), Some(t)) = (hit, target) {
-                        crate::app::handle_panel_hit(app, hit, t);
+                    let dispatch = match verdict {
+                        Release::Accept {
+                            hit: Some(hit),
+                            dragged: false,
+                        } => target.map(|t| (hit, t)),
+                        _ => None,
+                    };
+                    let app = pump(app, hwnd, || {
+                        let _ = ReleaseCapture();
+                    });
+                    if let (Some((hit, t)), Some(_)) = (dispatch, app) {
+                        let _ = crate::app::dispatch_hit(hit, t);
                     }
+                } else {
+                    let _ = ReleaseCapture();
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+                // 前台到达浮窗：面板冻结的跑马灯一并唤醒，面板自己
+                // 收不到本消息。
+                if (wparam.0 & 0xFFFF) != 0 {
+                    crate::ui::panel::wake_frozen_marquee(hwnd);
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_CAPTURECHANGED => {
+                // 捕获被夺后无配对 UP，门闩须在此复位。
+                if let Some(app) = app_from_tray(hwnd) {
+                    float_of(app, kind).gesture.clear();
                 }
                 LRESULT(0)
             }

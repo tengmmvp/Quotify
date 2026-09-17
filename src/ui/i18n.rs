@@ -1,7 +1,7 @@
 //! 界面文案
 
 /// 生效语言
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Lang {
     Zh,
     En,
@@ -68,23 +68,34 @@ pub struct Strings {
     // ── 主视图 · 状态 ──
     pub updated_just_now: &'static str,
     pub updated_ago: &'static str,
-    pub data_as_of: &'static str,
     pub loading: &'static str,
-    pub fetch_failed: &'static str,
-    pub retry: &'static str,
     pub not_configured_title: &'static str,
     pub not_configured_hint: &'static str,
     pub key_invalid: &'static str,
 
-    // ── 错误前缀 ──
-    /// 凭据失效（`FetchError::Auth`）：错误卡主文案
-    pub err_auth: &'static str,
-    /// 空 limits（`FetchError::EmptyLimits`）：key 无套餐权限 / 团队版缺选择头
-    pub err_empty: &'static str,
-    /// 业务错误前缀（`FetchError::Api`）：与 detail 拼成「前缀: 细节」
-    pub err_api: &'static str,
-    /// 网络错误前缀（`FetchError::Network`）：拼接方式同上
-    pub err_network: &'static str,
+    // ── 错误显示 ──
+    /// 页脚错误摘要的前缀段：数据截至时间，段间分隔符由绘制侧拼接。
+    pub data_as_of: &'static str,
+    /// 大类标题：认证失败
+    pub err_cat_auth: &'static str,
+    /// 大类标题：请求出错
+    pub err_cat_bad_request: &'static str,
+    /// 大类标题：请求受限
+    pub err_cat_rate_limited: &'static str,
+    /// 大类标题：服务端错误
+    pub err_cat_server: &'static str,
+    /// 大类标题：网络错误
+    pub err_cat_network: &'static str,
+    /// 大类标题：暂无数据
+    pub err_cat_no_data: &'static str,
+    /// 错误卡正文：码与提示齐全
+    pub err_code_msg: &'static str,
+    /// 错误卡正文：只有码
+    pub err_code_only: &'static str,
+    /// 认证失败无官方提示时的兜底正文
+    pub err_auth_hint: &'static str,
+    /// 暂无数据的引导正文
+    pub err_empty_hint: &'static str,
     /// 检查更新失败，对应 `service::update` 的 Err
     pub err_update: &'static str,
 
@@ -219,19 +230,23 @@ const ZH: Strings = Strings {
     // ── 主视图 · 状态 ──
     updated_just_now: "刚刚更新",
     updated_ago: "数据更新于 {t}前",
-    data_as_of: "数据截至 {t}",
     loading: "加载中…",
-    fetch_failed: "获取失败",
-    retry: "重试",
     not_configured_title: "未配置账号",
     not_configured_hint: "进入设置，添加 GLM Coding Plan 账号即可开始使用",
     key_invalid: "[提示] API key 无效，请在设置中检查",
 
-    // ── 错误前缀 ──
-    err_auth: "API key 无效或已失效",
-    err_empty: "未返回额度数据：请确认 API key 属于编码套餐（团队版需填写组织/项目 ID）",
-    err_api: "接口错误",
-    err_network: "网络错误",
+    // ── 错误显示 ──
+    data_as_of: "数据截至 {t}",
+    err_cat_auth: "认证失败",
+    err_cat_bad_request: "请求出错",
+    err_cat_rate_limited: "请求受限",
+    err_cat_server: "服务端错误",
+    err_cat_network: "网络错误",
+    err_cat_no_data: "暂无数据",
+    err_code_msg: "错误码 {code}：{msg}",
+    err_code_only: "错误码 {code}",
+    err_auth_hint: "API key 无效或已失效，请检查后重试",
+    err_empty_hint: "未返回额度数据。请确认 API key 属于编码套餐且未到期；团队版需填写组织 ID 与项目 ID",
     err_update: "检查更新失败",
 
     // ── 托盘 tooltip ──
@@ -365,19 +380,23 @@ const EN: Strings = Strings {
     // ── 主视图 · 状态 ──
     updated_just_now: "Updated just now",
     updated_ago: "Updated {t} ago",
-    data_as_of: "Data as of {t}",
     loading: "Loading…",
-    fetch_failed: "Fetch failed",
-    retry: "Retry",
     not_configured_title: "No account configured",
     not_configured_hint: "Open Settings and add a GLM Coding Plan account to get started",
     key_invalid: "[Note] Invalid API key. Check it in Settings",
 
-    // ── 错误前缀 ──
-    err_auth: "Invalid or expired API key",
-    err_empty: "No quota data: make sure the API key belongs to a Coding Plan (team accounts need Organization/Project IDs)",
-    err_api: "API error",
-    err_network: "Network error",
+    // ── 错误显示 ──
+    data_as_of: "Data as of {t}",
+    err_cat_auth: "Authentication failed",
+    err_cat_bad_request: "Bad request",
+    err_cat_rate_limited: "Rate limited",
+    err_cat_server: "Server error",
+    err_cat_network: "Network error",
+    err_cat_no_data: "No data",
+    err_code_msg: "Error {code}: {msg}",
+    err_code_only: "Error {code}",
+    err_auth_hint: "The API key is invalid or expired. Check it and retry",
+    err_empty_hint: "No quota data. Use an API key from an active Coding Plan; team keys need Org & Project IDs.",
     err_update: "Update check failed",
 
     // ── 托盘 tooltip ──

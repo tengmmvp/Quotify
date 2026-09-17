@@ -12,7 +12,7 @@ pub struct AccountView<'a> {
     pub team: bool,
 }
 
-/// 一帧渲染所需的全部 app 层数据，引用快照零拷贝
+/// 一帧渲染所需的全部 app 层数据，引用快照零拷贝。
 pub struct PanelModel<'a> {
     pub strings: &'static Strings,
     pub lang: Lang,
@@ -20,6 +20,7 @@ pub struct PanelModel<'a> {
     pub error: Option<&'a crate::api::FetchError>,
     pub account: Option<AccountView<'a>>,
     pub accounts_count: usize,
+    pub popup_open: bool,
     pub accounts: &'a [crate::app::config::Account],
     pub poll_interval_secs: u64,
     pub language: Option<&'a str>,
@@ -61,6 +62,7 @@ impl<'a> PanelModel<'a> {
             error: app.data.last_error.as_ref(),
             account,
             accounts_count: app.config.accounts.len(),
+            popup_open: app.popup.is_open(),
             accounts: &app.config.accounts,
             poll_interval_secs: g.poll_interval_secs,
             language: g.language.as_deref(),

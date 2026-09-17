@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_STRING, MSG, PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
     SetForegroundWindow, SetTimer, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY,
-    WM_NULL, WM_TIMER, WNDCLASSW, WS_POPUP,
+    WM_NULL, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -87,7 +87,9 @@ pub struct App {
     pub(crate) news: Option<Vec<crate::service::whatsnew::NewsItem>>,
     news_fetched: bool,
     pub(crate) autostart_enabled: bool,
-    last_icon_key: Option<(i64, bool, bool)>,
+    last_icon_key: Option<(i32, i64, bool, bool)>,
+    /// tooltip 的内容指纹，不变则跳过文本构建
+    last_tip: Option<String>,
     threshold_armed_5h: bool,
     last_reset_5h: Option<DateTime<Utc>>,
     threshold_armed_weekly: bool,
@@ -124,6 +126,7 @@ impl App {
             news_fetched: false,
             autostart_enabled: crate::platform::autostart::is_enabled(),
             last_icon_key: None,
+            last_tip: None,
             threshold_armed_5h: false,
             last_reset_5h: None,
             threshold_armed_weekly: false,
@@ -132,7 +135,7 @@ impl App {
         }
     }
 
-    fn hwnd(&self) -> HWND {
+    pub(crate) fn hwnd(&self) -> HWND {
         self.hwnd.unwrap_or_default()
     }
 
@@ -155,65 +158,107 @@ impl App {
             .clamp(MIN_POLL_SECS, MAX_POLL_SECS);
     }
 
-    fn update_tray_icon(&mut self) {
-        let failed = self.data.last_error.is_some() && self.data.snapshot.is_none();
-        let used = self
+    /// 刷新托盘 tooltip 与图标
+    /// NIM_MODIFY 是跨线程同步调用，可能重入消息泵使引用失效：每段
+    /// 下发后经重取引用重算决策再续走。内容键只在下发成功后推进，
+    /// 失败由下一次刷新重试。
+    pub(crate) fn update_tray_icon(&mut self) {
+        let tray_hwnd = self.hwnd();
+        // tooltip 先行：与上次下发的文本比对，不变即跳过下发。文本级
+        // 比对天然跟随文案增改，指纹键漏段会冻结旧文本。
+        let tip = tooltip_text(self);
+        // 未注册期 NIM_MODIFY 必失败：跳过下发，键不推进，重注册后
+        // 的全量重发自愈。
+        let tray_up = self.tray.as_ref().is_some_and(|tray| tray.registered);
+        if tray_up && self.last_tip.as_deref() != Some(tip.as_str()) {
+            let tip_set = self
+                .tray
+                .as_ref()
+                .is_some_and(|tray| tray.set_tooltip(&tip));
+            if tip_set && let Some(app) = app_from(tray_hwnd) {
+                app.last_tip = Some(tip);
+            }
+        }
+        // set_tooltip 的 NIM_MODIFY 是泵点：重取引用并重算决策，
+        // 防泵内到达的新状态被泵前旧值覆盖。
+        let Some(app) = app_from(tray_hwnd) else {
+            return;
+        };
+        // 图标同样只对已注册托盘下发：未注册期建图必随失败销毁，
+        // 纯 GDI 空转。
+        if !app.tray.as_ref().is_some_and(|tray| tray.registered) {
+            return;
+        }
+        let failed = app.data.last_error.is_some() && app.data.snapshot.is_none();
+        let used = app
             .data
             .snapshot
             .as_ref()
             .and_then(|s| s.five_hour.as_ref())
             .map(|b| b.used_percent)
             .unwrap_or(0.0);
-        let key = (used.round() as i64, self.data.snapshot.is_some(), failed);
-        // tooltip 先于图标 key 早退刷新：其他桶摘要可能单独变化，
-        // 每拍一次 NIM_MODIFY 开销可忽略
-        if let Some(tray) = &self.tray {
-            tray.set_tooltip(&tooltip_text(self));
-        }
-        if self.last_icon_key == Some(key) {
+        // 键含像素尺寸：显示缩放变化后按新尺寸重建，不沿用旧位图。
+        let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) * 2;
+        let key = (px, used.round() as i64, app.data.snapshot.is_some(), failed);
+        if app.last_icon_key == Some(key) {
             return;
         }
-        // 两倍尺寸给 Shell 缩小显示；无数据态资源优先、手绘兜底
-        let px = unsafe { GetSystemMetrics(SM_CXSMICON) }.max(16) * 2;
-        let new = match &self.data.snapshot {
+        let new = match &app.data.snapshot {
             Some(_) => icon::ring_icon(px, used, failed),
             None if failed => icon::ring_icon(px, 0.0, true),
             None => icon::resource_icon(px).or_else(|| icon::logo_icon(px)),
         };
-        if let Some(new) = new {
-            // 先换新再销毁旧：成功时 shell 全程不引用已销毁句柄；NIM_MODIFY
-            // 失败时旧句柄仍销毁、托盘空到下次更新，与旧顺序结局相同
-            if let Some(tray) = &self.tray {
-                tray.update_icon(new);
+        let Some(new) = new else {
+            return;
+        };
+        // 下发成功才销毁旧句柄并推进键，失败由下一次刷新重试。
+        let set = app.tray.as_ref().is_some_and(|tray| tray.update_icon(new));
+        if !set {
+            icon::destroy_owned(new);
+            return;
+        }
+        if let Some(app) = app_from(tray_hwnd) {
+            // update_icon 的 NIM_MODIFY 是泵点：泵内嵌套刷新可能已装入
+            // 更新图标并推进键，键已变即让位——销毁在用句柄、回写旧键
+            // 都会吞掉新内容，只回收自建句柄。
+            if app.last_icon_key != Some(key) {
+                icon::destroy_owned(new);
+                return;
             }
-            if let Some(old) = self.tray_icon.take() {
+            if let Some(old) = app.tray_icon.take() {
                 icon::destroy_owned(old);
             }
-            self.tray_icon = Some(new);
-            self.last_icon_key = Some(key);
+            app.tray_icon = Some(new);
+            app.last_icon_key = Some(key);
         }
     }
 
     fn handle_poll_result(&mut self, msg: PollMessage) {
-        // 迟到的旧世代结果直接丢弃：换源后旧账号数据不得冒充当前账号
+        // 迟到的旧世代结果直接丢弃：换源后旧账号数据不得冒充当前账号。
         if msg.generation != self.poll_gen.load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         match msg.outcome {
-            PollOutcome::Success(snap) => {
-                // 快照时间戳推进才播换装动画
+            PollOutcome::Success(mut snap) => {
+                // 快照时间戳推进才播换装动画；页脚当前是错误摘要时不播：
+                // 吃豆人起点是定宽静态文案，接滚动中的文本会跳变，错误
+                // 恢复直接切正常文案。
                 let prev_at = self.data.snapshot.as_ref().map(|s| s.queried_at);
-                let anim_ok = prev_at.is_some_and(|t| t != snap.queried_at)
+                let anim_ok = self.data.last_error.is_none()
+                    && prev_at.is_some_and(|t| t != snap.queried_at)
                     && self.panel.mode == crate::ui::panel::PanelMode::Pinned
                     && self.panel.view == crate::ui::panel::PanelView::Main;
                 let anim_texts = anim_ok.then(|| {
                     let prev = prev_at.unwrap();
                     let s = self.strings;
-                    // 旧文案与静态页脚同源：动画起点必须逐字节等于上一帧
+                    // 旧文案与静态页脚同源：动画起点必须逐字节等于上一帧。
                     let old_text = crate::ui::fmt::updated_text(s, self.lang, prev);
                     (old_text, s.updated_just_now.to_string())
                 });
                 self.check_notifications(&snap);
+                // 附加块回填：本轮失败的余额与 Token 档沿用上一份快照。
+                let prev = self.data.snapshot.take();
+                crate::api::merge_sidecar(&mut snap, prev.as_ref());
                 self.data.snapshot = Some(*snap);
                 self.data.last_error = None;
                 self.last_logged_error = None;
@@ -223,7 +268,7 @@ impl App {
                     let ph = self.panel.hwnd;
                     if let (Some(p), Some(r)) = (ph, self.panel.renderer.as_mut()) {
                         // 动画开关用 renderer 的缓存判定，与 appear/spin
-                        // 一致；运行中切换系统减少动效不会两套标准
+                        // 同一来源。
                         if r.animations_on() {
                             let (ow, nw) = unsafe {
                                 (
@@ -231,20 +276,14 @@ impl App {
                                     r.measure(&new_text, 12.0, 400, false),
                                 )
                             };
-                            r.anim.footer = Some(crate::ui::panel::render::FooterAnim {
-                                tween: crate::ui::panel::anim::Tween::now(3600),
-                                old_text,
-                                new_text,
-                                old_w: ow,
-                                new_w: nw,
-                            });
+                            r.start_footer_anim(old_text, ow, new_text, nw);
                             unsafe { crate::ui::panel::start_anim(p) };
                         }
                     }
                 }
             }
             PollOutcome::Failure(e) => {
-                // 文案与上次相同的失败只记一次，固定间隔重试不刷屏
+                // 文案与上次相同的失败只记一次，固定间隔重试不刷屏。
                 let msg = e.to_string();
                 let repeated = self
                     .last_logged_error
@@ -257,12 +296,13 @@ impl App {
                 self.data.last_error = Some(*e);
             }
         }
-        self.update_tray_icon();
+        // 托盘刷新异步投递：NIM_MODIFY 泵点收进 wndproc 臂，此处引用不跨泵。
+        queue_tray_refresh(self.hwnd());
         if let Some(p) = self.panel.hwnd {
             relayout_panel(self, p);
         }
         // UI 可见期间跳过修剪：刚用过的页面被立即换出、下轮再缺页换回，
-        // 往返纯亏；静止归还交给收起路径兜底
+        // 往返纯亏；静止归还交给收起路径兜底。
         let ui_visible = self.panel.mode != crate::ui::panel::PanelMode::Hidden
             || self.popup.is_open()
             || self.about.is_open();
@@ -313,16 +353,32 @@ impl App {
         }
     }
 
-    /// 开门三步的唯一入口：调高度 → 弹面板 → 套外观。toggle_pin 内部
-    /// 先复位主视图再显示，视图切换必须在其后——顺序错则开门停在错页
-    pub(crate) fn open_panel(&mut self, tray: HWND, anchor: windows::Win32::Foundation::RECT) {
+    /// 左键开关面板的唯一入口：锁定态收起、隐藏态展开。展开序列
+    /// 调高度 → 弹面板 → 套外观，分支内部先复位主视图再显示，视图切换
+    /// 必须在其后——顺序错则开门停在错页。只想展开不收起的调用方须先
+    /// 自行确认处于 Hidden。收起路径无须重算高度
+    pub(crate) fn toggle_panel(&'static mut self, tray: HWND, anchor: RECT) {
         let n = self.config.accounts.len();
-        sync_main_height(self);
-        self.panel.toggle_pin(tray, anchor, n);
-        apply_appearance(self);
-        // 打开时若已处某窗口末分钟，立即把心跳切到秒拍，不等首个 tick。
-        if let Some(h) = self.panel.hwnd {
-            crate::ui::panel::retune_minute(self, h);
+        match self.panel.mode {
+            // 隐藏会重入消息泵，之后不再碰引用。
+            crate::ui::panel::PanelMode::Pinned => {
+                if let Some(p) = self.panel.hwnd {
+                    hide_panel(self, p);
+                }
+                return;
+            }
+            crate::ui::panel::PanelMode::Hidden => {
+                sync_main_height(self);
+                self.panel.show_from_hidden(tray, anchor, n);
+            }
+        }
+        // 展开序列内嵌消息泵，泵后重取引用收尾。
+        // 已处窗口末分钟时立即切秒拍，不等首个 tick。
+        if let Some(app) = app_from(tray) {
+            apply_appearance(app);
+            if let Some(h) = app.panel.hwnd {
+                crate::ui::panel::retune_minute(app, h);
+            }
         }
     }
 
@@ -345,7 +401,7 @@ impl App {
             );
             let _ = AppendMenuW(menu, MF_STRING, IDM_ABOUT as usize, PCWSTR(about.as_ptr()));
             let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(exit.as_ptr()));
-            // 弹菜单前先激活前台，否则点菜单外不收起[Shell_NotifyIcon 文档要求]
+            // [Shell_NotifyIcon 文档要求] 弹菜单前先激活前台，否则点菜单外不收起。
             let _ = SetForegroundWindow(owner);
             let _ = TrackPopupMenu(
                 menu,
@@ -357,15 +413,14 @@ impl App {
                 None,
             );
             let _ = DestroyMenu(menu);
-            // 官方模板要求的收尾：让菜单模式正确归还激活，否则下次弹菜单可能
-            // 立即失焦收不起来
+            // 让菜单模式正确归还激活，否则下次弹菜单可能立即失焦收不起来。
             let _ = PostMessageW(Some(owner), WM_NULL, WPARAM(0), LPARAM(0));
         }
     }
 }
 
-/// 毒化锁取回内部数据继续用，与 service::poller 同策略：锁只被短临界区持有，
-/// 毒化意味着持锁线程已死，数据本身仍完好
+/// 毒化锁取回内部数据继续用：锁只被短临界区持有，
+/// 毒化意味着持锁线程已死，数据本身仍完好。
 fn borrow<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -388,29 +443,79 @@ fn is_immersive_color_set(lparam: LPARAM) -> bool {
     }
 }
 
+/// 托盘内容刷新的异步入口
+/// NIM_MODIFY 泵点收进 wndproc 臂，调用方引用不跨泵
+pub(crate) fn queue_tray_refresh(tray_hwnd: HWND) {
+    unsafe {
+        let _ = PostMessageW(
+            Some(tray_hwnd),
+            crate::platform::msg::WM_APP_TRAY_REFRESH,
+            WPARAM(0),
+            LPARAM(0),
+        );
+    }
+}
+
+/// 托盘重注册的自愈序列：TaskbarCreated 与重试定时器两路同引。
+/// NIM_ADD 与 NIM_MODIFY 都是泵点，进出各自重取引用；成功即回写注册
+/// 态、清内容键并投递全量刷新——用量环立即接管，不等下一轮轮询回包。
+/// 失败返回 false，重试节奏归调用方。
+fn rearm_tray(hwnd: HWND) -> bool {
+    let Some((icon, tip)) = app_from(hwnd).map(|app| (app.tray_icon, tooltip_text(app))) else {
+        return false;
+    };
+    let Some(tray) = app_from(hwnd).and_then(|app| app.tray.as_ref()) else {
+        return false;
+    };
+    let ok = icon.is_some_and(|icon| tray.readd(icon, &tip));
+    if ok && let Some(tray) = app_from(hwnd).and_then(|app| app.tray.as_mut()) {
+        tray.registered = true;
+        if let Some(app) = app_from(hwnd) {
+            app.last_tip = None;
+            app.last_icon_key = None;
+        }
+        queue_tray_refresh(hwnd);
+    }
+    ok
+}
+
 /// 托盘隐藏窗口过程
 extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     match msg {
+        crate::platform::msg::WM_APP_TRAY_REFRESH => {
+            if let Some(app) = app_from(hwnd) {
+                app.update_tray_icon();
+            }
+            LRESULT(0)
+        }
         WM_APP_TRAY => {
             let app = app_from(hwnd);
             let code = tray::parse_callback(lparam);
             match code {
-                // 悬停只出系统 tooltip（用量摘要）；面板由左键打开
+                // 悬停显示 tooltip 摘要，左键打开面板。
+                // tray_rect 是跨进程同步调用即泵点：先拷判定，泵后重取再动面板。
                 windows::Win32::UI::WindowsAndMessaging::WM_LBUTTONUP => {
-                    if let Some(app) = app
-                        && let Some(rect) = tray_rect(app)
+                    let rect = app.and_then(|app| tray_rect(app));
+                    if let Some(rect) = rect
+                        && let Some(app) = app_from(hwnd)
                     {
-                        app.open_panel(hwnd, rect);
+                        app.toggle_panel(hwnd, rect);
                     }
                 }
                 windows::Win32::UI::WindowsAndMessaging::WM_RBUTTONUP => {
                     let ctx = app.map(|a| (a.hwnd(), a.strings));
                     if let Some((owner, s)) = ctx {
+                        // 菜单窗口同属本进程，前台判定不受弹窗巡检影响：
+                        // 进菜单前显式收掉，免得两件 UI 并存；close 的隐藏
+                        // 泵由 helper 消费引用，泵后不续用。
+                        if let Some(app) = app_from(hwnd) {
+                            let _ = close_popup(app, hwnd);
+                        }
                         App::show_context_menu(owner, s, tray::context_menu_pos());
                     }
                 }
                 // 键盘激活走 WM_CONTEXTMENU 且不带坐标（右键另有
-                // RBUTTONUP 臂）；光标可能在任意处，菜单定位用图标矩形中心
+                // RBUTTONUP 臂）；光标可能在任意处，菜单定位用图标矩形中心。
                 windows::Win32::UI::WindowsAndMessaging::WM_CONTEXTMENU => {
                     if let Some(app) = app {
                         let owner = app.hwnd();
@@ -421,6 +526,11 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                                 y: (r.top + r.bottom) / 2,
                             })
                             .unwrap_or_else(tray::context_menu_pos);
+                        // 同 RBUTTONUP：菜单前台不受巡检影响，先收弹窗；
+                        // tray_rect 的跨进程同步调用是泵点，收起前重取。
+                        if let Some(app) = app_from(hwnd) {
+                            let _ = close_popup(app, hwnd);
+                        }
                         App::show_context_menu(owner, s, pos);
                     }
                 }
@@ -429,23 +539,22 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         msg if msg == *tray::TASKBAR_CREATED => {
-            // explorer 重启：托盘图标随任务栏进程消亡，广播到达即重注册
-            if let Some(app) = app_from(hwnd)
-                && let Some(icon) = app.tray_icon
+            // explorer 重启：托盘图标随任务栏进程消亡，广播到达即重注册。
+            // readd 与 tray_rect 都是泵点：决策前置纯读，泵后重取。
+            let pinned = app_from(hwnd)
+                .is_some_and(|app| app.panel.mode == crate::ui::panel::PanelMode::Pinned);
+            rearm_tray(hwnd);
+            // 任务栏重建后图标可能换位，面板还开着时同步刷新锚点，
+            // near_tray 保活与下次重排不按旧矩形误判。
+            if pinned
+                && let Some(rect) = app_from(hwnd).and_then(|app| tray_rect(app))
+                && let Some(app) = app_from(hwnd)
             {
-                let tip = tooltip_text(app);
-                if let Some(tray) = app.tray.as_mut() {
-                    tray.readd(icon, &tip);
-                }
-                // 任务栏重建后图标可能换位，面板还开着时同步刷新锚点，
-                // near_tray 保活与下次重排不按旧矩形误判
-                if app.panel.mode == crate::ui::panel::PanelMode::Pinned
-                    && let Some(rect) = tray_rect(app)
-                {
-                    app.panel.anchor = Some(rect);
-                }
-                // 补回成功撤掉还在跑的重试定时器；失败则挂起重试接管，
-                // 不让图标缺席到下次 explorer 重启
+                app.panel.anchor = Some(rect);
+            }
+            // 补回成功撤掉还在跑的重试定时器；失败则挂起重试接管，
+            // 不让图标缺席到下次 explorer 重启。
+            if let Some(app) = app_from(hwnd) {
                 if app.tray.as_ref().is_some_and(|t| t.registered) {
                     unsafe {
                         use windows::Win32::UI::WindowsAndMessaging::KillTimer;
@@ -460,22 +569,46 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
             LRESULT(0)
         }
+        windows::Win32::UI::WindowsAndMessaging::WM_ACTIVATE => {
+            // 前台到达托盘窗（右键菜单流程）：面板冻结的跑马灯一并
+            // 唤醒——激活消息只发给本窗口，面板自己收不到。
+            if (wparam.0 & 0xFFFF) != 0 {
+                crate::ui::panel::wake_frozen_marquee(hwnd);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_POWERBROADCAST => {
+            // 唤醒即补拉：等待计时与墙钟在睡眠期间脱钩。只匹配
+            // AUTOMATIC，任何恢复都广播它，用户触发的恢复还追加
+            // SUSPEND，双接会双触发。
+            use windows::Win32::UI::WindowsAndMessaging::PBT_APMRESUMEAUTOMATIC;
+            if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
+                && let Some(app) = app_from(hwnd)
+                && let Some(p) = app.poller.as_ref()
+            {
+                p.refresh_now();
+            }
+            LRESULT(1)
+        }
         WM_TIMER => {
             // 托盘首注册失败的短程重试；成功或超限即撤，TaskbarCreated 兜底。
             // 未知定时器 id 落回默认处理，未来新增带回调的定时器不被吞。
             if wparam.0 == TIMER_TRAY_RETRY {
-                if let Some(app) = app_from(hwnd) {
+                let registered = app_from(hwnd).map(|app| {
                     let registered = app.tray.as_ref().is_some_and(|t| t.registered);
+                    if !registered {
+                        // 本拍已用掉一次重试：计数推进在泵前完成。
+                        app.tray_retries += 1;
+                    }
+                    registered
+                });
+                if let Some(registered) = registered {
                     let mut done = registered;
                     if !registered {
-                        app.tray_retries += 1;
-                        let tip = tooltip_text(app);
-                        if let (Some(icon), Some(tray)) = (app.tray_icon, app.tray.as_mut()) {
-                            tray.readd(icon, &tip);
-                            done = tray.registered;
-                        }
+                        done = rearm_tray(hwnd);
                     }
-                    if done || app.tray_retries >= TRAY_RETRY_MAX {
+                    if done || app_from(hwnd).is_some_and(|app| app.tray_retries >= TRAY_RETRY_MAX)
+                    {
                         unsafe {
                             use windows::Win32::UI::WindowsAndMessaging::KillTimer;
                             let _ = KillTimer(Some(hwnd), TIMER_TRAY_RETRY);
@@ -488,7 +621,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             }
         }
         WM_APP_POLL_RESULT => {
-            // 无载荷唤醒码：结果在通道里排队空取，伪造消息最多扑空
+            // 无载荷唤醒码：结果在通道里排队空取，伪造消息最多落空。
             if let Some(app) = app_from(hwnd) {
                 while let Some(msg) = crate::service::poller::POLL_SLOT.take() {
                     app.handle_poll_result(msg);
@@ -512,7 +645,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         windows::Win32::UI::WindowsAndMessaging::WM_SETTINGCHANGE => {
-            // 外观未显式指定时，系统主题切换即时重绘面板
+            // 外观未显式指定时，系统主题切换即时重绘面板。
             if is_immersive_color_set(lparam)
                 && let Some(app) = app_from(hwnd)
                 && crate::ui::panel::theme::explicit_appearance(
@@ -521,7 +654,6 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 .is_none()
             {
                 apply_appearance(app);
-                // 面板与打开中的弹窗、关于窗一并按新主题重绘
                 invalidate_ui(app);
             }
             LRESULT(0)
@@ -532,12 +664,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     match result {
                         Ok(news) => {
                             app.news = Some(news);
-                            // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高
+                            // 慢网络下关于窗可能已按基础高度打开：动态到达后重排窗高。
                             refit_about(app);
                         }
                         Err(e) => {
                             crate::platform::log(&format!("[Quotify] 动态拉取失败: {e}"));
-                            // 复位闸门，下次打开关于窗可重试
+                            // 复位闸门，下次打开关于窗可重试。
                             app.news_fetched = false;
                         }
                     }
@@ -546,12 +678,15 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             LRESULT(0)
         }
         WM_APP_WAKE_INSTANCE => {
-            // 第二实例唤醒的语义是「弹出来」：已显示时不动作，仅隐藏时开门
-            if let Some(app) = app_from(hwnd)
-                && app.panel.mode == crate::ui::panel::PanelMode::Hidden
-                && let Some(rect) = tray_rect(app)
+            // 第二实例唤醒的语义是「弹出来」：已显示时不动作，仅隐藏时开门。
+            // tray_rect 是泵点：先拷判定，泵后重取再动面板。
+            let rect = app_from(hwnd)
+                .filter(|app| app.panel.mode == crate::ui::panel::PanelMode::Hidden)
+                .and_then(|app| tray_rect(app));
+            if let Some(rect) = rect
+                && let Some(app) = app_from(hwnd)
             {
-                app.open_panel(hwnd, rect);
+                app.toggle_panel(hwnd, rect);
             }
             LRESULT(0)
         }
@@ -559,24 +694,33 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             let cmd = (wparam.0 & 0xFFFF) as u16;
             match cmd {
                 IDM_SETTINGS => {
-                    if let Some(app) = app_from(hwnd) {
-                        // 隐藏时先开门，顺序约束在 open_panel 内；已显示则只切视图。
-                        if app.panel.mode == crate::ui::panel::PanelMode::Hidden
-                            && let Some(rect) = tray_rect(app)
+                    // 已在设置页时不再重进：重进会预填代理，覆盖用户清空
+                    // 未应用的编辑。tray_rect 是泵点：先拷判定，泵后重取。
+                    let decision = app_from(hwnd).map(|app| {
+                        let showing = app.panel.mode != crate::ui::panel::PanelMode::Hidden
+                            && app.panel.view == crate::ui::panel::PanelView::Settings;
+                        let open_rect = (app.panel.mode == crate::ui::panel::PanelMode::Hidden)
+                            .then(|| tray_rect(app))
+                            .flatten();
+                        (!showing, open_rect)
+                    });
+                    if let Some((_, rect)) = decision.filter(|(act, _)| *act) {
+                        if let Some(rect) = rect
+                            && let Some(app) = app_from(hwnd)
                         {
-                            app.open_panel(hwnd, rect);
+                            app.toggle_panel(hwnd, rect);
                         }
-                        app.panel.view = crate::ui::panel::PanelView::Settings;
-                        if let Some(p) = app.panel.hwnd {
-                            sync_customizing(app);
-                            relayout_panel(app, p);
+                        if let Some(app) = app_from(hwnd)
+                            && let Some(p) = app.panel.hwnd
+                        {
+                            enter_settings(app, p);
                         }
                     }
                 }
                 IDM_ABOUT => {
                     if let Some(app) = app_from(hwnd) {
                         // 首次开关于窗才拉；不随启动拉，弱网下 raw 域名
-                        // 慢解析会在进程内排队，拖住启动轮询、延后面板首屏
+                        // 慢解析会在进程内排队，拖住启动轮询、延后面板首屏。
                         if app.news.is_none() && !app.news_fetched {
                             app.news_fetched = true;
                             if !crate::platform::post::spawn_post(
@@ -592,7 +736,11 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                             app.news.as_deref(),
                             app.about.news_expanded,
                         );
-                        app.about.open(hwnd, h);
+                        // 关弹窗先于开关于窗：SW_HIDE 同步重入消息泵，
+                        // 引用 move 进 helper 换泵后新引用；两浮窗不同时在场。
+                        if let Some(app) = close_popup(app, hwnd) {
+                            app.about.open(hwnd, h);
+                        }
                     }
                 }
                 IDM_EXIT => unsafe {
@@ -615,30 +763,21 @@ fn tray_rect(app: &App) -> Option<RECT> {
 }
 
 /// 托盘 tooltip 文本：应用名 + 各桶用量摘要，无数据仅应用名。
+/// 桶集与面板行集同引 present_buckets，摘要与面板不再各写一份。
 fn tooltip_text(app: &App) -> String {
     let Some(snap) = app.data.snapshot.as_ref() else {
         return "Quotify".to_string();
     };
-    let part = |pct: Option<f64>, name: &str| {
-        pct.map(|p| format!("{name} {}", crate::ui::fmt::percent(p)))
-    };
-    let segs: Vec<String> = [
-        part(
-            snap.five_hour.as_ref().map(|b| b.used_percent),
-            app.strings.tooltip_5h,
-        ),
-        part(
-            snap.weekly.as_ref().map(|b| b.used_percent),
-            app.strings.tooltip_weekly,
-        ),
-        part(
-            snap.mcp.as_ref().map(|m| m.used_percent),
-            app.strings.tooltip_mcp,
-        ),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let names = [
+        app.strings.tooltip_5h,
+        app.strings.tooltip_weekly,
+        app.strings.tooltip_mcp,
+    ];
+    let segs: Vec<String> = snap
+        .present_buckets()
+        .zip(names)
+        .map(|(b, name)| format!("{name} {}", crate::ui::fmt::percent(b.used_percent())))
+        .collect();
     if segs.is_empty() {
         "Quotify".to_string()
     } else {
@@ -653,12 +792,33 @@ fn app_from(hwnd: HWND) -> Option<&'static mut App> {
     (p != 0).then(|| unsafe { &mut *(p as *mut App) })
 }
 
+/// 进设置页的公共入口：切视图、同步布局、预填代理、重排、关弹窗。
+/// 关弹窗放最后：close 的 SW_HIDE 同步重入消息泵，之后不得再用本引用
+fn enter_settings(app: &mut App, panel_hwnd: HWND) {
+    app.panel.view = crate::ui::panel::PanelView::Settings;
+    sync_customizing(app);
+    // 代理框预填当前生效值，用户可改可清空；清空应用即直连。
+    if app.panel.input.proxy.is_empty()
+        && let Some(p) = app.config.general.proxy.clone()
+    {
+        app.panel.input.proxy = p;
+    }
+    relayout_panel(app, panel_hwnd);
+    app.popup.close();
+}
+
 /// 面板命中处理
-pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
+/// 引用按 'static 收：ClosePanel 臂经 hide_panel move 消费过泵，
+/// 其余臂泵后由调用方重取。
+pub fn handle_panel_hit(
+    app: &'static mut App,
+    hit: crate::ui::panel::render::Hit,
+    panel_hwnd: HWND,
+) {
     use crate::ui::panel::render::{Hit, ScopeChoice};
     match hit {
-        Hit::Refresh | Hit::Retry => {
-            // 主动重试开启新一轮记录，同文案失败再现时也重记日志
+        Hit::Refresh => {
+            // 主动重试开启新一轮记录，同文案失败再现时也重记日志。
             app.last_logged_error = None;
             if let Some(p) = &app.poller {
                 p.refresh_now();
@@ -670,23 +830,15 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                 unsafe { crate::ui::panel::start_anim(panel_hwnd) };
             }
         }
-        Hit::Settings => {
-            app.panel.view = crate::ui::panel::PanelView::Settings;
-            sync_customizing(app);
-            // 代理框预填当前生效值，用户可改可清空；清空应用即直连
-            if app.panel.input.proxy.is_empty()
-                && let Some(p) = app.config.general.proxy.clone()
-            {
-                app.panel.input.proxy = p;
-            }
-            relayout_panel(app, panel_hwnd);
-        }
+        Hit::Settings => enter_settings(app, panel_hwnd),
         Hit::AccountSwitch => {
-            if let Some(p) = app.panel.hwnd {
+            if app.popup.is_open() {
+                app.popup.close();
+            } else if let Some(p) = app.panel.hwnd {
                 app.popup.open(app.hwnd(), p, app.config.accounts.len());
             }
         }
-        // 悬停徽标无点击语义
+        // 悬停徽标无点击语义。
         Hit::UsageInfo => {}
 
         // ── 导航 ──
@@ -694,7 +846,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel.key_revealed = false;
             app.panel.customizing_interval = false;
             app.panel.clear_input(panel_hwnd);
-            // 表单态的返回是退回设置页，设置页的返回才是回主视图
+            // 表单态的返回是退回设置页，设置页的返回才是回主视图。
             app.panel.view = if app.panel.view == crate::ui::panel::PanelView::AddForm {
                 crate::ui::panel::PanelView::Settings
             } else {
@@ -703,7 +855,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             relayout_panel(app, panel_hwnd);
         }
         Hit::ClosePanel => {
-            app.panel.begin_hide(panel_hwnd);
+            hide_panel(app, panel_hwnd);
         }
 
         // ── 设置 · 轮询间隔 ──
@@ -740,9 +892,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.strings = app.lang.strings();
             crate::app::config::save(&app.config);
             invalidate_ui(app);
-            if let Some(tray) = &app.tray {
-                tray.set_tooltip(&tooltip_text(app));
-            }
+            // 语言变了 tooltip 要重建。
+            queue_tray_refresh(app.hwnd());
         }
         Hit::Appearance(choice) => {
             app.config.general.appearance = choice.to_config();
@@ -763,6 +914,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             app.panel
                 .focus_input(panel_hwnd, crate::ui::panel::InputField::Proxy);
         }
+        Hit::ApplyProxy => apply_proxy(app, panel_hwnd),
 
         // ── 设置 · 用量通知 ──
         Hit::ToggleThreshold => {
@@ -809,31 +961,38 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             if i < app.config.accounts.len() {
                 let removed_id = app.config.accounts[i].id.clone();
                 app.config.accounts.remove(i);
-                if app.config.selected.as_deref() == Some(removed_id.as_str()) {
+                // 仅删中当前选中才换源重拉；无关账号的删除不动轮询与快照。
+                let selected_gone = app.config.selected.as_deref() == Some(removed_id.as_str());
+                if selected_gone {
                     app.config.selected = app.config.accounts.first().map(|a| a.id.clone());
                 }
                 if let Some(r) = app.panel.renderer.as_mut() {
                     r.hits.clear();
                     r.hover = None;
                 }
-                switch_poll_source(app);
+                if selected_gone {
+                    switch_poll_source(app);
+                } else {
+                    crate::app::config::save(&app.config);
+                }
                 relayout_panel(app, panel_hwnd);
             }
         }
         Hit::PickAccount(i) => {
             if i < app.config.accounts.len() {
                 select_account(app, i);
-                app.popup.close();
                 app.panel.view = crate::ui::panel::PanelView::Main;
-                // 选完光标还停在弹窗原位（面板外），重起离面计时
+                // 选完光标还停在弹窗原位（面板外），重起离面计时。
                 app.panel.outside_since = None;
                 relayout_panel(app, panel_hwnd);
+                // close 放最后：SW_HIDE 同步重入消息泵，泵后不用本引用。
+                app.popup.close();
             }
         }
         Hit::AccountType(scope) => {
             app.panel.pending_team = matches!(scope, ScopeChoice::Team);
             if app.panel.pending_team {
-                // 团队版仅国内站：类型切团队时平台同步回国内
+                // 团队版仅国内站：类型切团队时平台同步回国内。
                 app.panel.pending_platform = crate::api::Platform::Cn;
             }
             reconcile_fading_focus(app, panel_hwnd);
@@ -870,7 +1029,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
         Hit::Platform(platform) => {
             app.panel.pending_platform = platform;
             if platform == crate::api::Platform::Intl {
-                // 团队版仅国内站：切到国际版时类型同步回个人版
+                // 团队版仅国内站：切到国际版时类型同步回个人版。
                 app.panel.pending_team = false;
             }
             reconcile_fading_focus(app, panel_hwnd);
@@ -916,7 +1075,7 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             }
         }
         Hit::NewsItem(i) => {
-            // 展开/收起互斥；展开即视为已读，已读标记推进到该条日期并落盘
+            // 展开/收起互斥；展开即视为已读，已读标记推进到该条日期并落盘。
             let Some(item) = app.news.as_ref().and_then(|n| n.get(i)) else {
                 return;
             };
@@ -935,11 +1094,10 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
             } else {
                 Some(i)
             };
-            // 展开改变窗高：重定位并重绘关于窗
             refit_about(app);
         }
         Hit::AboutLogo => {
-            // 单向彩蛋：吃掉后点击不再响应，关关于窗复位
+            // 单向彩蛋：吃掉后点击不再响应，关闭关于窗后复位。
             let about = &mut app.about;
             if about.egg.is_none() && !about.egg_eaten {
                 about.egg_clicks = about.egg_clicks.saturating_add(1);
@@ -952,13 +1110,12 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
                         .is_some_and(|r| r.animations_on());
                     if anim {
                         about.egg = Some(crate::ui::panel::anim::Tween::now(1500));
-                        // 动画时钟可能已被 appear 收尾撤掉，彩蛋期间重挂
+                        // 动画时钟可能已被 appear 收尾撤掉，彩蛋期间重挂。
                         use windows::Win32::UI::WindowsAndMessaging::SetTimer;
                         unsafe {
                             SetTimer(Some(panel_hwnd), crate::ui::float_wnd::TIMER_ANIM, 16, None);
                         }
                     } else {
-                        // 减少动效：不播，直接到终态
                         about.egg_eaten = true;
                     }
                 }
@@ -970,7 +1127,8 @@ pub fn handle_panel_hit(app: &mut App, hit: crate::ui::panel::render::Hit, panel
     }
 }
 
-/// 关于窗「复制诊断信息」的拼装：版本/系统/config 路径/代理/最近错误
+/// 关于窗「复制诊断信息」的拼装
+/// 版本、系统、config 路径、代理、最近错误各一行。
 fn diagnostics_text(app: &App) -> String {
     let os = windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
@@ -1024,7 +1182,7 @@ fn switch_poll_source(app: &mut App) {
     app.sync_poll_context();
     app.poll_gen
         .fetch_add(1, std::sync::atomic::Ordering::Release);
-    app.update_tray_icon();
+    queue_tray_refresh(app.hwnd());
     if let Some(p) = &app.poller {
         p.refresh_now();
     }
@@ -1074,7 +1232,6 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
             return;
         }
     }
-    // 名称留空默认 Default
     let name = if name.is_empty() {
         "Default".to_string()
     } else {
@@ -1100,7 +1257,6 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         r.hover = None;
     }
     switch_poll_source(app);
-    // 保存成功退回设置页
     app.panel.view = crate::ui::panel::PanelView::Settings;
     app.panel.key_revealed = false;
     app.panel.clear_input(panel_hwnd);
@@ -1184,19 +1340,11 @@ fn refit_about(app: &mut App) {
     let h =
         crate::ui::panel::render::about::about_height(app.news.as_deref(), app.about.news_expanded);
     unsafe {
-        let monitor = windows::Win32::Graphics::Gdi::MonitorFromWindow(
-            a,
-            windows::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
-        );
-        let mut mi = windows::Win32::Graphics::Gdi::MONITORINFO {
-            cbSize: std::mem::size_of::<windows::Win32::Graphics::Gdi::MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = windows::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut mi);
+        let mi = crate::ui::panel::monitor_info_of(a);
         let w = (crate::ui::panel::render::about::ABOUT_W * app.about.wnd.dpi).round() as i32;
         let hgt = (h as f32 * app.about.wnd.dpi).round() as i32;
         let x = mi.rcWork.left + (mi.rcWork.right - mi.rcWork.left - w) / 2;
-        // 矮屏窗高超出工作区时保顶弃底，头部信息不裁
+        // 矮屏窗高超出工作区时保顶弃底，头部信息不裁。
         let y = (mi.rcWork.top + (mi.rcWork.bottom - mi.rcWork.top - hgt) / 2).max(mi.rcWork.top);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowPos(
             a,
@@ -1232,7 +1380,7 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     app.config.general.proxy = next;
     crate::app::config::save(&app.config);
     app.panel.clear_input(panel_hwnd);
-    // 换代理后的拉取是新尝试轮次，同文案失败再现时也重记日志
+    // 换代理后的拉取是新尝试轮次，同文案失败再现时也重记日志。
     app.last_logged_error = None;
     if let Some(p) = &app.poller {
         p.refresh_now();
@@ -1295,6 +1443,20 @@ pub fn dispatch_modal(hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
     }
 }
 
+/// 命中分派路由：模态类拦截直调两段式并返回 true，其余重取引用
+/// 分派返回 false。面板与浮窗两处分派层同引，模态拦截的同步只剩
+/// 此一处消费。
+pub(crate) fn dispatch_hit(hit: crate::ui::panel::render::Hit, owner: HWND) -> bool {
+    if hit.is_modal() {
+        dispatch_modal(hit, owner);
+        return true;
+    }
+    if let Some(app) = crate::ui::panel::app_from_tray(owner) {
+        handle_panel_hit(app, hit, owner);
+    }
+    false
+}
+
 /// 导出配置为明文 JSON。两段式取引用：模态对话框跑嵌套消息泵，泵内
 /// 其他消息会重取 App 使本函数前段的引用失效——模态前只取 &'static
 /// 数据，模态后重取引用落盘。
@@ -1309,8 +1471,8 @@ pub fn export_config(panel_hwnd: HWND) {
             app.strings.export_confirm_body,
         )
     };
-    // 风险知情先于选位置：敏感内容的告知应前置；取消则连保存对话框
-    // 都不出，静默中止导出、无 toast。
+    // 风险知情先于选位置：敏感内容的告知应前置。
+    // 取消则连保存对话框都不出，静默中止导出、无 toast。
     let picked = {
         let _modal = ModalGuard::new(panel_hwnd);
         confirm_box(owner, title, body)
@@ -1328,7 +1490,7 @@ pub fn export_config(panel_hwnd: HWND) {
         .and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()))
     {
         Ok(()) => {
-            // 导出文件同为明文 key 落盘，与 config 同标准收紧
+            // 导出文件同为明文 key 落盘，与 config 同标准收紧。
             crate::platform::secure_file_acl(&path);
             app.strings.export_done.to_string()
         }
@@ -1347,11 +1509,10 @@ pub fn import_config(panel_hwnd: HWND) {
         crate::platform::open_dialog()
     };
     let Some(path) = picked else {
-        // 用户取消选择文件，无事发生
         return;
     };
-    // 外部文件不可信：先限大小防超大文件撑内存；三类失败分别落日志，区分
-    // 超限 / 读取事故 / 坏文件，用户 toast 统一为导入失败
+    // 外部文件不可信，先限大小防超大文件撑内存。
+    // 三类失败分别落日志：超限、读取事故、坏文件；用户 toast 统一为导入失败。
     let parsed = match std::fs::metadata(&path) {
         Ok(m) if m.len() > IMPORT_MAX_BYTES => {
             crate::platform::log(&format!(
@@ -1361,7 +1522,7 @@ pub fn import_config(panel_hwnd: HWND) {
             None
         }
         meta => {
-            let _ = meta; // Err(metadata) 随读取一并报错
+            let _ = meta; // Err(metadata) 随读取一并报错。
             std::fs::read_to_string(&path)
                 .map_err(|e| {
                     crate::platform::log(&format!("[Quotify] 配置导入读取失败: {e}"));
@@ -1384,8 +1545,8 @@ pub fn import_config(panel_hwnd: HWND) {
         crate::platform::notify::show(NOTIFY_TITLE, app.strings.import_failed);
         return;
     };
-    // 导入会清掉现有账号时先确认；现状判定与文案一次取用拷出，
-    // 确认框模态泵返回后重取。
+    // 导入会清掉现有账号时先确认。
+    // 现状判定与文案一次取用拷出，确认框模态泵返回后重取。
     if cfg.accounts.is_empty() {
         let confirm = {
             let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
@@ -1439,7 +1600,7 @@ fn sync_customizing(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
     let is_preset = INTERVAL_PRESETS.contains(&cur);
     app.panel.customizing_interval = !is_preset;
-    // 缓冲非空说明用户正在输入，预填会覆盖未应用的编辑
+    // 缓冲非空说明用户正在输入，预填会覆盖未应用的编辑。
     if !is_preset && app.panel.input.interval.is_empty() {
         prefill_interval(app);
     }
@@ -1462,7 +1623,7 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
             }
         }
         Some(InputField::Key) => {
-            // key 必填，名称可留空
+            // key 必填，名称可留空。
             if !app.panel.input.key.trim().is_empty() {
                 if app.panel.pending_team {
                     app.panel.focus_input(panel_hwnd, InputField::Org);
@@ -1508,7 +1669,7 @@ fn normalize_config(c: &mut Config) {
 /// 应用生效外观
 fn apply_appearance(app: &mut App) {
     let appearance = resolved_appearance(app.config.general.appearance.as_deref());
-    // 托盘菜单是系统绘制的，须在进程级单独设模式；此后弹出的菜单才带上主题
+    // 托盘菜单由系统绘制，须在进程级单独设模式，此后弹出的菜单才带上主题。
     crate::platform::menu_theme::apply(matches!(
         appearance,
         crate::ui::panel::theme::Appearance::Dark
@@ -1516,7 +1677,6 @@ fn apply_appearance(app: &mut App) {
     if let Some(r) = app.panel.renderer.as_mut() {
         r.theme = crate::ui::panel::theme::Theme::new(appearance);
     }
-    // 弹窗、关于窗与面板同步换肤
     for r in [&mut app.popup.wnd.renderer, &mut app.about.wnd.renderer]
         .into_iter()
         .flatten()
@@ -1526,15 +1686,13 @@ fn apply_appearance(app: &mut App) {
 }
 
 fn sync_main_height(app: &mut App) {
-    // 特征派生单源于 api::main_features，与渲染侧陈列判定同源
-    let (rows, comp, stats, bal) = crate::api::main_features(app.data.snapshot.as_ref());
-    app.panel.main_h = crate::ui::panel::layout::main_view_height(
-        app.data.snapshot.is_some(),
-        rows,
-        comp,
-        stats,
-        bal,
-    );
+    app.panel.main_h = main_height_of(app.data.snapshot.as_ref());
+}
+
+/// 主视图高度的派生单源：sync_main_height 的高度计算同引
+pub(crate) fn main_height_of(snap: Option<&UsageSnapshot>) -> i32 {
+    let (rows, comp, stats, bal) = crate::api::main_features(snap);
+    crate::ui::panel::layout::main_view_height(snap.is_some(), rows, comp, stats, bal)
 }
 
 /// 生效布局切换：展开立即生效渐扩揭露；收缩保持出发布局收窗渐裁，结束追平。
@@ -1554,7 +1712,34 @@ fn sync_layout_effective(app: &mut App, panel_hwnd: HWND) {
     relayout_panel(app, panel_hwnd);
 }
 
-/// 同步状态并重定位面板
+/// 已开弹窗随面板几何重对位；由面板的 WM_WINDOWPOSCHANGED 统一驱动
+pub(crate) fn reposition_popup(app: &mut App, panel_hwnd: HWND) {
+    app.popup
+        .reposition(app.hwnd(), panel_hwnd, app.config.accounts.len());
+}
+
+/// 收起面板并连带关弹窗的统一入口，漏走此处的收起只剩巡检兜底。
+/// 两步各含隐藏泵点：弹窗段由 close_popup 组合，引用 move 消费换泵
+/// 后新引用——begin_hide 尾部的 SW_HIDE 又是一轮嵌套泵，此后再取的
+/// 引用一律不可外传，续用方自行 app_from 重取。
+pub(crate) fn hide_panel(app: &'static mut App, panel_hwnd: HWND) {
+    let tray = app.hwnd();
+    let mut app = close_popup(app, tray);
+    if let Some(app) = &mut app {
+        app.panel.begin_hide(panel_hwnd);
+    }
+}
+
+/// 关闭账号弹窗并换回泵后新引用：close 的 SW_HIDE 同步重入消息泵，
+/// 调用方持有的 App 引用经此 move 消费——泵后误用旧引用是编译错误。
+/// 弹窗未开时 close 幂等，等价一次重取。重取失败返 None，续用方
+/// 按空路径早退。
+pub(crate) fn close_popup(app: &'static mut App, hwnd: HWND) -> Option<&'static mut App> {
+    app.popup.close();
+    app_from(hwnd)
+}
+
+/// 同步布局状态并重定位面板
 pub(crate) fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
     // 生效布局默认随重排追平；同视图收缩过渡例外——出发布局归动画
     // 独占，跨视图过渡终止后照常追平。
@@ -1569,7 +1754,11 @@ pub(crate) fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
         reconcile_fading_focus(app, panel_hwnd);
     }
     sync_main_height(app);
-    app.panel.account_error = matches!(app.data.last_error, Some(crate::api::FetchError::Auth));
+    app.panel.account_error = app
+        .data
+        .last_error
+        .as_ref()
+        .is_some_and(|e| e.category() == crate::api::ErrorCategory::Unauthenticated);
     app.panel.caret_ctx = (!app.config.accounts.is_empty(), app.panel.account_error);
     apply_appearance(app);
     if app.panel.mode == crate::ui::panel::PanelMode::Hidden {
@@ -1598,14 +1787,14 @@ pub fn run() -> i32 {
         crate::platform::notify::ensure_aumid();
 
         let config = config::load();
-        // 配置的代理在首次请求前生效；地址无效仅记录，不阻断启动
+        // 配置的代理在首次请求前生效。地址无效仅记录，不阻断启动。
         if let Err(e) = crate::api::client::set_proxy(config.general.proxy.clone()) {
             crate::platform::log(&format!("[Quotify] 代理地址无效，保持直连: {e}"));
         }
         let app = Box::new(App::new(config));
         let mut app = app;
-        // 启动即套外观，未开面板前的首次右键菜单也带主题；此刻
-        // renderer 均未建立，无副作用。
+        // 启动即套外观，未开面板前的首次右键菜单也带主题。
+        // 此刻 renderer 均未建立，无副作用。
         apply_appearance(&mut app);
 
         let hinst = windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok();
@@ -1643,7 +1832,6 @@ pub fn run() -> i32 {
         app.hwnd = Some(hwnd);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, &mut *app as *mut App as isize);
 
-        // 两倍尺寸给 Shell 缩小显示；资源优先，手绘兜底
         let px = GetSystemMetrics(SM_CXSMICON).max(16) * 2;
         let initial = icon::resource_icon(px).or_else(|| icon::logo_icon(px));
         if initial.is_none() {
@@ -1652,7 +1840,7 @@ pub fn run() -> i32 {
         let initial = initial.unwrap_or_default();
         app.tray_icon = Some(initial);
         app.tray = Some(TrayIcon::new(hwnd, initial));
-        // 开机自启可能撞上任务栏未就绪，失败挂短程重试直至图标就位
+        // 开机自启可能撞上任务栏未就绪，失败挂短程重试直至图标就位。
         if !app.tray.as_ref().is_some_and(|t| t.registered) {
             app.tray_retries = 0;
             SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
@@ -1669,7 +1857,7 @@ pub fn run() -> i32 {
             p.refresh_now();
         }
 
-        // 诊断后门，仅 debug 生效：QUOTIFY_DIAG=adding 自动弹设置-添加账号页
+        // 诊断后门，仅 debug 生效：QUOTIFY_DIAG=adding 自动弹设置-添加账号页。
         #[cfg(debug_assertions)]
         if std::env::var("QUOTIFY_DIAG").as_deref() == Ok("adding") {
             let rect = tray_rect(&app).unwrap_or(RECT {
@@ -1678,13 +1866,18 @@ pub fn run() -> i32 {
                 right: 1340,
                 bottom: 920,
             });
-            {
-                app.open_panel(hwnd, rect);
+            // move 进 toggle_panel 须用重取引用，外层引用留给退出清理。
+            if let Some(app) = app_from(hwnd) {
+                app.toggle_panel(hwnd, rect);
+            }
+            if let Some(app) = app_from(hwnd) {
                 app.panel.view = crate::ui::panel::PanelView::AddForm;
                 app.panel.pending_platform = crate::api::Platform::Cn;
                 if let Some(p) = app.panel.hwnd {
-                    relayout_panel(&mut app, p);
-                    app.panel.focus_input(p, crate::ui::panel::InputField::Name);
+                    relayout_panel(app, p);
+                    if let Some(app) = app_from(hwnd) {
+                        app.panel.focus_input(p, crate::ui::panel::InputField::Name);
+                    }
                 }
             }
         }

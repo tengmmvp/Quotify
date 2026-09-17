@@ -66,7 +66,7 @@ impl Renderer {
         };
         y = self.section_label(target, section, pad, y, w, alpha, false);
         if on_add_form {
-            // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID
+            // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID。
             y = self.sub_label(target, s.account_platform, pad, y, cw, alpha);
             let plats: [(Hit, &str); 2] = [
                 (Hit::Platform(Platform::Cn), s.platform_cn),
@@ -83,7 +83,7 @@ impl Renderer {
                 alpha,
             );
             y = self.sub_label(target, s.account_type_label, pad, y, cw, alpha);
-            // 行集与 y 链跟随生效布局
+            // 行集与 y 链跟随生效布局。
             let team = panel.layout_team;
             let team_sel = panel.pending_team;
             let types: [(Hit, &str); 2] = [
@@ -99,7 +99,7 @@ impl Renderer {
                 cw,
                 alpha,
             );
-            // y 钉在 layout 常量：绘制、光标、高度公式三方同源
+            // y 钉在 layout 常量：绘制、光标、高度公式三方同源。
             let input = &panel.input;
             self.sub_label(target, s.account_name, pad, y, cw, alpha);
             let name_y = dy + layout::ADD_NAME_Y;
@@ -117,7 +117,7 @@ impl Renderer {
             y = name_y + layout::INPUT_H + layout::INPUT_GAP;
             self.sub_label(target, s.api_key_label, pad, y, cw, alpha);
             let key_y = dy + layout::ADD_KEY_Y;
-            // key 不整串落屏：聚焦显等宽圆点，未聚焦且足 12 位只露首尾各 4 位；框内眼睛可切明文
+            // key 不整串落屏：聚焦显等宽圆点，未聚焦且足 12 位只露首尾各 4 位，框内眼睛可切明文。
             let key_active = input.field == Some(InputField::Key);
             let key_disp = if panel.key_revealed {
                 input.key.clone()
@@ -195,14 +195,14 @@ impl Renderer {
             );
             return;
         }
-        // 当前活跃账号卡片（有则显示）；添加入口常驻，支持继续添加账号
+        // 当前活跃账号卡片（有则显示）；添加入口常驻，支持继续添加账号。
         if let Some(acc) = model.account {
             let platform = if acc.platform == Platform::Cn {
                 s.platform_cn
             } else {
                 s.platform_intl
             };
-            // 团队版在平台名牌并列标注——账号卡无编辑入口，保存后仍可辨识
+            // 团队版在平台名牌并列标注：账号卡无编辑入口，保存后仍可辨识。
             let platform_owned;
             let platform = if acc.team {
                 platform_owned = format!("{platform} | {}", s.team_badge);
@@ -210,7 +210,7 @@ impl Renderer {
             } else {
                 platform
             };
-            // 版本 / 等级来自用量数据，缺则不画徽标；全借用快照字段，重绘零分配
+            // 版本 / 等级来自用量数据，缺则不画徽标；全借用快照字段，重绘零分配。
             let (version, tier) = match model.snapshot {
                 Some(snap) => {
                     let tier = snap.tier_label();
@@ -235,7 +235,8 @@ impl Renderer {
                 alpha,
             );
             y += layout::ACCOUNT_CARD_H;
-            if matches!(model.error, Some(crate::api::FetchError::Auth)) {
+            // 谓词与 y 链同引 panel.account_error：高度与绘制的行集同源。
+            if panel.account_error {
                 self.text(
                     target,
                     s.key_invalid,
@@ -251,14 +252,14 @@ impl Renderer {
                 y += layout::AUTH_ERROR_H;
             }
         }
-        // 添加账号独占一行：占满内容区，视觉对称
+        // 添加账号独占一行：占满内容区，视觉对称。
         self.pill_button(
             target,
             Hit::AddAccount,
             pad,
             y + 2.0,
             cw,
-            layout::SAVE_BTN_H,
+            layout::ADD_BTN_H,
             s.add_account,
             alpha,
             false,
@@ -302,7 +303,7 @@ impl Renderer {
             alpha,
         );
         if panel.layout_customizing {
-            // y 钉在 layout::interval_input_y，与光标、高度公式同源
+            // y 钉在 layout::interval_input_y，与光标、高度公式同源。
             let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
             let input = &panel.input;
             self.input_field(
@@ -382,17 +383,17 @@ impl Renderer {
 
         // ── 高峰区间：工作日生效，自定义起止 ──
         self.section_label(target, s.peak_section, pad, y, w, alpha, true);
-        // y 钉在 layout::peak_input_y，与光标、高度公式同源
+        // y 钉在 layout::peak_input_y，与光标、高度公式同源。
         let pky = dy
             + layout::peak_input_y(
                 model.accounts_count > 0,
                 panel.account_error,
                 panel.layout_customizing,
             );
-        // 当前配置值作为弱色占位提示，输入即覆盖，无需删除
+        // 当前配置值作为弱色占位提示，输入即覆盖，无需删除。
         let start_buf = panel.input.peak_start.as_str();
         let end_buf = panel.input.peak_end.as_str();
-        // 非法状态（格式错误或两端相等）给红框，提示等待修正；空缓冲表示未编辑不判
+        // 非法状态（格式错误或两端相等）给红框，提示等待修正；空缓冲表示未编辑不判。
         let bad = |v: &str| !v.is_empty() && crate::ui::peak::parse_hhmm(v).is_none();
         let peak_bad = bad(start_buf)
             || bad(end_buf)
@@ -485,7 +486,7 @@ impl Renderer {
             (Hit::Language(LanguageChoice::Zh), "中文"),
             (Hit::Language(LanguageChoice::En), "English"),
         ];
-        // 配置字符串 → 选项枚举：未配置 / 未知值都归「跟随系统」
+        // 配置字符串 → 选项枚举：未配置 / 未知值都归「跟随系统」。
         let cur_lang = LanguageChoice::from_setting(model.language);
         y = self.segmented_raw(
             target,
@@ -529,7 +530,7 @@ impl Renderer {
         // ── 网络代理：地址留空直连，未配置时框内只显占位提示 ──
         y = self.section_label(target, s.network_section, pad, y, w, alpha, true);
         self.sub_label(target, s.proxy_label, pad, y, cw, alpha);
-        // y 钉在 layout::proxy_input_y，与光标、高度公式同源
+        // y 钉在 layout::proxy_input_y，与光标、高度公式同源。
         let py = dy
             + layout::proxy_input_y(
                 model.accounts_count > 0,
@@ -545,6 +546,16 @@ impl Renderer {
             &panel.input.proxy,
             s.proxy_hint,
             panel.input.field == Some(InputField::Proxy),
+            alpha,
+        );
+        self.outline_button(
+            target,
+            Hit::ApplyProxy,
+            w - pad - layout::APPLY_BTN_W,
+            py - 1.0,
+            layout::APPLY_BTN_W,
+            layout::BTN_H,
+            s.apply,
             alpha,
         );
         y = py + layout::INPUT_H + layout::PROXY_TAIL_GAP;
@@ -585,7 +596,7 @@ impl Renderer {
             None => s.check_update.into(),
         };
         y = self.section_label(target, "", pad, y, w, alpha, true);
-        // 版本行收尾：有新版时文字带「当前 → 最新」、按钮换「前往下载」
+        // 版本行收尾：有新版时文字带「当前 → 最新」、按钮换「前往下载」。
         let (btn_hit, btn_label) = if model.update_available {
             (Hit::OpenDownload, s.go_download)
         } else {
@@ -646,30 +657,35 @@ impl Renderer {
         }
         if !label.is_empty() {
             let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+            // 柱子与文字同框垂直居中
             target.FillRectangle(
                 &D2D_RECT_F {
                     left: x,
-                    top: ny + 1.0,
+                    top: ny + 2.0,
                     right: x + 3.0,
-                    bottom: ny + 14.0,
+                    bottom: ny + 15.0,
                 },
                 &bar,
             );
-            self.text(
+            self.text_aligned_vc(
                 target,
                 label,
-                x + 7.0,
-                ny,
-                _w - 7.0,
-                17.0,
+                &D2D_RECT_F {
+                    left: x + 7.0,
+                    top: ny,
+                    right: x + _w,
+                    bottom: ny + 17.0,
+                },
                 13.0,
                 600,
                 self.theme.text_tertiary,
                 alpha,
+                Align::Left,
+                false,
             );
             ny + layout::SECTION_LABEL_H
         } else {
-            // 纯分隔无标题，只留少量空隙给紧随内容
+            // 纯分隔无标题，只留少量空隙给紧随内容。
             ny + 6.0
         }
     }
@@ -832,7 +848,7 @@ impl Renderer {
             self.draw_caret(target, panel, x, cl.cx, y, alpha);
         } else {
             // 失焦态：尾部可视切片取最长可放入后缀；前缀宽表一次成型，
-            // 后缀宽 = 全宽 - 前缀宽，零逐候选测量
+            // 后缀宽 = 全宽 - 前缀宽，零逐候选测量。
             let avail = (w - 6.0 - tail).max(1.0);
             let chars: Vec<char> = content.chars().collect();
             let mut vis = String::new();
@@ -843,7 +859,7 @@ impl Renderer {
                     vis = content.to_string();
                 } else {
                     // 至少保尾 1 字符；找最小起点使后缀入宽[后缀宽随
-                    // 起点减小单调增，首个溢出前一位即最长可放入后缀]
+                    // 起点减小单调增，首个溢出前一位即最长可放入后缀]。
                     let mut k = 0usize;
                     while k + 1 < n && widths[n] - widths[k] > avail {
                         k += 1;
@@ -874,7 +890,7 @@ impl Renderer {
                 self.theme.text_secondary,
                 alpha,
             );
-            // 眼睛命中区先于整框登记：hit_at 取首个命中，后登记会被整框吞掉
+            // 眼睛命中区先于整框登记：hit_at 取首个命中，后登记会被整框吞掉。
             self.hits.push((
                 eye_hit,
                 D2D_RECT_F {
@@ -965,7 +981,7 @@ impl Renderer {
             radiusY: knob / 2.0,
         };
         target.FillEllipse(&ellipse, &kb);
-        // 命中区只覆盖开关本体并含 8px 容差——点击行文字/空白不翻转
+        // 命中区只覆盖开关本体并含 8px 容差，点击行文字/空白不翻转。
         self.hits.push((
             hit,
             D2D_RECT_F {
@@ -1086,7 +1102,7 @@ impl Renderer {
         target.FillRoundedRectangle(&card, &fill);
         let edge = self.brush(target, self.theme.card_border, alpha);
         target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-        // 徽标与关闭钮居右对齐，名称吃左侧剩余空间；从右界向左依次排 tier/version/platform
+        // 徽标与关闭钮居右对齐，名称吃左侧剩余空间；从右界向左依次排 tier/version/platform。
         let by = y + (h - BADGE_H) / 2.0;
         let mut bx = x + w - 56.0; // 徽标区右界，给右侧 × 留位
         if let Some(tier) = tier {
@@ -1204,11 +1220,11 @@ impl Renderer {
         target.FillRoundedRectangle(&r, &b);
         let rect = D2D_RECT_F {
             left: x,
-            top: y + 5.0,
+            top: y + 2.0,
             right: x + w,
-            bottom: y + h - 4.0,
+            bottom: y + h - 2.0,
         };
-        self.text_aligned(
+        self.text_aligned_vc(
             target,
             label,
             &rect,
@@ -1254,7 +1270,7 @@ mod tests {
 
     #[test]
     fn interval_presets_pinned() {
-        // 只锁档位值；与四个标签的配对靠渲染侧按下标顺序维护，无防护
+        // 只锁档位值；与四个标签的配对靠渲染侧按下标顺序维护，无防护。
         assert_eq!(INTERVAL_PRESETS, [60, 300, 900, 1800]);
     }
 
@@ -1270,14 +1286,14 @@ mod tests {
 
     #[test]
     fn mask_key_active_full_dots() {
-        // 聚焦强制逐字符圆点，位数与原串一致，光标步宽可对
+        // 聚焦强制逐字符圆点，位数与原串一致。
         assert_eq!(mask_key("abcd1234wxyz9999", true), "•".repeat(16));
         assert_eq!(mask_key("abc", true), "•••");
     }
 
     #[test]
     fn mask_key_no_middle_plaintext() {
-        // 12 位以上中段不落屏
+        // 12 位以上中段不落屏。
         let m = mask_key("abcdefghijkl", false);
         assert_eq!(m, "abcd…ijkl");
         assert!(!m.contains('e') && !m.contains('h'));

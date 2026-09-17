@@ -497,7 +497,7 @@ impl Renderer {
         let mid = y + 9.0;
         let unread = model.last_news_read.is_none_or(|r| item.date.as_str() > r);
 
-        // 节点：未读实心强调色、已读空心三级色；右延短横线接日期列
+        // 节点：未读实心强调色、已读空心三级色，右延短横线接日期列。
         let node = D2D1_ELLIPSE {
             point: Vector2 {
                 X: NEWS_AXIS_X,
@@ -516,7 +516,7 @@ impl Renderer {
             target.DrawEllipse(&node, &b, 1.0, None);
         }
 
-        // 日期取 MM-DD；异常长度（非 YYYY-MM-DD）宽松回退整串，不 panic
+        // 日期取 MM-DD；异常长度（非 YYYY-MM-DD）宽松回退整串，不 panic。
         let date_disp = item
             .date
             .get(5..)
@@ -535,7 +535,7 @@ impl Renderer {
             alpha,
         );
 
-        // 右端展开/收起箭头，NEW 徽标在其左
+        // 右端展开/收起箭头，NEW 徽标在其左。
         let arrow_x = right - 4.0;
         let stroke = self.brush(target, self.theme.text_tertiary, alpha);
         let (ay, by) = if expanded {
@@ -547,7 +547,7 @@ impl Renderer {
         self.line(target, arrow_x, by, arrow_x + 3.0, ay, &stroke, 1.2);
 
         // 标题；右端为箭头与 NEW 留位，截断宽随 NEW 有无伸缩。
-        // 宽度直接取 ellipsize 返回值，NEW 徽标跟随不复测
+        // 宽度直接取 ellipsize 返回值，NEW 徽标跟随不复测。
         let new_w = if unread { 36.0 } else { 0.0 }; // NEW 徽标 30 + 左隙 6
         let title_w = (right - 14.0 - new_w - NEWS_BODY_X).max(40.0);
         let (title, tw) = self.ellipsize(&item.title, 13.0, title_w, 600, false);
@@ -564,7 +564,7 @@ impl Renderer {
             alpha,
         );
 
-        // NEW 徽标紧跟标题尾部；上限防越入右端箭头区
+        // NEW 徽标紧跟标题尾部，上限防越入右端箭头区。
         if unread {
             let left = (NEWS_BODY_X + tw + 6.0).min(right - 44.0);
             let badge_rect = D2D_RECT_F {
@@ -592,7 +592,7 @@ impl Renderer {
                 false,
             );
         }
-        // 正文：折叠显首行截断，展开显全部行
+        // 正文：折叠显首行截断，展开显全部行。
         if expanded {
             let mut ly = y + 18.0;
             for line in &item.lines {

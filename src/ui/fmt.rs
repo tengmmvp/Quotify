@@ -37,7 +37,7 @@ pub fn compact_number_split(v: f64) -> (String, &'static str) {
         (1e3, "k")
     };
     let mut s = format!("{:.1}", v / div);
-    // 进位跨档：按绝对值判定，负值同升档，不出 "1000k"/"1000M"
+    // 进位跨档：按绝对值判定，负值同升档，不出 "1000k"/"1000M"。
     if suffix != "B" && s.parse::<f64>().is_ok_and(|n| n.abs() >= 1000.0) {
         div *= 1000.0;
         suffix = if suffix == "k" { "M" } else { "B" };
@@ -87,11 +87,6 @@ fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> Strin
     } else {
         format!("{sec}{}", u(s.second))
     }
-}
-
-/// 「数据截至」时间戳
-pub fn as_of_time(at: DateTime<Local>) -> String {
-    at.format("%H:%M").to_string()
 }
 
 /// 页脚「数据更新」文案

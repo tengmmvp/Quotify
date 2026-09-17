@@ -19,7 +19,7 @@ pub fn fetch_latest() -> Result<Vec<NewsItem>, String> {
     let url = format!("https://raw.githubusercontent.com/{REPO}/main/docs/WHAT_IS_NEW.md");
     let resp = agent_long()
         .get(&url)
-        // GitHub 拒绝无 User-Agent 的请求，同 update.rs
+        // GitHub 拒绝无 User-Agent 的请求，同 update.rs。
         .header(
             "User-Agent",
             format!("quotify/{}", env!("CARGO_PKG_VERSION")),
@@ -45,7 +45,7 @@ pub fn parse_news(text: &str) -> Vec<NewsItem> {
     let mut out: Vec<NewsItem> = Vec::new();
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("## ") else {
-            // 非节头行归入当前节正文；空行与 Markdown 分隔线丢弃
+            // 非节头行归入当前节正文，空行与 Markdown 分隔线丢弃。
             if let Some(cur) = out.last_mut() {
                 let t = line.trim();
                 if !t.is_empty() && t != "---" {
@@ -54,7 +54,7 @@ pub fn parse_news(text: &str) -> Vec<NewsItem> {
             }
             continue;
         };
-        // 节头形如 `2026-08-27 · 标题`；日期不合法的节整节丢弃
+        // 节头形如 `2026-08-27 · 标题`，日期不合法的节整节丢弃。
         let Some((date, title)) = rest.split_once(" · ") else {
             continue;
         };
@@ -68,7 +68,7 @@ pub fn parse_news(text: &str) -> Vec<NewsItem> {
             lines: Vec::new(),
         });
     }
-    // 解析吃全量，常驻只留最新 NEWS_MAX 条
+    // 解析吃全量，常驻只留最新 NEWS_MAX 条。
     out.truncate(NEWS_MAX);
     out
 }

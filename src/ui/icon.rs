@@ -75,7 +75,7 @@ pub fn q_outline() -> [Vec<(f32, f32)>; 3] {
     [
         ring(9.2),
         ring(4.2),
-        // 尾部斜矩形：起点埋进环带避免交界露缝
+        // 尾部斜矩形：起点埋进环带避免交界露缝。
         vec![
             (17.62, 19.84),
             (21.69, 23.91),
@@ -105,7 +105,7 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
 
     for y in 0..px {
         for x in 0..px {
-            // 4× 子采样取覆盖率做边缘抗锯齿，16 = 4×4 采样数
+            // 4× 子采样取覆盖率做边缘抗锯齿，16 = 4×4 采样数。
             let mut hit = 0u32;
             for sy in 0..4u32 {
                 for sx in 0..4u32 {
@@ -121,7 +121,7 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
             let a = (hit * 255 / 16) as u8;
             if a > 0 {
                 // 颜色按像素中心单判，半透明边缘不混色；
-                // RGB 按覆盖率预乘——HICON 合成按预乘约定
+                // RGB 按覆盖率预乘，HICON 合成按预乘约定。
                 let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
                 let in_q = (in_polygon(cx, cy, &outer) && !in_polygon(cx, cy, &inner))
                     || in_polygon(cx, cy, &tail);
@@ -158,22 +158,22 @@ pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
                 continue;
             }
             let cov = (0.5 - edge).clamp(0.0, 1.0);
-            // 屏幕角度：12 点方向为 -90°，顺时针增加
+            // 屏幕角度：12 点方向为 -90°，顺时针增加。
             let mut a = fy.atan2(fx).to_degrees();
             if a < -90.0 {
                 a += 360.0;
             }
             let i = ((y * px + x) * 4) as usize;
-            // 余量不足 0.4% 视为耗尽，画灰轨道
+            // 余量不足 0.4% 视为耗尽，画灰轨道。
             let on_arc = !failed && remain > 0.004 && a <= remain * 360.0;
             if on_arc {
-                // 档位色（BGRA），RGB 按覆盖率预乘——HICON 合成按预乘约定
+                // 档位色（BGRA），RGB 按覆盖率预乘，HICON 合成按预乘约定。
                 buf[i] = (tb as f32 * cov) as u8;
                 buf[i + 1] = (tg as f32 * cov) as u8;
                 buf[i + 2] = (tr as f32 * cov) as u8;
                 buf[i + 3] = (0xFF as f32 * cov) as u8;
             } else {
-                // 半透明深灰轨道，深浅任务栏下均可见
+                // 半透明深灰轨道，深浅任务栏下均可见。
                 buf[i] = (0x66 as f32 * cov) as u8;
                 buf[i + 1] = (0x66 as f32 * cov) as u8;
                 buf[i + 2] = (0x66 as f32 * cov) as u8;
@@ -266,7 +266,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         ) {
             Ok(m) => m,
             Err(_) => {
-                // 掩码创建失败：回收已建的颜色位图再放弃
+                // 掩码创建失败：回收已建的颜色位图再放弃。
                 let _ = DeleteObject(color.into());
                 return None;
             }
@@ -289,7 +289,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         let hicon = match CreateIconIndirect(&info) {
             Ok(h) => h,
             Err(_) => {
-                // 图标合成失败：两张位图所有权仍在自己手里，一并回收
+                // 图标合成失败：两张位图所有权仍在自己手里，一并回收。
                 let _ = DeleteObject(color.into());
                 let _ = DeleteObject(mask.into());
                 return None;

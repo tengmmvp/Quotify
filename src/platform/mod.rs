@@ -21,6 +21,19 @@ pub fn log(msg: &str) {
     unsafe { OutputDebugStringW(PCWSTR(w.as_ptr())) };
 }
 
+/// 前台是否属于本程序的窗口：跑马灯在场判定与浮窗保活巡检共用。
+/// 进程窗口全在 UI 线程，按线程等值判定。
+pub fn foreground_is_self() -> bool {
+    unsafe {
+        let fg = windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow();
+        if fg.is_invalid() {
+            return false;
+        }
+        windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None)
+            == windows::Win32::System::Threading::GetCurrentThreadId()
+    }
+}
+
 /// WM_APP 系自定义消息统一分配
 pub mod msg {
     use super::WM_APP;
@@ -34,6 +47,10 @@ pub mod msg {
     pub const WM_APP_UPDATE_RESULT: u32 = WM_APP + 4;
     /// 仓库动态拉取结果回传
     pub const WM_APP_NEWS_RESULT: u32 = WM_APP + 5;
+    /// 面板几何变化后的弹窗重对位：异步派发，泵纪律下不重入取引用。
+    pub const WM_APP_REPOSITION_POPUP: u32 = WM_APP + 6;
+    /// 托盘内容刷新：异步派发，泵点收进 wndproc 臂，调用方引用不跨泵。
+    pub const WM_APP_TRAY_REFRESH: u32 = WM_APP + 7;
 }
 
 /// 用默认浏览器打开链接
@@ -56,13 +73,13 @@ pub fn open_url(url: &str) {
             SW_SHOW,
         )
     };
-    // 返回值 <= 32 表示失败
+    // 返回值 <= 32 表示失败。
     if r.0 as isize <= 32 {
         log(&format!("[Quotify] 打开链接失败: {url}"));
     }
 }
 
-/// 归还工作集，静止时保持低内存；换出页面按需换回
+/// 归还工作集，静止时保持低内存，换出页面按需换回。
 pub fn trim_working_set() {
     unsafe {
         use windows::Win32::System::ProcessStatus::EmptyWorkingSet;
@@ -71,12 +88,12 @@ pub fn trim_working_set() {
     }
 }
 
-/// 模态保存文件对话框；取消返回 None
+/// 模态保存文件对话框，取消返回 None
 pub fn save_dialog(default_name: &str) -> Option<std::path::PathBuf> {
     file_dialog(default_name, true)
 }
 
-/// 模态打开文件对话框；取消返回 None
+/// 模态打开文件对话框，取消返回 None
 pub fn open_dialog() -> Option<std::path::PathBuf> {
     file_dialog("", false)
 }
@@ -88,7 +105,7 @@ fn file_dialog(default_name: &str, save: bool) -> Option<std::path::PathBuf> {
         OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST, OPENFILENAMEW,
     };
     use windows::core::PWSTR;
-    // 过滤串以双 nul 收尾
+    // 过滤串以双 nul 收尾。
     let filter: Vec<u16> = "JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0"
         .encode_utf16()
         .collect();
@@ -156,15 +173,15 @@ fn set_restrictive_dacl(path: &std::path::Path) -> windows::core::Result<()> {
     let mut token = HANDLE::default();
     unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)? };
 
-    // 分配的 SYSTEM SID、ACL 与令牌句柄要覆盖所有失败路径，统一在尾部清理
+    // 分配的 SYSTEM SID、ACL 与令牌句柄要覆盖所有失败路径，统一在尾部清理。
     let mut system_sid = PSID(std::ptr::null_mut());
     let mut new_acl: *mut ACL = std::ptr::null_mut();
     let result = (|| -> windows::core::Result<()> {
-        // 当前用户 SID 直接取自进程令牌，免去用户名到 SID 的二次解析
+        // 当前用户 SID 直接取自进程令牌，免去用户名到 SID 的二次解析。
         let mut len = 0u32;
-        // 首查只为取缓冲长度，返回 ERROR_INSUFFICIENT_BUFFER 属预期
+        // 首查只为取缓冲长度，返回 ERROR_INSUFFICIENT_BUFFER 属预期。
         let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut len) };
-        // u64 缓冲保证 TOKEN_USER 指针字段的对齐
+        // u64 缓冲保证 TOKEN_USER 指针字段的对齐。
         let mut buf = vec![0u64; len.div_ceil(8) as usize];
         let user_sid = unsafe {
             GetTokenInformation(
@@ -199,7 +216,7 @@ fn set_restrictive_dacl(path: &std::path::Path) -> windows::core::Result<()> {
             ..Default::default()
         };
         // SET_ACCESS 整体替换：新 DACL 只含这两条 ACE，配合 PROTECTED
-        // 切断父目录继承，Authenticated Users 等宽松 ACE 一并丢弃
+        // 切断父目录继承，Authenticated Users 等宽松 ACE 一并丢弃。
         let entries = [
             EXPLICIT_ACCESS_W {
                 grfAccessPermissions: GENERIC_ALL.0,
@@ -243,7 +260,7 @@ fn set_restrictive_dacl(path: &std::path::Path) -> windows::core::Result<()> {
             FreeSid(system_sid);
         }
         if !new_acl.is_null() {
-            // SetEntriesInAclW 分配的 ACL 由 LocalFree 释放
+            // SetEntriesInAclW 分配的 ACL 由 LocalFree 释放。
             let _ = LocalFree(Some(HLOCAL(new_acl.cast())));
         }
         let _ = CloseHandle(token);

@@ -197,11 +197,11 @@ fn backup_broken(path: &Path) {
 /// 只回退默认不动磁盘。
 pub fn load() -> Config {
     let path = config_path();
-    // 清理上次进程在 write→rename 之间被杀时遗留的临时文件
+    // 清理上次进程在 write→rename 之间被杀时遗留的临时文件。
     let _ = std::fs::remove_file(path.with_extension("toml.tmp"));
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            // 旧版本写下的文件没有收紧过 ACL，启动时统一补一次[幂等]
+            // 旧版本写下的文件没有收紧过 ACL，启动时统一补一次[幂等]。
             crate::platform::secure_file_acl(&path);
             let (cfg, broken) = parse_or_default(&text, &path);
             if broken {
@@ -212,7 +212,7 @@ pub fn load() -> Config {
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             // 模板本身不含 key，但用户可能直接手填，落盘即统一收紧；
-            // 写失败时无文件可加固，只记日志
+            // 写失败时无文件可加固，只记日志。
             match std::fs::write(&path, TEMPLATE) {
                 Ok(()) => crate::platform::secure_file_acl(&path),
                 Err(e) => {

@@ -16,15 +16,16 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D_RECT_F, D2D_SIZE_U, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget,
-    ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP, D2D1_DRAW_TEXT_OPTIONS_NONE,
+    D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_HWND_RENDER_TARGET_PROPERTIES,
+    D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
     DWRITE_TEXT_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_LEADING, DWRITE_TEXT_ALIGNMENT_TRAILING,
-    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat,
+    DWriteCreateFactory, IDWriteFactory, IDWriteTextFormat, IDWriteTextLayout,
 };
 use windows::core::PCWSTR;
 use windows_numerics::Vector2;
@@ -107,7 +108,6 @@ pub enum Hit {
     Refresh,
     Settings,
     AccountSwitch,
-    Retry,
     UsageInfo,
 
     // ── 导航 ──
@@ -127,6 +127,7 @@ pub enum Hit {
 
     // ── 设置 · 网络代理 ──
     InputProxy,
+    ApplyProxy,
 
     // ── 设置 · 用量通知 ──
     ToggleThreshold,
@@ -170,12 +171,13 @@ impl Hit {
     /// 点击后会进入/保持输入态或 key 明文查看态的命中；
     /// WM_LBUTTONUP 据此决定点击后是否结束输入态。
     /// 输入框槽位经 input_field_of_hit 穷尽判定，
-    /// 此处只补三个非槽位但保持输入态的命中
+    /// 此处只补四个非槽位但保持输入态的命中（应用按钮校验失败
+    /// 保留字段供修改）
     pub(crate) fn is_input_hit(&self) -> bool {
         crate::ui::panel::input_field_of_hit(*self).is_some()
             || matches!(
                 self,
-                Self::CustomizeInterval | Self::AddAccount | Self::RevealKey
+                Self::CustomizeInterval | Self::AddAccount | Self::RevealKey | Self::ApplyProxy
             )
     }
 
@@ -194,11 +196,12 @@ enum Align {
     Right,
 }
 
-/// 淡入与刷新旋转两类动画的插值状态
+/// 面板各动画的插值状态：淡入、刷新旋转、页脚换装、错误跑马灯
 pub struct AnimState {
     pub appear: Option<Tween>,
     pub spin: f32,
     pub footer: Option<FooterAnim>,
+    pub error_scroll: Option<ErrorScroll>,
 }
 
 /// 页脚换装动画的单次状态
@@ -210,12 +213,92 @@ pub struct FooterAnim {
     pub new_w: f32,
 }
 
+/// 页脚错误摘要的滚动状态：摘要超面板宽时传送带循环，开头与每轮
+/// 回到起点后暂停数秒。布局与宽度在创建时算好，滚动帧零测量零分配
+/// 零 COM 对象重建
+pub struct ErrorScroll {
+    /// 内容指纹：错误负载、快照时间、可视宽、语言与动效开关的哈希，
+    /// 任一变化即重建
+    key: u64,
+    /// 三块内容（前缀/大类/尾段）：布局与宽成对持有，消费端不重排；
+    /// 减动效超宽时存截断串的布局
+    blocks: [ScrollBlock; 3],
+    /// 块界左右括号：加粗字重，三块共享
+    bracket: ScrollBlock,
+    bracket_end: ScrollBlock,
+    /// 摘要是否超宽滚动：非滚动态只作缓存，tick 不保活
+    scrolling: bool,
+    /// 失焦冻结中：时钟已撤，激活消息唤醒；重挂判定与推进都绕开
+    frozen: bool,
+    /// 当前偏移，0..total_w
+    offset: f32,
+    /// 暂停截止时刻；滚动中为过去时刻
+    resume_at: std::time::Instant,
+    /// 上帧时刻，帧率随动画优先级变化，按实距推进
+    last: std::time::Instant,
+}
+
+/// 跑马灯的单个内容块：布局与宽成对，推进与绘制同引一份
+struct ScrollBlock {
+    layout: Option<IDWriteTextLayout>,
+    w: f32,
+}
+
+impl ScrollBlock {
+    /// 建块并从布局读宽；布局建不出即空块
+    unsafe fn new(layout: Option<IDWriteTextLayout>) -> Self {
+        let w = layout.as_ref().map_or(0.0, |l| Renderer::layout_width(l));
+        Self { layout, w }
+    }
+}
+
+impl ErrorScroll {
+    /// 滚动周期：在场块总宽加循环段间空隙
+    pub(crate) fn total_w(&self) -> f32 {
+        belt_width(
+            &self.blocks.each_ref().map(|b| b.w),
+            self.bracket.w + self.bracket_end.w,
+        ) + ERROR_SCROLL_GAP
+    }
+}
+
+/// 在场块（内容宽 + 括号对）的总宽：空块零贡献，周期不带尾随空白。
+/// 溢出判定与滚动周期同引，块结构改动只改此处
+pub(crate) fn belt_width(blocks: &[f32], pair: f32) -> f32 {
+    blocks.iter().filter(|w| **w > 0.0).map(|w| *w + pair).sum()
+}
+
+/// 跑马灯帧间隔
+/// 30px/s 下 33ms 每帧推进约 1px，与页脚换装同档减半整窗重绘开销。
+pub(crate) const ERROR_SCROLL_FRAME_MS: u32 = 33;
+/// 跑马灯滚动速度（逻辑 px/秒）
+pub(crate) const ERROR_SCROLL_SPEED: f32 = 30.0;
+/// 轮回到位后的暂停时长
+pub(crate) const ERROR_SCROLL_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
+/// 循环平铺的段间空隙（逻辑 px）
+pub(crate) const ERROR_SCROLL_GAP: f32 = 48.0;
+/// 跑马灯文案字号：三块内容与括号同号
+pub(crate) const ERROR_SCROLL_SIZE: f32 = 12.0;
+/// 块界括号字重（加粗）：内容常规字重 400
+pub(crate) const ERROR_SCROLL_BRACKET_WEIGHT: u16 = 700;
+
+/// 跑马灯的单拍结果
+pub(crate) enum ScrollTick {
+    /// 滚动帧，帧间隔 ERROR_SCROLL_FRAME_MS
+    Frame,
+    /// 暂停中，距恢复毫秒数
+    Pause(u32),
+    /// 前台门控冻结中，不推进不重绘；不保活，回焦由激活消息重启时钟
+    Idle,
+}
+
 impl AnimState {
     pub fn new() -> Self {
         Self {
             appear: None,
             spin: 0.0,
             footer: None,
+            error_scroll: None,
         }
     }
 }
@@ -238,6 +321,81 @@ impl Renderer {
     /// 触发一次刷新按钮旋转
     pub fn start_spin(&mut self) {
         self.anim.spin = std::f32::consts::TAU;
+    }
+
+    /// 挂起页脚换装动画：新旧串与测宽由调用方备好；随错误退场的
+    /// 拆除由绘制入口按数据统一处理
+    pub fn start_footer_anim(
+        &mut self,
+        old_text: String,
+        old_w: f32,
+        new_text: String,
+        new_w: f32,
+    ) {
+        self.anim.footer = Some(FooterAnim {
+            tween: crate::ui::panel::anim::Tween::now(3600),
+            old_text,
+            new_text,
+            old_w,
+            new_w,
+        });
+    }
+
+    /// 跑马灯推进一帧
+    /// 失焦先于暂停判定：冻结即刻生效，不为等恢复点多保活一拍；
+    /// 暂停期一次定到恢复点零空转；非滚动态与减少动效时不保活；
+    /// 回焦由激活消息重启时钟，续滚不跳变。
+    pub fn error_scroll_tick(&mut self, active: bool) -> Option<ScrollTick> {
+        let sc = self.anim.error_scroll.as_mut()?;
+        if !sc.scrolling || !self.anim_allowed {
+            return None;
+        }
+        let now = std::time::Instant::now();
+        if !active {
+            sc.frozen = true;
+            sc.last = now;
+            return Some(ScrollTick::Idle);
+        }
+        // 暂停期不推进 last：轮回到位时 last 已对齐恢复点，恢复首帧
+        // 位移只计一帧间隔。
+        if now < sc.resume_at {
+            return Some(ScrollTick::Pause((sc.resume_at - now).as_millis() as u32));
+        }
+        sc.frozen = false;
+        let dt = now.saturating_duration_since(sc.last).as_secs_f32();
+        sc.last = now;
+        sc.offset += ERROR_SCROLL_SPEED * dt;
+        if sc.offset >= sc.total_w() {
+            // 一轮滚完，文本开头回到左侧，暂停后再滚；last 同步到恢复点，
+            // 暂停时长不计入首帧位移。
+            sc.offset = 0.0;
+            sc.resume_at = now + ERROR_SCROLL_PAUSE;
+            sc.last = sc.resume_at;
+        }
+        Some(ScrollTick::Frame)
+    }
+
+    /// 跑马灯处于滚动且未冻结：时钟该在场的判定，重挂点同引。
+    /// 冻结态不重挂——挂上也是一拍空转即撤。
+    pub fn error_scrolling(&self) -> bool {
+        self.anim
+            .error_scroll
+            .as_ref()
+            .is_some_and(|sc| sc.scrolling && !sc.frozen)
+    }
+
+    /// 冻结的跑马灯回焦复活：last 重压到当前，防首帧把停摆时长一次
+    /// 推进跳变；返回是否需要重新挂钟。
+    pub fn resume_error_scroll(&mut self) -> bool {
+        if let Some(sc) = self.anim.error_scroll.as_mut()
+            && sc.scrolling
+            && sc.frozen
+        {
+            sc.frozen = false;
+            sc.last = std::time::Instant::now();
+            return true;
+        }
+        false
     }
 
     /// 鼠标位置（逻辑像素）命中的可点击元素；未命中返回 None
@@ -281,6 +439,10 @@ pub struct Renderer {
     dash_style: Option<ID2D1StrokeStyle>,
     mcp_cache: Option<main::McpCompCache>,
     token_cells: Option<main::TokenCells>,
+    main_texts: Option<main::MainTexts>,
+    /// 顶栏标题截断缓存：键 (源串, 可用宽) → (截断串, 实宽)。只随
+    /// 账号名与宽度变化，与快照无关，跨快照存活
+    title_cache: Option<((String, f32), (String, f32))>,
 }
 
 impl Renderer {
@@ -319,6 +481,8 @@ impl Renderer {
                 dash_style: None,
                 mcp_cache: None,
                 token_cells: None,
+                main_texts: None,
+                title_cache: None,
             })
         }
     }
@@ -425,7 +589,7 @@ impl Renderer {
                 return table;
             };
             // encode_utf16 的 &mut [u16] 参数按切片长度校验容量，裸 Vec
-            // 长度恒 0 必 panic；栈上双字缓冲接住单字符再入列
+            // 长度恒 0 必 panic。栈上双字缓冲接住单字符再入列。
             let mut w16: Vec<u16> = Vec::with_capacity(n);
             for c in chars {
                 let mut buf = [0u16; 2];
@@ -445,7 +609,7 @@ impl Renderer {
             {
                 return table;
             }
-            // 每字符的 UTF-16 起始单位位次；簇宽记到簇末所在字符边界上
+            // 每字符的 UTF-16 起始单位位次；簇宽记到簇末所在字符边界上。
             let mut starts: Vec<usize> = Vec::with_capacity(n + 1);
             let mut off = 0usize;
             for c in chars {
@@ -464,7 +628,7 @@ impl Renderer {
                     ci += 1;
                 }
             }
-            // 度量覆不满串（异常短缺）时补平尾，保住单调不减
+            // 度量覆不满串（异常短缺）时补平尾，保住单调不减。
             for t in table.iter_mut().skip(ci + 1) {
                 *t = w;
             }
@@ -509,12 +673,7 @@ impl Renderer {
             let Ok(layout) = self.dwrite.CreateTextLayout(&w16, fmt, 1.0e6, 1.0e6) else {
                 return 0.0;
             };
-            let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
-            if layout.GetMetrics(&mut m).is_ok() {
-                m.widthIncludingTrailingWhitespace
-            } else {
-                0.0
-            }
+            Self::layout_width(&layout)
         }
     }
 
@@ -532,7 +691,7 @@ impl Renderer {
         if s.is_empty() {
             return (String::new(), 0.0);
         }
-        // 省略号宽走帧内去重：同帧多次 ellipsize 同参时只建一次 layout
+        // 省略号宽走帧内去重：同帧多次 ellipsize 同参时只建一次 layout。
         let ell_w = self.measure_static("…", size, weight, mono);
         let budget = (max_w - ell_w).max(0.0);
         let Some(fmt) = self.format(size, weight, mono) else {
@@ -544,7 +703,7 @@ impl Renderer {
             (self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6), len)
         };
         let Ok(layout) = layout else {
-            // 退化路径按整串测量兜底，宽 0 会让跟随元素叠上文本头
+            // 退化路径按整串测量兜底，宽 0 会让跟随元素叠上文本头。
             let w = self.measure_with(&fmt, s);
             return (s.to_string(), w);
         };
@@ -552,7 +711,7 @@ impl Renderer {
             vec![windows::Win32::Graphics::DirectWrite::DWRITE_CLUSTER_METRICS::default(); w16_len];
         let mut n = 0u32;
         if layout.GetClusterMetrics(Some(&mut cms), &mut n).is_err() {
-            // 簇度量缺席时截断无从谈起，宽退回整串测量
+            // 簇度量缺席时截断无从谈起，宽退回整串测量。
             let w = self.measure(s, size, weight, mono);
             return (s.to_string(), w);
         }
@@ -577,6 +736,52 @@ impl Renderer {
         (disp, w + ell_w)
     }
 
+    /// 按字号字重建文本布局：只读上下文取 format，供缓存的直绘文本
+    /// 预建布局共用
+    unsafe fn make_layout(
+        &self,
+        s: &str,
+        size: f32,
+        weight: u16,
+        mono: bool,
+    ) -> Option<IDWriteTextLayout> {
+        if s.is_empty() {
+            return None;
+        }
+        let fmt = self.ro_format(size, weight, mono)?;
+        let w16 = self.encode_u16(s);
+        self.dwrite.CreateTextLayout(&w16, &fmt, 1.0e6, 1.0e6).ok()
+    }
+
+    /// 预建布局直绘：复用缓存布局，绕开 DrawText 每次内部重建 COM 对象；
+    /// 裁剪由调用点外层统一
+    unsafe fn draw_layout(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        layout: &IDWriteTextLayout,
+        x: f32,
+        y: f32,
+        brush: &ID2D1SolidColorBrush,
+    ) {
+        target.DrawTextLayout(
+            Vector2 { X: x, Y: y },
+            layout,
+            brush,
+            D2D1_DRAW_TEXT_OPTIONS_NONE,
+        );
+    }
+
+    /// 建成布局的文本宽：先建布局再取宽的路径共用，
+    /// 宽度与直绘同一来源，字号字重只写一处
+    unsafe fn layout_width(layout: &IDWriteTextLayout) -> f32 {
+        let mut m = windows::Win32::Graphics::DirectWrite::DWRITE_TEXT_METRICS::default();
+        if layout.GetMetrics(&mut m).is_ok() {
+            m.widthIncludingTrailingWhitespace
+        } else {
+            0.0
+        }
+    }
+
     /// 绘制一帧；`rect_phys` 为物理像素，绘制全程用逻辑像素 DIP。
     /// 返回 false 表示设备已丢失，调用方须丢弃整个 Renderer，下帧全量重建
     pub fn paint(
@@ -589,7 +794,7 @@ impl Renderer {
         dpi: f32,
     ) -> bool {
         unsafe {
-            // 整建失败只跳过本帧：Renderer 本体仍健康，保留待下次绘制消息重试
+            // 整建失败只跳过本帧：Renderer 本体仍健康，保留待下次绘制消息重试。
             let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
                 return true;
             };
@@ -607,7 +812,7 @@ impl Renderer {
                 Ok(()) => true,
                 Err(e) => {
                     // 设备丢失：target 与全部设备绑定刷子一并失效，残留只会让
-                    // 面板永久空白——整个 Renderer 丢弃，下帧重建并重新对齐主题
+                    // 面板永久空白——整个 Renderer 丢弃，下帧重建并重新对齐主题。
                     crate::platform::log(&format!("[Quotify] EndDraw 失败: {e}"));
                     false
                 }
@@ -627,7 +832,7 @@ impl Renderer {
         let w = (rect.right - rect.left) as f32;
         let h = (rect.bottom - rect.top) as f32;
 
-        // 弹出动画：内容上浮渐入；背景必须不透明全幅绘制，否则首帧露交换链、错位抖动
+        // 弹出动画：内容上浮渐入；背景必须不透明全幅绘制，否则首帧露交换链、错位抖动。
         let (dy, alpha) = match &self.anim.appear {
             Some(t) if self.anim_allowed => {
                 let p = ease_out_cubic(t.progress());
@@ -636,6 +841,17 @@ impl Renderer {
             _ => (0.0, 1.0),
         };
         let dy = dy - panel.scroll_dy;
+
+        // 页脚动画存续单点：换装动画随错误退场（不清会藏在摘要背后
+        // 空跑，错误恢复后从中途续播陈旧文案）；跑马灯只在主视图且
+        // 错误与快照双在场时存续——拆掉跟随数据与视图，数据侧与各
+        // 视图不再自觉维护。
+        if model.error.is_some() {
+            self.anim.footer = None;
+        }
+        if view != PanelView::Main || model.error.is_none() || model.snapshot.is_none() {
+            self.anim.error_scroll = None;
+        }
 
         let bg = self.theme.bg;
         let bg_brush = self.brush(target, bg, 1.0);
@@ -652,13 +868,13 @@ impl Renderer {
                 let content_h = panel.main_h as f32;
                 self.draw_main(target, model, w, h, content_h, dy, alpha)
             }
-            // 添加表单与设置页共用 draw_settings，内部按视图分流
+            // 添加表单与设置页共用 draw_settings，内部按视图分流。
             PanelView::Settings | PanelView::AddForm => {
                 self.draw_settings(target, panel, model, w, dy, alpha)
             }
         }
 
-        // 峰谷说明卡片最后画，盖过数据行
+        // 峰谷说明卡片最后画，盖过数据行。
         if let Some((x, y, tw)) = self.pending_tip.take() {
             let tip = model
                 .strings
@@ -802,7 +1018,7 @@ impl Renderer {
                 windows::Win32::Graphics::DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
             );
         }
-        // 还原 format 默认态（LEADING/NO_WRAP/NEAR），与缓存创建时一致
+        // 还原 format 默认态（LEADING/NO_WRAP/NEAR），与缓存创建时一致。
         if wrap {
             let _ = fmt.SetWordWrapping(
                 windows::Win32::Graphics::DirectWrite::DWRITE_WORD_WRAPPING_NO_WRAP,
@@ -917,7 +1133,7 @@ impl Renderer {
             }
             // 创建失败只在设备濒死时发生：black 随 target 常驻必有活句柄，拿它
             // 绘制把错误递延给 EndDraw，本帧色偏可接受；随后 Renderer 整体
-            // 丢弃重建，绝不 panic=abort 把瞬时设备丢失升级成进程终止
+            // 丢弃重建，绝不 panic=abort 把瞬时设备丢失升级成进程终止。
             Err(_) => self.black.clone(),
         }
     }
@@ -938,12 +1154,12 @@ impl Renderer {
         let dpi = sane_dpi(dpi);
         let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
         let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
-        // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准
+        // 尺寸/DPI 变化时处理；内部尺寸记录以 GetPixelSize 读数为准。
         let sz = self.target.GetPixelSize();
         let need_rebuild = sz.width != w_px || sz.height != h_px || self.target_dpi != dpi;
         if need_rebuild {
             // 仅尺寸变化优先 Resize 复用——整建重分配后台缓冲引发顿挫；
-            // Resize 不换设备，已建刷子继续有效
+            // Resize 不换设备，已建刷子继续有效。
             let size_only = self.target_dpi == dpi;
             let resized = size_only
                 && self
@@ -955,7 +1171,7 @@ impl Renderer {
                     .is_ok();
             if !resized {
                 // 整建换 target：缓存刷子绑死创建它的旧 target，残留句柄会让
-                // 整建后首帧绘制报错递延到 EndDraw 而白费一帧，先清缓存
+                // 整建后首帧绘制报错递延到 EndDraw 而白费一帧，先清缓存。
                 self.brushes.clear();
                 match create_hwnd_target(&self.factory, hwnd, rect_phys, dpi) {
                     Some((target, black)) => {
@@ -963,7 +1179,7 @@ impl Renderer {
                         self.black = black;
                         self.target_dpi = dpi;
                     }
-                    // 保留旧 target 原样跳过本帧，待下次绘制消息重试整建；失败细节由助手内记录
+                    // 保留旧 target 原样跳过本帧，待下次绘制消息重试整建；失败细节由助手内记录。
                     None => return None,
                 }
             }
@@ -1002,7 +1218,7 @@ unsafe fn create_hwnd_target(
         alphaMode: D2D1_ALPHA_MODE_IGNORE,
     };
     // 软件渲染：硬件路径会拉起 d3d11+显卡驱动栈，驱动内部提交
-    // 占 60MB+，远超本程序预算；窗口小，软光栅耗时可忽略
+    // 占 60MB+，超出内存预算；窗口小，软光栅耗时可忽略。
     let props = D2D1_RENDER_TARGET_PROPERTIES {
         r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
         pixelFormat: pf,

@@ -29,7 +29,7 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = agent_long()
         .get(&url)
-        // GitHub API 强制要求 User-Agent
+        // GitHub API 强制要求 User-Agent。
         .header(
             "User-Agent",
             format!("quotify/{}", env!("CARGO_PKG_VERSION")),
@@ -40,10 +40,10 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     if !resp.status().is_success() {
         let status = resp.status();
         if status.as_u16() == 404 {
-            // 仓库存疑或 Release 尚未发布，给可读文案而非裸状态码
+            // 仓库存疑或 Release 尚未发布，给可读文案而非裸状态码。
             return Err("release not found".into());
         }
-        // 失败原因（如 403 限流的 Retry-After 提示）都在 body 里，带前缀进消息
+        // 失败原因（如 403 限流的 Retry-After 提示）都在 body 里，带前缀进消息。
         let body = resp
             .into_body()
             .into_with_config()

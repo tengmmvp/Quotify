@@ -95,10 +95,25 @@ pub fn proxy_split_userinfo(rest: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// Byte-length cap for proxy strings. Same value as the ui layer's
+/// `PROXY_MAX_BYTES` (same-value linkage, deliberately two copies): the
+/// api layer must not depend on ui, yet the input buffer cap and the
+/// validation gate must agree — without this gate, an over-cap value
+/// imported from an external file would be silently corrupted to the
+/// truncated display buffer by one settings-page Apply.
+pub(crate) const PROXY_MAX_BYTES: usize = 512;
+
 /// Validate proxy address shape.
-/// Explicit http:// or socks5:// prefix, non-empty host, port 1–65535.
+/// Explicit http:// or socks5:// prefix, non-empty host, port 1–65535,
+/// byte length capped at PROXY_MAX_BYTES.
 /// ureq fills in a default prefix and never validates the port, so parse it ourselves.
 pub fn proxy_valid(s: &str) -> Result<(), String> {
+    if s.len() > PROXY_MAX_BYTES {
+        return Err(format!(
+            "too long: {} bytes (max {PROXY_MAX_BYTES})",
+            s.len()
+        ));
+    }
     let lower = s.trim().to_ascii_lowercase();
     let socks = lower.starts_with("socks5://");
     let rest = lower
@@ -186,6 +201,12 @@ struct KeyMemory {
 
 /// key hash → per-key memory. On lock poisoning the data is still intact;
 /// take the inner data and keep using it.
+///
+/// Keyed by `key_hash`, never the plaintext: a process-lifetime map, and
+/// hashed keys keep key material out of it (logs print no keys either;
+/// nothing is persisted, so a deterministic hasher is all it needs to be).
+/// Written by fetch rounds, shrunk by `retain_keys` with the account set —
+/// an orphaned entry would hand a re-added key its old auth order.
 static KEY_MEMORY: LazyLock<Mutex<std::collections::HashMap<u64, KeyMemory>>> =
     LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -311,10 +332,7 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         })
         .collect();
     if !failed.is_empty() {
-        crate::api::log(&format!(
-            "[Quotify] Token 档拉取失败: {}",
-            failed.join("; ")
-        ));
+        crate::api::log(&format!("Token 档拉取失败: {}", failed.join("; ")));
     }
     // A sidecar 429 doesn't trigger separate backoff: while the main endpoint is healthy, the
     // regular cadence stands and the next round retries naturally. Any present tier sets
@@ -337,8 +355,8 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
             }
             // Envelope failure and shape mismatch are both handled as no data:
             // the log keeps a record, and the backfill carries the old value.
-            Ok(None) => log_balance_state(plain, Some("[Quotify] 余额响应无有效数据".into())),
-            Err(e) => log_balance_state(plain, Some(format!("[Quotify] 余额拉取失败: {e}"))),
+            Ok(None) => log_balance_state(plain, Some("余额响应无有效数据".into())),
+            Err(e) => log_balance_state(plain, Some(format!("余额拉取失败: {e}"))),
         }
     }
     Ok(snap)
@@ -365,7 +383,7 @@ fn token_params(now: chrono::DateTime<chrono::Local>) -> TokenWindows {
             .and_hms_opt(0, 0, 0)
             .and_then(|t| chrono::TimeZone::from_local_datetime(&chrono::Local, &t).earliest());
         if t.is_none() {
-            crate::api::log(&format!("[Quotify] Token {tag} 窗口起点本地化失败，跳过"));
+            crate::api::log(&format!("Token {tag} 窗口起点本地化失败，跳过"));
         }
         t
     };
@@ -642,7 +660,9 @@ fn fetch_quota(
 
 #[cfg(test)]
 mod tests {
-    use super::{auth_order, is_auth_status, parse_balance, proxy_valid, token_params};
+    use super::{
+        PROXY_MAX_BYTES, auth_order, is_auth_status, parse_balance, proxy_valid, token_params,
+    };
     use crate::api::FetchError;
     use serde_json::json;
 
@@ -759,6 +779,23 @@ mod tests {
         // ureq's Uri parsing rejects it as a backstop.
         assert!(proxy_valid("http://::1").is_ok());
         assert!(ureq::Proxy::new("http://::1").is_err());
+    }
+
+    /// Length gate: 511/512 bytes pass, 513 is rejected and the reason
+    /// carries both the actual length and the cap.
+    #[test]
+    fn proxy_valid_length_gate() {
+        // "http://" + host + ":80" = 10 fixed bytes; padding goes into the host.
+        let mk = |total: usize| format!("http://{}:80", "h".repeat(total - 10));
+        assert_eq!(mk(511).len(), 511);
+        assert!(proxy_valid(&mk(511)).is_ok());
+        assert!(proxy_valid(&mk(512)).is_ok());
+        let err = proxy_valid(&mk(513)).unwrap_err();
+        assert!(err.contains("513"), "reason carries the length: {err}");
+        assert!(
+            err.contains(&PROXY_MAX_BYTES.to_string()),
+            "reason carries the cap: {err}"
+        );
     }
 
     #[test]

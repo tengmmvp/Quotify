@@ -164,8 +164,16 @@ pub struct McpUsage {
     pub total: f64,
     /// Monthly reset time.
     pub resets_at: Option<DateTime<Utc>>,
-    /// Per-model breakdown.
+    /// Per-model breakdown (residency-capped to the top MCP_TOP_N by usage).
     pub details: Vec<McpDetail>,
+    /// Raw entry count before the residency cap: the legend's "+N" must
+    /// count truncated tools too, so the render side reads this — not
+    /// details.len().
+    pub total_count: usize,
+    /// Sum of every entry's usage before the cap: the energy bar
+    /// normalizes against the whole-set total, so tools beyond the cap
+    /// still shrink the visible segments' shares.
+    pub total_usage: f64,
 }
 
 /// Usage snapshot from one successful query.
@@ -694,18 +702,37 @@ fn parse_bucket(item: &Value) -> QuotaBucket {
     }
 }
 
-fn parse_mcp_details(item: &Value) -> Vec<McpDetail> {
+/// Residency cap on parsed details: only the top MCP_TOP_N by usage stay
+/// (sort key shared with the render side's descending order) — the detail
+/// count feeding render and height stays bounded.
+const MCP_TOP_N: usize = 20;
+
+/// Parsed per-model breakdown with the whole-set totals kept: returns
+/// (capped details, raw entry count, whole-set usage sum) — the totals
+/// are recorded before the cap so the truncated tail still counts in
+/// the legend's "+N" and the energy bar's denominator.
+fn parse_mcp_details(item: &Value) -> (Vec<McpDetail>, usize, f64) {
     item.get("usageDetails")
         .and_then(Value::as_array)
         .map(|arr| {
-            arr.iter()
+            let mut details: Vec<McpDetail> = arr
+                .iter()
                 .filter_map(|d| {
                     Some(McpDetail {
                         model_code: d.get("modelCode")?.as_str()?.to_string(),
                         usage: d.get("usage").and_then(Value::as_f64).unwrap_or(0.0),
                     })
                 })
-                .collect()
+                .collect();
+            let total_count = details.len();
+            let total_usage = details.iter().map(|d| d.usage).sum();
+            details.sort_by(|a, b| {
+                b.usage
+                    .partial_cmp(&a.usage)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            details.truncate(MCP_TOP_N);
+            (details, total_count, total_usage)
         })
         .unwrap_or_default()
 }
@@ -746,12 +773,15 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                 }
             } else if is_mcp_entry(item) {
                 let bucket = parse_bucket(item);
+                let (details, total_count, total_usage) = parse_mcp_details(item);
                 mcp = Some(McpUsage {
                     used_percent: bucket.used_percent,
                     current_value: bucket.current.unwrap_or(0.0),
                     total: bucket.total.unwrap_or(0.0),
                     resets_at: bucket.resets_at,
-                    details: parse_mcp_details(item),
+                    details,
+                    total_count,
+                    total_usage,
                 });
             }
         }
@@ -984,6 +1014,8 @@ mod tests {
                         usage: 1.0,
                     })
                     .collect(),
+                total_count: n,
+                total_usage: n as f64,
             }),
             token_stats: stats.then_some(TokenStats {
                 legs: [Some(1.0), Some(2.0), Some(3.0)],
@@ -1025,6 +1057,37 @@ mod tests {
         // Empty details mean not displayed.
         let empty = r#"{"success":true,"data":{"limits":[{"type":"TIME_LIMIT","percentage":10.0,"usage":100,"currentValue":10}]}}"#;
         assert!(!parse_response(empty).unwrap().has_mcp_details());
+    }
+
+    /// Details residency: sorted by usage descending (the render side's
+    /// order) and truncated to the top MCP_TOP_N — anything beyond the cap
+    /// is dropped at parse, the lowest-usage entries first. The whole-set
+    /// totals survive the cap: raw entry count and usage sum are recorded
+    /// before truncation, so the legend's "+N" and the energy bar's
+    /// denominator still see the dropped tail.
+    #[test]
+    fn mcp_details_sorted_and_capped_to_top_n() {
+        // MCP_TOP_N + 5 models with usage == index, plus one outranking all.
+        let mut entries = String::new();
+        for i in 0..(MCP_TOP_N + 5) {
+            entries.push_str(&format!(r#"{{"modelCode":"m{i}","usage":{i}}},"#));
+        }
+        entries.push_str(r#"{"modelCode":"top","usage":1000}"#);
+        let body = format!(
+            r#"{{"success":true,"data":{{"limits":[{{"type":"TIME_LIMIT","percentage":10.0,"usageDetails":[{entries}]}}]}}}}"#
+        );
+        let mcp = parse_response(&body).unwrap().mcp.unwrap();
+        let details = mcp.details;
+        assert_eq!(details.len(), MCP_TOP_N);
+        assert_eq!(details[0].model_code, "top");
+        assert_eq!(details[1].model_code, format!("m{}", MCP_TOP_N + 4));
+        // Kept tail reaches m6; m5 and below are dropped.
+        assert_eq!(details.last().unwrap().model_code, "m6");
+        // Totals count the dropped tail: the input set is MCP_TOP_N + 6
+        // entries, and total_usage sums every entry's usage.
+        assert_eq!(mcp.total_count, MCP_TOP_N + 6);
+        let whole: f64 = (0..(MCP_TOP_N + 5)).map(|i| i as f64).sum::<f64>() + 1000.0;
+        assert_eq!(mcp.total_usage, whole);
     }
 
     /// Tray ring priority: a present 5h bucket beats everything, absence falls back to the weekly

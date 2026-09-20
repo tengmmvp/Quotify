@@ -91,6 +91,11 @@ pub(super) struct McpCompCache {
     ranges: Vec<(usize, usize, [f32; 4])>,
     badges: Vec<McpBadge>,
     shown: usize,
+    /// Tools hidden from the legend: parse-side total_count minus the
+    /// shown badges — covers both width-dropped badges and parse-side
+    /// residency-truncated entries; the "+N" badge draws exactly when
+    /// this is > 0.
+    hidden: usize,
     /// Truncated first-badge label for the over-width fallback
     /// (shown == 0): the largest tool stays visible as ellipsized text
     fallback: super::TextBlock,
@@ -1325,7 +1330,7 @@ impl Renderer {
                 );
                 x += b.block.w;
             }
-            if shown < badges.len() {
+            if c.hidden > 0 {
                 x += MCP_BADGE_GAP;
                 self.draw_block_nosnap(
                     target,
@@ -1358,7 +1363,16 @@ impl Renderer {
                 .partial_cmp(&a.usage)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        let sum: f64 = items.iter().map(|d| d.usage).sum();
+        // Normalization denominator takes the parse-side whole-set
+        // total: the residency cap drops the lowest-usage tail, and
+        // normalizing against the kept top-N sum alone would overstate
+        // the last visible segment's share. A zero total falls back to
+        // the kept sum (zero as well) — no division either way.
+        let sum: f64 = if m.total_usage > 0.0 {
+            m.total_usage
+        } else {
+            items.iter().map(|d| d.usage).sum()
+        };
         let mut segs: Vec<(usize, usize, [f32; 4])> = Vec::new();
         if sum > 0.0 {
             let mut cum = 0.0f64;
@@ -1383,10 +1397,12 @@ impl Renderer {
         // is width-driven: after the current badge fits, continuing
         // requires the remaining width to also hold the inter-badge gap
         // + "+N"; the trailing summary count is the number of remaining
-        // tools.
+        // tools, taken from the parse-side total_count so entries the
+        // residency cap already dropped count as hidden too.
         // The raw strings live only for this build pass (the over-width
         // fallback layout is built right after fitting); the cache holds
         // blocks alone, so no frame path re-measures.
+        let hidden_after = |shown: usize| m.total_count.saturating_sub(shown);
         let mut texts: Vec<String> = Vec::with_capacity(items.len());
         let badges: Vec<McpBadge> = items
             .iter()
@@ -1412,10 +1428,10 @@ impl Renderer {
         let mut cur = 0.0f32;
         for (i, b) in badges.iter().enumerate() {
             let add = if i == 0 { 0.0 } else { MCP_BADGE_GAP } + badge_w(b);
-            let tail = if badges.len() - i > 1 {
+            let tail = if hidden_after(i + 1) > 0 {
                 MCP_BADGE_GAP
                     + self.measure(
-                        &format!("+{}", badges.len() - i - 1),
+                        &format!("+{}", hidden_after(i + 1)),
                         MCP_BADGE_SIZE,
                         400,
                         true,
@@ -1429,8 +1445,9 @@ impl Renderer {
             cur += add;
             shown = i + 1;
         }
-        let plus = if shown < badges.len() {
-            let t = format!("+{}", badges.len() - shown);
+        let hidden = hidden_after(shown);
+        let plus = if hidden > 0 {
+            let t = format!("+{hidden}");
             super::TextBlock::new(self.make_layout(&t, MCP_BADGE_SIZE, 400, true))
         } else {
             super::TextBlock::new(None)
@@ -1462,6 +1479,7 @@ impl Renderer {
             ranges,
             badges,
             shown,
+            hidden,
             fallback,
             plus,
         }
@@ -1750,14 +1768,16 @@ fn category_label(s: &Strings, c: ErrorCategory) -> &'static str {
     }
 }
 
-/// Footer cache key: the minute bucket delegates to fmt::elapsed_minutes —
-/// the same source the text tiers read, so key transitions land exactly at
-/// whole elapsed minutes. Taking a whole-second timestamp would drop the
-/// snapshot's sub-second part; the key transition would lead the real one
-/// by up to a second, and crossing a tier would cache the stale copy under
-/// the new key, displaying it a full minute late
+/// Footer cache key: a thin delegation to fmt::elapsed_minutes_since —
+/// the same clamped minute bucket the text tiers read, so key
+/// transitions land exactly at whole elapsed minutes (the zero clamp
+/// single-sources there; a wall-clock step back must not bucket to -1).
+/// Taking a whole-second timestamp would drop the snapshot's sub-second
+/// part; the key transition would lead the real one by up to a second,
+/// and crossing a tier would cache the stale copy under the new key,
+/// displaying it a full minute late
 fn footer_key(now_ms: i64, at_ms: i64) -> i64 {
-    crate::ui::fmt::elapsed_minutes(now_ms - at_ms)
+    crate::ui::fmt::elapsed_minutes_since(now_ms, at_ms)
 }
 
 /// Display material for FetchError: the official error info and the
@@ -1847,6 +1867,9 @@ mod tests {
         assert_eq!(footer_key(at + 60_000, at), 1);
         assert_eq!(footer_key(at + 119_999, at), 1);
         assert_eq!(footer_key(at + 120_000, at), 2);
+        // Wall clock stepped back (NTP correction): delta clamps to zero,
+        // never bucketing to -1 — same clamp as fmt::updated_text
+        assert_eq!(footer_key(at - 30_000, at), 0);
     }
 
     /// Pinned pairing of tiers with fallback day counts and log labels

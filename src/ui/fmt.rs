@@ -100,6 +100,15 @@ pub(crate) fn elapsed_minutes(delta_ms: i64) -> i64 {
     delta_ms.div_euclid(60_000)
 }
 
+/// Elapsed-minute bucket of two wall-clock millisecond stamps with the
+/// zero clamp built in: the single "a wall-clock step back must not
+/// bucket negative" policy — the footer cache key and the copy tiers
+/// (updated_text) both derive here, so the clamp cannot exist in one
+/// and be missing from the other.
+pub(crate) fn elapsed_minutes_since(now_ms: i64, at_ms: i64) -> i64 {
+    elapsed_minutes((now_ms - at_ms).max(0))
+}
+
 /// Footer "data updated" text.
 ///
 /// "Just updated" is exactly elapsed-minutes bucket 0 — the same boundary
@@ -109,12 +118,13 @@ pub(crate) fn elapsed_minutes(delta_ms: i64) -> i64 {
 /// this function, so the two implementations cannot drift and misplace the
 /// animation start.
 pub fn updated_text(s: &crate::ui::i18n::Strings, lang: Lang, at: DateTime<Local>) -> String {
-    // Clamped at zero: a wall-clock step back (NTP correction) leaves the
-    // snapshot stamped in the future — a negative bucket would read as -1
-    // minutes and fall through to "1m ago"; zero keeps "just updated"
-    // until wall time passes the stamp, matching ago()'s own clamp.
-    let delta_ms = (Local::now() - at).num_milliseconds().max(0);
-    if elapsed_minutes(delta_ms) == 0 {
+    // The zero clamp lives in elapsed_minutes_since: a wall-clock step
+    // back (NTP correction) leaves the snapshot stamped in the future —
+    // a negative bucket would read as -1 minutes and fall through to
+    // "1m ago"; zero keeps "just updated" until wall time passes the
+    // stamp, matching ago()'s own clamp.
+    let now_ms = Local::now().timestamp_millis();
+    if elapsed_minutes_since(now_ms, at.timestamp_millis()) == 0 {
         s.updated_just_now.to_string()
     } else {
         s.updated_ago.replace("{t}", &ago(at, lang))
@@ -180,6 +190,17 @@ mod tests {
             let secs = delta / 1000; // num_seconds truncation for non-negative deltas
             assert_eq!(elapsed_minutes(delta), secs / 60, "delta {delta}");
         }
+    }
+
+    /// The zero clamp lives in elapsed_minutes_since: a stepped-back
+    /// wall clock (now before the stamp) never buckets negative — the
+    /// footer cache key and the copy tiers share this one clamp.
+    #[test]
+    fn elapsed_minutes_since_clamps_negative() {
+        assert_eq!(elapsed_minutes_since(1_000, 5_000), 0);
+        assert_eq!(elapsed_minutes_since(5_000, 1_000), 0);
+        assert_eq!(elapsed_minutes_since(5_000, 61_000), 0);
+        assert_eq!(elapsed_minutes_since(61_000, 1_000), 1);
     }
 
     #[test]

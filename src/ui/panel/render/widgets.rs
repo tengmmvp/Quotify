@@ -1,4 +1,4 @@
-//! 跨视图通用小件
+//! Cross-view shared widgets
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -13,122 +13,48 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows_numerics::{Matrix3x2, Vector2};
 
-use super::{Align, Hit, Renderer};
-use crate::ui::panel::theme::RADIUS;
+use super::{Hit, Renderer};
 
-/// 名牌高：与账号卡高同为偶数，垂直居中落整像素
+/// Badge height: even like the account-card height, so vertical centering lands on whole pixels
 pub(super) const BADGE_H: f32 = 16.0;
 
+/// Section-header row geometry shared across views — main's accent_label
+/// and settings' section_label: inset from the accent bar and the row
+/// height for vertical centering. Font size stays a caller decision
+/// (12 main labels, 13 settings).
+pub(super) const ACCENT_INSET: f32 = 7.0;
+pub(super) const ACCENT_ROW_H: f32 = 17.0;
+
 impl Renderer {
-    /// 名牌
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn badge(
+    /// Section-title accent bar: main's accent_label and settings'
+    /// section_label share this geometry
+    pub(super) unsafe fn fill_accent_bar(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
         x: f32,
         y: f32,
-        w: f32,
-        edge_color: [f32; 4],
-        fg: [f32; 4],
         alpha: f32,
-        mono: bool,
     ) {
-        let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
+        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
+        // Vertical centering of the bar in the row derives from
+        // ACCENT_ROW_H — same source the label layout centers against.
+        let top = y + (ACCENT_ROW_H - 13.0) / 2.0;
+        target.FillRectangle(
+            &D2D_RECT_F {
                 left: x,
-                top: y,
-                right: x + w,
-                bottom: y + BADGE_H,
+                top,
+                right: x + 3.0,
+                bottom: top + 13.0,
             },
-            radiusX: 2.5,
-            radiusY: 2.5,
-        };
-        let edge = self.brush(target, edge_color, alpha * 0.9);
-        target.DrawRoundedRectangle(&r, &edge, 1.0, None);
-        let rect = D2D_RECT_F {
-            left: x,
-            top: y,
-            right: x + w,
-            bottom: y + BADGE_H,
-        };
-        self.text_aligned_vc(
-            target,
-            label,
-            &rect,
-            10.5,
-            400,
-            fg,
-            alpha,
-            Align::Center,
-            mono,
+            &bar,
         );
     }
 
-    /// 描边按钮
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn outline_button(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        hit: Hit,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        label: &str,
-        alpha: f32,
-    ) {
-        let hovered = self.hover == Some(hit);
-        let r = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: x,
-                top: y,
-                right: x + w,
-                bottom: y + h,
-            },
-            radiusX: RADIUS,
-            radiusY: RADIUS,
-        };
-        if hovered {
-            let b = self.brush(target, self.theme.track, alpha);
-            target.FillRoundedRectangle(&r, &b);
-        }
-        let edge = self.brush(target, self.theme.border, alpha * 0.9);
-        target.DrawRoundedRectangle(&r, &edge, 1.0, None);
-        let fg = if hovered {
-            self.theme.text_primary
-        } else {
-            self.theme.text_secondary
-        };
-        let rect = D2D_RECT_F {
-            left: x,
-            top: y + 5.0,
-            right: x + w,
-            bottom: y + h - 4.0,
-        };
-        self.text_aligned(
-            target,
-            label,
-            &rect,
-            12.0,
-            400,
-            fg,
-            alpha,
-            Align::Center,
-            false,
-        );
-        self.hits.push((
-            hit,
-            D2D_RECT_F {
-                left: x - 4.0,
-                top: y - 4.0,
-                right: x + w + 4.0,
-                bottom: y + h + 4.0,
-            },
-        ));
-    }
+    // The badge and outlined-button immediate-text versions were retired
+    // with the frame caches: settings and popup draw prebuilt TextBlocks
+    // now (settings-local badge/outline mirrors live in settings.rs).
 
-    /// 图标按钮
+    /// Icon button
     pub(super) unsafe fn icon_button(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -181,7 +107,7 @@ impl Renderer {
         ));
     }
 
-    /// 刷新按钮的圆弧双段加尾箭头折线
+    /// The refresh button's two arc segments plus tail-arrow polylines
     fn build_refresh_glyph(&self) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
@@ -222,7 +148,7 @@ impl Renderer {
         }
     }
 
-    /// 设置入口滑杆图标
+    /// Settings-entry sliders icon
     pub(super) unsafe fn sliders(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -280,7 +206,7 @@ impl Renderer {
         ));
     }
 
-    /// 返回箭头
+    /// Back arrow
     pub(super) unsafe fn back_arrow(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -303,7 +229,7 @@ impl Renderer {
         ));
     }
 
-    /// 叉号钮：账号删除与面板关闭共用
+    /// X button: shared by account deletion and panel close
     pub(super) unsafe fn x_button(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -325,7 +251,7 @@ impl Renderer {
         ));
     }
 
-    /// 分隔线
+    /// Divider line
     pub(super) unsafe fn divider(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -338,7 +264,7 @@ impl Renderer {
         self.line(target, x, y, x + width, y, &b, 1.0);
     }
 
-    /// 小票撕线
+    /// Receipt tear line
     pub(super) unsafe fn dashed_divider(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -375,8 +301,8 @@ impl Renderer {
         }
     }
 
-    /// 下拉小箭头
-    /// 收起朝下，展开翻转朝上。
+    /// Dropdown chevron
+    /// Points down when collapsed, flips up when expanded.
     pub(super) unsafe fn chevron(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -393,7 +319,7 @@ impl Renderer {
         self.line(target, x + half, cy + d, x + half * 2.0, cy - d, &b, 1.8);
     }
 
-    /// 眼睛图标
+    /// Eye icon
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn eye(
         &mut self,
@@ -442,7 +368,7 @@ impl Renderer {
         }
     }
 
-    /// 应用 logo
+    /// App logo
     pub(super) unsafe fn logo(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -485,7 +411,7 @@ impl Renderer {
         target.SetTransform(&Matrix3x2::identity());
     }
 
-    /// 多组封闭折线 → 单份填充几何；不相交轮廓为并集
+    /// Multiple closed polylines → one filled geometry; non-intersecting contours form a union
     fn build_polys(&self, polys: Vec<Vec<(f32, f32)>>) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
@@ -506,8 +432,10 @@ impl Renderer {
         }
     }
 
-    /// 构建白色 Q 字路径。环与尾必须拆成两个 geometry：同一 geometry 内
-    /// 两 figure 相交在默认 evenodd 规则下会被挖空，分体两次填充才是并集
+    /// Build the white Q glyph path. The ring and the tail must be split into two
+    /// geometries: two figures
+    /// intersecting inside one geometry get hollowed out under the default evenodd rule;
+    /// filling them separately yields the union
     fn build_logo_glyph(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         let [outer, inner, tail] = crate::ui::icon::q_outline();
         let ring = self.build_polys(vec![outer, inner])?;
@@ -515,7 +443,7 @@ impl Renderer {
         Some((ring, tail))
     }
 
-    /// 构建闪电图标路径
+    /// Build the bolt icon path
     pub(super) fn build_bolt_glyph(&self) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
@@ -532,7 +460,7 @@ impl Renderer {
         }
     }
 
-    /// 构建眼睛杏仁轮廓路径
+    /// Build the eye's almond outline path
     fn build_eye_glyph(&self) -> Option<ID2D1PathGeometry> {
         unsafe {
             let geo = self.factory.CreatePathGeometry().ok()?;
@@ -554,15 +482,22 @@ impl Renderer {
         }
     }
 
-    /// 页脚换装的吃豆人：cx/cy 为圆心，p 为动画进度 0..1。嘴朝右
-    /// 一张一合边走边啃。开合用上下两半圆绕圆心反向旋转拼出——
-    /// 几何恒定缓存，每帧只改变换矩阵
-    pub(super) unsafe fn pacman(
+    /// The Pac-Man sprite: cx/cy is the center, p the animation progress
+    /// 0..1, r the drawn radius (the cached geometry is PACMAN_R and
+    /// scales by r/PACMAN_R), color the fill/stroke brush. The mouth
+    /// faces right, chomping as it walks; the open/close is built from
+    /// the upper and lower half-discs counter-rotating around the center
+    /// transform matrix. Shared by the footer swap and the about-window
+    /// easter egg.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn pacman_at(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         cx: f32,
         cy: f32,
+        r: f32,
         p: f32,
+        color: [f32; 4],
         alpha: f32,
     ) {
         if self.pacman_geo.is_none() {
@@ -571,23 +506,16 @@ impl Renderer {
         let Some((upper, lower)) = self.pacman_geo.clone() else {
             return;
         };
-        let smooth =
-            |t: f32| t.clamp(0.0, 1.0) * t.clamp(0.0, 1.0) * (3.0 - 2.0 * t.clamp(0.0, 1.0));
-        let phase = (p * 8.0).fract();
-        let ratio = if phase < 0.65 {
-            smooth(phase / 0.65)
-        } else {
-            1.0 - smooth((phase - 0.65) / 0.35)
-        };
-        let mouth = 0.02 + ratio * 0.94;
-        let b = self.brush(target, self.theme.text_tertiary, alpha);
+        let mouth = pacman_mouth(p);
+        let b = self.brush(target, color, alpha);
+        let k = r / PACMAN_R;
         for (geo, ang) in [(upper, -mouth), (lower, mouth)] {
             let (s, c) = ang.sin_cos();
             target.SetTransform(&Matrix3x2 {
-                M11: c,
-                M12: s,
-                M21: -s,
-                M22: c,
+                M11: k * c,
+                M12: k * s,
+                M21: -k * s,
+                M22: k * c,
                 M31: cx,
                 M32: cy,
             });
@@ -597,8 +525,10 @@ impl Renderer {
         target.SetTransform(&Matrix3x2::identity());
     }
 
-    /// 构建吃豆人上下两半圆几何（半径 PACMAN_R，局部原点即圆心）。
-    /// 半圆的直径边经过圆心，绕圆心旋转即可张合出嘴
+    /// Build the Pac-Man's upper and lower half-disc geometries (radius PACMAN_R,
+    /// local origin at the center).
+    /// Each half-disc's diameter edge passes through the center, so
+    /// rotating around the center opens and closes the mouth
     pub(super) fn build_pacman_geo(&self) -> Option<(ID2D1PathGeometry, ID2D1PathGeometry)> {
         unsafe {
             let build_half = |clockwise: bool| -> Option<ID2D1PathGeometry> {
@@ -633,7 +563,8 @@ impl Renderer {
                 sink.Close().ok()?;
                 Some(geo)
             };
-            // 屏幕坐标 y 向下：上半圆走顺时针小弧（经顶部），下半圆对称。
+            // Screen coordinates have y pointing down: the upper half-disc takes the
+            // clockwise small arc (through the top); the lower is symmetric.
             let upper = build_half(true)?;
             let lower = build_half(false)?;
             Some((upper, lower))
@@ -641,5 +572,21 @@ impl Renderer {
     }
 }
 
-/// 吃豆人半径
+/// Pac-Man radius
 pub(super) const PACMAN_R: f32 = 8.0;
+
+/// Pac-Man mouth opening angle: the footer swap and the about-window easter egg share
+/// this one animation curve
+pub(super) fn pacman_mouth(p: f32) -> f32 {
+    let sm = |t: f32| {
+        let c = t.clamp(0.0, 1.0);
+        c * c * (3.0 - 2.0 * c)
+    };
+    let phase = (p * 8.0).fract();
+    let ratio = if phase < 0.65 {
+        sm(phase / 0.65)
+    } else {
+        1.0 - sm((phase - 0.65) / 0.35)
+    };
+    0.02 + ratio * 0.94
+}

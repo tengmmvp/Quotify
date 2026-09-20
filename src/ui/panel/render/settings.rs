@@ -1,4 +1,4 @@
-//! 设置视图与添加账号表单
+//! Settings view and the add-account form
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -6,14 +6,212 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
 use super::widgets::BADGE_H;
-use super::{Align, AppearanceChoice, Hit, LanguageChoice, Renderer, ScopeChoice};
+use super::{AppearanceChoice, Hit, InputStyle, LanguageChoice, Renderer, ScopeChoice};
 use crate::api::Platform;
+use crate::ui::panel::caret::FieldContent;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::{CARD_RADIUS, RADIUS};
 use crate::ui::panel::{InputField, Panel, layout};
 
+// ── Settings frame cache ──
+// Mirrors main.rs's MainTexts/MainLabels discipline: text whose content
+// changes only with (language, config, data, width) is prebuilt as
+// TextBlocks, so caret-blink, hover, and height-animation frames create
+// zero layouts and zero intermediate strings.
+
+/// Rebuild key: the full-value inputs of the cached layouts. Width enters
+/// by bits (f32 semantic equality is bitwise equality). The per-frame
+/// check compares against borrowed model data — owned clones live only
+/// here, taken on the rebuild path.
+struct SettingsKey {
+    lang: crate::ui::i18n::Lang,
+    threshold: u8,
+    cw: u32,
+    update: UpdateKey,
+    account: Option<AccountKey>,
+}
+
+/// Update-check state feeding the about section: picks the button label
+/// ("check" / "up to date" / "error" / "go download"); New carries the
+/// release tag both the button label branch and the version line read
+enum UpdateKey {
+    Idle,
+    OkNoUpdate,
+    Err,
+    New(String),
+}
+
+/// Account-card identity: name, platform + team annotation, and the
+/// version/tier badge labels off the snapshot
+struct AccountKey {
+    name: String,
+    platform: Platform,
+    team: bool,
+    version: Option<&'static str>,
+    tier: Option<String>,
+}
+
+/// One badge on the account card: label block plus the badge box width
+/// (label width + 14 padding) — measure and draw read the same layout
+/// metrics, so box and text cannot drift
+struct CardBadge {
+    block: super::TextBlock,
+    w: f32,
+}
+
+/// Account-card artifacts with all width-derived values baked in: badges
+/// in right-to-left draw order plus the ellipsized name. Colors are NOT
+/// cached — only the tier class is; the theme lookup stays per-frame so a
+/// light/dark switch recolors without a rebuild.
+struct AccountCardTexts {
+    tier: Option<(CardBadge, crate::api::PlanTier)>,
+    version: Option<CardBadge>,
+    platform: CardBadge,
+    name: super::TextBlock,
+}
+
+/// About-section artifacts: the action button's label (whichever of the
+/// four update states it holds) with its measured width, plus the version
+/// line
+struct AboutTexts {
+    btn: super::TextBlock,
+    btn_w: f32,
+    ver_line: super::TextBlock,
+}
+
+/// Settings frame cache: the threshold description, about-section
+/// artifacts, and the account card — rebuilt as one unit whenever the key
+/// changes. The constant labels live in their own language-keyed cache
+/// (Renderer::settings_labels) and survive these rebuilds.
+pub(super) struct SettingsTexts {
+    key: SettingsKey,
+    threshold_desc: super::TextBlock,
+    about: AboutTexts,
+    card: Option<AccountCardTexts>,
+}
+
+/// Constant-label layout set: every settings/add-form label whose content
+/// changes only with the language. Field order = build order = draw order
+/// (navigation → accounts/add form → interval → notifications → peak →
+/// general → proxy → backup → about).
+pub(super) struct SettingsLabels {
+    // Navigation titles (16/400, centered in the nav bar)
+    nav_settings: super::TextBlock,
+    nav_add: super::TextBlock,
+    // Accounts section: accent title 13/600, key-invalid line 12/400,
+    // add pill 13/400, add-form's own section title
+    sec_accounts: super::TextBlock,
+    key_invalid: super::TextBlock,
+    pill_add: super::TextBlock,
+    sec_platform: super::TextBlock,
+    // Add form: sub labels 13/400, segmented items 13/400, pills 13/400
+    sub_platform: super::TextBlock,
+    seg_platform_cn: super::TextBlock,
+    seg_platform_intl: super::TextBlock,
+    sub_type: super::TextBlock,
+    seg_personal: super::TextBlock,
+    seg_team: super::TextBlock,
+    sub_name: super::TextBlock,
+    sub_key: super::TextBlock,
+    sub_org: super::TextBlock,
+    sub_project: super::TextBlock,
+    pill_save: super::TextBlock,
+    pill_cancel: super::TextBlock,
+    // Poll interval: title 13/600, segments 13/400, unit 12/400, apply 12/400
+    sec_interval: super::TextBlock,
+    iv_1m: super::TextBlock,
+    iv_5m: super::TextBlock,
+    iv_15m: super::TextBlock,
+    iv_30m: super::TextBlock,
+    iv_custom: super::TextBlock,
+    iv_unit: super::TextBlock,
+    btn_apply: super::TextBlock,
+    // Notifications: titles 13/400, descs 12/400
+    sec_notifications: super::TextBlock,
+    t_threshold: super::TextBlock,
+    t_reset_5h: super::TextBlock,
+    d_reset_5h: super::TextBlock,
+    t_reset_weekly: super::TextBlock,
+    d_reset_weekly: super::TextBlock,
+    // Peak hours: labels 12/400
+    sec_peak: super::TextBlock,
+    peak_start: super::TextBlock,
+    peak_end: super::TextBlock,
+    // General: title 13/600, sub labels + segments 13/400
+    sec_general: super::TextBlock,
+    sub_language: super::TextBlock,
+    seg_follow_system: super::TextBlock,
+    seg_lang_zh: super::TextBlock,
+    seg_lang_en: super::TextBlock,
+    sub_appearance: super::TextBlock,
+    seg_light: super::TextBlock,
+    seg_dark: super::TextBlock,
+    t_autostart: super::TextBlock,
+    // Network proxy
+    sec_network: super::TextBlock,
+    sub_proxy: super::TextBlock,
+    // Config management: buttons 12/400
+    sec_backup: super::TextBlock,
+    btn_export: super::TextBlock,
+    btn_import: super::TextBlock,
+}
+
+/// Version/tier badge labels from the snapshot: the shared source of the
+/// key check and the card rebuild, so the two sides cannot drift
+fn badge_labels<'a>(model: &'a PanelModel) -> (Option<&'static str>, Option<&'a str>) {
+    match model.snapshot {
+        Some(snap) => {
+            let tier = snap.tier_label();
+            let v = snap.plan_version.label();
+            (
+                (!v.is_empty()).then_some(v),
+                (!tier.is_empty()).then_some(tier),
+            )
+        }
+        None => (None, None),
+    }
+}
+
+impl SettingsKey {
+    /// Compare against borrowed frame data: the per-frame hit path
+    /// allocates nothing (owned clones live in the key, taken only on
+    /// rebuild). The update arm mirrors build_settings_texts' state
+    /// mapping — update_available is derived from the same Result the
+    /// build reads.
+    fn matches(&self, model: &PanelModel, cw: f32) -> bool {
+        if self.lang != model.lang
+            || self.threshold != model.threshold_percent
+            || self.cw != cw.to_bits()
+        {
+            return false;
+        }
+        let update_ok = match (&self.update, model.update) {
+            (UpdateKey::Idle, None) => true,
+            (UpdateKey::OkNoUpdate, Some(Ok(_))) => !model.update_available,
+            (UpdateKey::Err, Some(Err(_))) => true,
+            (UpdateKey::New(tag), Some(Ok(info))) => model.update_available && *tag == info.tag,
+            _ => false,
+        };
+        if !update_ok {
+            return false;
+        }
+        let (version, tier) = badge_labels(model);
+        match (&self.account, model.account) {
+            (None, None) => true,
+            (Some(k), Some(acc)) => {
+                k.name == acc.name
+                    && k.platform == acc.platform
+                    && k.team == acc.team
+                    && k.version == version
+                    && k.tier.as_deref() == tier
+            }
+            _ => false,
+        }
+    }
+}
+
 impl Renderer {
-    /// 设置视图
+    /// Settings view
     pub(super) unsafe fn draw_settings(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -28,16 +226,35 @@ impl Renderer {
         let cw = w - pad * 2.0;
         let mut y = dy + layout::SETTINGS_EDGE_PAD;
 
-        // ── 导航栏 ──
+        // ── Frame caches (both exits below put them back): the key check
+        // allocates zero on hits, so a key change is the only thing that
+        // ever rebuilds layouts. The constant labels sit in their own
+        // language-keyed cache — account switches and update results
+        // rebuild the volatile part only ──
+        let mut labels_opt = self.settings_labels.take();
+        if labels_opt.as_ref().is_none_or(|(l, _)| *l != model.lang) {
+            labels_opt = Some((model.lang, self.build_settings_labels(s)));
+        }
+        let labels = labels_opt
+            .as_ref()
+            .map(|(_, ls)| ls)
+            .expect("settings_labels 上方必已置");
+        let mut texts_opt = self.settings_texts.take();
+        if texts_opt.as_ref().is_none_or(|t| !t.key.matches(model, cw)) {
+            texts_opt = Some(self.build_settings_texts(s, model, cw));
+        }
+        let texts = texts_opt.expect("settings_texts 上方必已置");
+
+        // ── Navigation bar ──
         let on_add_form = panel.view == crate::ui::panel::PanelView::AddForm;
         if !on_add_form {
             self.back_arrow(target, Hit::Back, pad, y + 6.0);
         }
         self.x_button(target, Hit::ClosePanel, w - pad - 10.0, y + 6.0);
         let nav_title = if on_add_form {
-            s.add_account
+            &labels.nav_add
         } else {
-            s.settings
+            &labels.nav_settings
         };
         let title_rect = D2D_RECT_F {
             left: pad,
@@ -45,214 +262,60 @@ impl Renderer {
             right: w - pad,
             bottom: y + 26.0,
         };
-        self.text_aligned(
+        self.block_c(
             target,
             nav_title,
             &title_rect,
-            16.0,
-            400,
             self.theme.text_primary,
             alpha,
-            Align::Center,
-            false,
         );
         y += layout::NAV_H;
 
-        // ── 账号：设置页首项即数据来源；添加页此处标题用「账号信息」──
+        // ── Accounts: the settings page's first section is the data source; on the add page this heading reads "Account info" ──
         let section = if on_add_form {
-            s.platform_section
+            &labels.sec_platform
         } else {
-            s.accounts_section
+            &labels.sec_accounts
         };
-        y = self.section_label(target, section, pad, y, w, alpha, false);
+        y = self.section_label(target, Some(section), pad, y, w, alpha, false);
         if on_add_form {
-            // 添加流程：平台 → 类型 → 名称/key，团队版追加组织/项目 ID。
-            y = self.sub_label(target, s.account_platform, pad, y, cw, alpha);
-            let plats: [(Hit, &str); 2] = [
-                (Hit::Platform(Platform::Cn), s.platform_cn),
-                (Hit::Platform(Platform::Intl), s.platform_intl),
-            ];
-            let cur_plat = panel.pending_platform;
-            y = self.segmented_raw(
-                target,
-                &plats,
-                |h| matches!(h, Hit::Platform(v) if cur_plat == *v),
-                pad,
-                y,
-                cw,
-                alpha,
-            );
-            y = self.sub_label(target, s.account_type_label, pad, y, cw, alpha);
-            // 行集与 y 链跟随生效布局。
-            let team = panel.layout_team;
-            let team_sel = panel.pending_team;
-            let types: [(Hit, &str); 2] = [
-                (Hit::AccountType(ScopeChoice::Personal), s.type_personal),
-                (Hit::AccountType(ScopeChoice::Team), s.type_team),
-            ];
-            y = self.segmented_raw(
-                target,
-                &types,
-                |h| matches!(h, Hit::AccountType(v) if team_sel == matches!(*v, ScopeChoice::Team)),
-                pad,
-                y,
-                cw,
-                alpha,
-            );
-            // y 钉在 layout 常量：绘制、光标、高度公式三方同源。
-            let input = &panel.input;
-            self.sub_label(target, s.account_name, pad, y, cw, alpha);
-            let name_y = dy + layout::ADD_NAME_Y;
-            self.input_field(
-                panel,
-                target,
-                Hit::InputName,
-                name_y,
-                None,
-                &input.name,
-                "",
-                input.field == Some(InputField::Name),
-                alpha,
-            );
-            y = name_y + layout::INPUT_H + layout::INPUT_GAP;
-            self.sub_label(target, s.api_key_label, pad, y, cw, alpha);
-            let key_y = dy + layout::ADD_KEY_Y;
-            // key 不整串落屏：聚焦显等宽圆点，未聚焦且足 12 位只露首尾各 4 位，框内眼睛可切明文。
-            let key_active = input.field == Some(InputField::Key);
-            let key_disp = if panel.key_revealed {
-                input.key.clone()
-            } else {
-                mask_key(&input.key, key_active)
-            };
-            self.input_field(
-                panel,
-                target,
-                Hit::InputKey,
-                key_y,
-                Some((Hit::RevealKey, panel.key_revealed)),
-                &key_disp,
-                "",
-                key_active,
-                alpha,
-            );
-            y = key_y + layout::INPUT_H + layout::INPUT_GAP;
-            if team {
-                // 团队版：组织 / 项目 ID（请求头 Bigmodel-Organization / Bigmodel-Project）
-                self.sub_label(target, s.org_id_label, pad, y, cw, alpha);
-                let org_y = dy + layout::ADD_ORG_Y;
-                self.input_field(
-                    panel,
-                    target,
-                    Hit::InputOrg,
-                    org_y,
-                    None,
-                    &input.org,
-                    "",
-                    input.field == Some(InputField::Org),
-                    alpha,
-                );
-                y = org_y + layout::INPUT_H + layout::INPUT_GAP;
-                self.sub_label(target, s.project_id_label, pad, y, cw, alpha);
-                let project_y = dy + layout::ADD_PROJECT_Y;
-                self.input_field(
-                    panel,
-                    target,
-                    Hit::InputProject,
-                    project_y,
-                    None,
-                    &input.project,
-                    "",
-                    input.field == Some(InputField::Project),
-                    alpha,
-                );
-                y = project_y + layout::INPUT_H + 12.0;
-            } else {
-                y += 6.0;
-            }
-            let pair_w = 88.0 * 2.0 + 12.0;
-            let bx = pad + (cw - pair_w) / 2.0;
-            self.pill_button(
-                target,
-                Hit::SaveAccount,
-                bx,
-                y,
-                88.0,
-                layout::SAVE_BTN_H,
-                s.save,
-                alpha,
-                true,
-            );
-            self.pill_button(
-                target,
-                Hit::Back,
-                bx + 100.0,
-                y,
-                88.0,
-                layout::SAVE_BTN_H,
-                s.cancel,
-                alpha,
-                false,
-            );
+            self.draw_add_form(target, panel, labels, pad, cw, dy, y, alpha);
+            // Both exits put the taken caches back: losing them here would
+            // force a full rebuild on the next paint.
+            self.settings_texts = Some(texts);
+            self.settings_labels = labels_opt;
             return;
         }
-        // 当前活跃账号卡片（有则显示）；添加入口常驻，支持继续添加账号。
-        if let Some(acc) = model.account {
-            let platform = if acc.platform == Platform::Cn {
-                s.platform_cn
-            } else {
-                s.platform_intl
-            };
-            // 团队版在平台名牌并列标注：账号卡无编辑入口，保存后仍可辨识。
-            let platform_owned;
-            let platform = if acc.team {
-                platform_owned = format!("{platform} | {}", s.team_badge);
-                &platform_owned
-            } else {
-                platform
-            };
-            // 版本 / 等级来自用量数据，缺则不画徽标；全借用快照字段，重绘零分配。
-            let (version, tier) = match model.snapshot {
-                Some(snap) => {
-                    let tier = snap.tier_label();
-                    let v = snap.plan_version.label();
-                    (
-                        (!v.is_empty()).then_some(v),
-                        (!tier.is_empty()).then_some(tier),
-                    )
-                }
-                None => (None, None),
-            };
+
+        // Current active account card (shown when present); the add entry is always
+        // present, allowing more accounts to be added. All card text comes
+        // from the frame cache — badges, widths, and the ellipsized name
+        // are width-derived and were built together.
+        if let (Some(acc), Some(card)) = (model.account, texts.card.as_ref()) {
             self.account_card(
                 target,
                 Hit::RemoveAccount(acc.index),
-                acc.name,
-                platform,
-                version,
-                tier,
+                card,
                 pad,
                 y,
                 cw,
                 alpha,
             );
             y += layout::ACCOUNT_CARD_H;
-            // 谓词与 y 链同引 panel.account_error：高度与绘制的行集同源。
+            // The predicate and the y chain share panel.account_error: height and
+            // the drawn row set come from the same source.
             if panel.account_error {
-                self.text(
-                    target,
-                    s.key_invalid,
-                    pad + 2.0,
-                    y - 4.0,
-                    cw,
-                    16.0,
-                    12.0,
-                    400,
-                    self.theme.danger,
-                    alpha,
-                );
+                let r = D2D_RECT_F {
+                    left: pad + 2.0,
+                    top: y - 4.0,
+                    right: pad + 2.0 + cw,
+                    bottom: y + 12.0,
+                };
+                self.block_l(target, &labels.key_invalid, &r, self.theme.danger, alpha);
                 y += layout::AUTH_ERROR_H;
             }
         }
-        // 添加账号独占一行：占满内容区，视觉对称。
+        // Add-account takes its own full row: it spans the content area for visual symmetry.
         self.pill_button(
             target,
             Hit::AddAccount,
@@ -260,33 +323,25 @@ impl Renderer {
             y + 2.0,
             cw,
             layout::ADD_BTN_H,
-            s.add_account,
+            &labels.pill_add,
             alpha,
             false,
         );
         y += layout::ADD_BTN_ROW_H;
 
-        // ── 轮询间隔：分段第 5 段「自定义」，选中时下方展开输入行 ──
-        y = self.section_label(target, s.poll_interval, pad, y, w, alpha, true);
-        let presets: [(Hit, &str); 5] = [
-            (
-                Hit::IntervalPreset(layout::INTERVAL_PRESETS[0]),
-                s.interval_1m,
-            ),
-            (
-                Hit::IntervalPreset(layout::INTERVAL_PRESETS[1]),
-                s.interval_5m,
-            ),
-            (
-                Hit::IntervalPreset(layout::INTERVAL_PRESETS[2]),
-                s.interval_15m,
-            ),
-            (
-                Hit::IntervalPreset(layout::INTERVAL_PRESETS[3]),
-                s.interval_30m,
-            ),
-            (Hit::CustomizeInterval, s.interval_custom),
-        ];
+        // ── Poll interval: the segmented control's 5th segment is "Custom"; selecting it expands an input row below ──
+        y = self.section_label(target, Some(&labels.sec_interval), pad, y, w, alpha, true);
+        // Fixed-length stack array with zero allocation; the sync between preset count and label slots is
+        // pinned by the interval_preset_count test.
+        let iv = [&labels.iv_1m, &labels.iv_5m, &labels.iv_15m, &labels.iv_30m];
+        let presets: [(Hit, &super::TextBlock); layout::INTERVAL_PRESETS.len() + 1] =
+            std::array::from_fn(|i| {
+                if i < iv.len() {
+                    (Hit::IntervalPreset(layout::INTERVAL_PRESETS[i]), iv[i])
+                } else {
+                    (Hit::CustomizeInterval, &labels.iv_custom)
+                }
+            });
         let cur = model.poll_interval_secs;
         let is_preset = layout::INTERVAL_PRESETS.contains(&cur);
         y = self.segmented_raw(
@@ -303,7 +358,7 @@ impl Renderer {
             alpha,
         );
         if panel.layout_customizing {
-            // y 钉在 layout::interval_input_y，与光标、高度公式同源。
+            // y is pinned to layout::interval_input_y, sharing the source with the caret and the height formula.
             let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
             let input = &panel.input;
             self.input_field(
@@ -312,46 +367,52 @@ impl Renderer {
                 Hit::InputInterval,
                 iy,
                 None,
-                &input.interval,
+                FieldContent::Plain(&input.interval),
                 "",
                 input.field == Some(InputField::Interval),
                 alpha,
             );
-            self.text(
+            let unit_rect = D2D_RECT_F {
+                left: pad + 104.0,
+                top: iy + 6.0,
+                right: pad + 144.0,
+                bottom: iy + 22.0,
+            };
+            self.block_l(
                 target,
-                s.interval_custom_unit,
-                pad + 104.0,
-                iy + 6.0,
-                40.0,
-                16.0,
-                12.0,
-                400,
+                &labels.iv_unit,
+                &unit_rect,
                 self.theme.text_secondary,
                 alpha,
             );
-            self.outline_button(
+            self.outline_button_blk(
                 target,
                 Hit::ApplyInterval,
                 w - pad - 56.0,
                 iy - 1.0,
                 56.0,
                 layout::BTN_H,
-                s.apply,
+                &labels.btn_apply,
                 alpha,
             );
             y = iy + layout::CUSTOMIZE_EXTRA_H;
         }
 
-        // ── 通知 ──
-        y = self.section_label(target, s.notifications, pad, y, w, alpha, true);
-        let threshold_desc = s
-            .notify_threshold_desc
-            .replace("{p}", &model.threshold_percent.to_string());
+        // ── Notifications ──
+        y = self.section_label(
+            target,
+            Some(&labels.sec_notifications),
+            pad,
+            y,
+            w,
+            alpha,
+            true,
+        );
         y = self.toggle_row(
             target,
             Hit::ToggleThreshold,
-            s.notify_threshold,
-            &threshold_desc,
+            &labels.t_threshold,
+            Some(&texts.threshold_desc),
             model.threshold_enabled,
             pad,
             y,
@@ -361,8 +422,8 @@ impl Renderer {
         y = self.toggle_row(
             target,
             Hit::ToggleReset5h,
-            s.notify_reset_5h_opt,
-            s.notify_reset_5h_desc,
+            &labels.t_reset_5h,
+            Some(&labels.d_reset_5h),
             model.reset_5h_enabled,
             pad,
             y,
@@ -372,8 +433,8 @@ impl Renderer {
         y = self.toggle_row(
             target,
             Hit::ToggleResetWeekly,
-            s.notify_reset_weekly_opt,
-            s.notify_reset_weekly_desc,
+            &labels.t_reset_weekly,
+            Some(&labels.d_reset_weekly),
             model.reset_weekly_enabled,
             pad,
             y,
@@ -381,19 +442,21 @@ impl Renderer {
             alpha,
         );
 
-        // ── 高峰区间：工作日生效，自定义起止 ──
-        self.section_label(target, s.peak_section, pad, y, w, alpha, true);
-        // y 钉在 layout::peak_input_y，与光标、高度公式同源。
+        // ── Peak hours: effective on weekdays, custom start/end ──
+        self.section_label(target, Some(&labels.sec_peak), pad, y, w, alpha, true);
+        // y is pinned to layout::peak_input_y, sharing the source with the caret and the height formula.
         let pky = dy
             + layout::peak_input_y(
                 model.accounts_count > 0,
                 panel.account_error,
                 panel.layout_customizing,
             );
-        // 当前配置值作为弱色占位提示，输入即覆盖，无需删除。
+        // The current config value serves as a faint placeholder hint;
+        // typing overwrites it, no deletion needed.
         let start_buf = panel.input.peak_start.as_str();
         let end_buf = panel.input.peak_end.as_str();
-        // 非法状态（格式错误或两端相等）给红框，提示等待修正；空缓冲表示未编辑不判。
+        // An invalid state (format error or both ends equal) gets a red frame as
+        // a hint awaiting correction; empty buffers mean unedited and are not judged.
         let bad = |v: &str| !v.is_empty() && crate::ui::peak::parse_hhmm(v).is_none();
         let peak_bad = bad(start_buf)
             || bad(end_buf)
@@ -404,15 +467,16 @@ impl Renderer {
                 ),
                 (Some(s), Some(e)) if s == e
             );
-        self.text(
+        let start_rect = D2D_RECT_F {
+            left: pad,
+            top: pky + 7.0,
+            right: pad + 26.0,
+            bottom: pky + 21.0,
+        };
+        self.block_l(
             target,
-            s.peak_start_label,
-            pad,
-            pky + 7.0,
-            26.0,
-            14.0,
-            12.0,
-            400,
+            &labels.peak_start,
+            &start_rect,
             self.theme.text_tertiary,
             alpha,
         );
@@ -422,20 +486,21 @@ impl Renderer {
             Hit::InputPeakStart,
             pky,
             None,
-            start_buf,
+            FieldContent::Plain(start_buf),
             model.peak_start_raw,
             panel.input.field == Some(InputField::PeakStart),
             alpha,
         );
-        self.text(
+        let end_rect = D2D_RECT_F {
+            left: pad + 100.0,
+            top: pky + 7.0,
+            right: pad + 126.0,
+            bottom: pky + 21.0,
+        };
+        self.block_l(
             target,
-            s.peak_end_label,
-            pad + 100.0,
-            pky + 7.0,
-            26.0,
-            14.0,
-            12.0,
-            400,
+            &labels.peak_end,
+            &end_rect,
             self.theme.text_tertiary,
             alpha,
         );
@@ -445,19 +510,19 @@ impl Renderer {
             Hit::InputPeakEnd,
             pky,
             None,
-            end_buf,
+            FieldContent::Plain(end_buf),
             model.peak_end_raw,
             panel.input.field == Some(InputField::PeakEnd),
             alpha,
         );
-        self.outline_button(
+        self.outline_button_blk(
             target,
             Hit::ApplyPeak,
             w - pad - 48.0,
             pky - 1.0,
             48.0,
             layout::BTN_H,
-            s.apply,
+            &labels.btn_apply,
             alpha,
         );
         if peak_bad {
@@ -478,15 +543,18 @@ impl Renderer {
         }
         y = pky + layout::INPUT_H + layout::PEAK_TAIL_GAP;
 
-        // ── 通用：语言 / 外观 / 开机自启 ──
-        y = self.section_label(target, s.settings_general, pad, y, w, alpha, true);
-        y = self.sub_label(target, s.language, pad, y, cw, alpha);
-        let langs: [(Hit, &str); 3] = [
-            (Hit::Language(LanguageChoice::System), s.follow_system),
-            (Hit::Language(LanguageChoice::Zh), "中文"),
-            (Hit::Language(LanguageChoice::En), "English"),
+        // ── General: language / appearance / autostart ──
+        y = self.section_label(target, Some(&labels.sec_general), pad, y, w, alpha, true);
+        y = self.sub_label(target, &labels.sub_language, pad, y, cw, alpha);
+        let langs: [(Hit, &super::TextBlock); 3] = [
+            (
+                Hit::Language(LanguageChoice::System),
+                &labels.seg_follow_system,
+            ),
+            (Hit::Language(LanguageChoice::Zh), &labels.seg_lang_zh),
+            (Hit::Language(LanguageChoice::En), &labels.seg_lang_en),
         ];
-        // 配置字符串 → 选项枚举：未配置 / 未知值都归「跟随系统」。
+        // Config string → choice enum: unset / unknown values all map to "follow the system".
         let cur_lang = LanguageChoice::from_setting(model.language);
         y = self.segmented_raw(
             target,
@@ -498,11 +566,14 @@ impl Renderer {
             alpha,
         );
         y += layout::CHOICE_ROW_TAIL;
-        y = self.sub_label(target, s.appearance_section, pad, y, cw, alpha);
-        let themes: [(Hit, &str); 3] = [
-            (Hit::Appearance(AppearanceChoice::System), s.follow_system),
-            (Hit::Appearance(AppearanceChoice::Light), s.theme_light),
-            (Hit::Appearance(AppearanceChoice::Dark), s.theme_dark),
+        y = self.sub_label(target, &labels.sub_appearance, pad, y, cw, alpha);
+        let themes: [(Hit, &super::TextBlock); 3] = [
+            (
+                Hit::Appearance(AppearanceChoice::System),
+                &labels.seg_follow_system,
+            ),
+            (Hit::Appearance(AppearanceChoice::Light), &labels.seg_light),
+            (Hit::Appearance(AppearanceChoice::Dark), &labels.seg_dark),
         ];
         let cur_theme = AppearanceChoice::from_setting(model.appearance);
         y = self.segmented_raw(
@@ -518,8 +589,8 @@ impl Renderer {
         y = self.toggle_row(
             target,
             Hit::ToggleAutostart,
-            s.autostart,
-            "",
+            &labels.t_autostart,
+            None,
             model.autostart,
             pad,
             y,
@@ -527,10 +598,10 @@ impl Renderer {
             alpha,
         );
 
-        // ── 网络代理：地址留空直连，未配置时框内只显占位提示 ──
-        y = self.section_label(target, s.network_section, pad, y, w, alpha, true);
-        self.sub_label(target, s.proxy_label, pad, y, cw, alpha);
-        // y 钉在 layout::proxy_input_y，与光标、高度公式同源。
+        // ── Network proxy: empty address means direct connection; when unconfigured the field shows only the placeholder hint ──
+        y = self.section_label(target, Some(&labels.sec_network), pad, y, w, alpha, true);
+        self.sub_label(target, &labels.sub_proxy, pad, y, cw, alpha);
+        // y is pinned to layout::proxy_input_y, sharing the source with the caret and the height formula.
         let py = dy
             + layout::proxy_input_y(
                 model.accounts_count > 0,
@@ -543,107 +614,475 @@ impl Renderer {
             Hit::InputProxy,
             py,
             None,
-            &panel.input.proxy,
+            FieldContent::Plain(&panel.input.proxy),
             s.proxy_hint,
             panel.input.field == Some(InputField::Proxy),
             alpha,
         );
-        self.outline_button(
+        self.outline_button_blk(
             target,
             Hit::ApplyProxy,
             w - pad - layout::APPLY_BTN_W,
             py - 1.0,
             layout::APPLY_BTN_W,
             layout::BTN_H,
-            s.apply,
+            &labels.btn_apply,
             alpha,
         );
         y = py + layout::INPUT_H + layout::PROXY_TAIL_GAP;
 
-        // ── 配置管理：导出 / 导入，位于关于区之前 ──
-        y = self.section_label(target, s.backup_section, pad, y, w, alpha, true);
+        // ── Config management: export / import, placed before the about section ──
+        y = self.section_label(target, Some(&labels.sec_backup), pad, y, w, alpha, true);
         let pair_w = 104.0 * 2.0 + 12.0;
         let bx = pad + (cw - pair_w) / 2.0;
-        self.outline_button(
+        self.outline_button_blk(
             target,
             Hit::ExportConfig,
             bx,
             y,
             104.0,
             layout::BTN_H,
-            s.export_config,
+            &labels.btn_export,
             alpha,
         );
-        self.outline_button(
+        self.outline_button_blk(
             target,
             Hit::ImportConfig,
             bx + 116.0,
             y,
             104.0,
             layout::BTN_H,
-            s.import_config,
+            &labels.btn_import,
             alpha,
         );
         y += layout::BACKUP_ROW_H;
 
-        // ── 关于：检查更新 + 版本，位于底部 ──
-        let update_label = match model.update {
-            Some(Ok(info)) if model.update_available => {
-                format!("{} · {}", s.check_update, info.tag)
-            }
-            Some(Ok(_)) => s.up_to_date.into(),
-            Some(Err(_)) => s.err_update.into(),
-            None => s.check_update.into(),
-        };
-        y = self.section_label(target, "", pad, y, w, alpha, true);
-        // 版本行收尾：有新版时文字带「当前 → 最新」、按钮换「前往下载」。
-        let (btn_hit, btn_label) = if model.update_available {
-            (Hit::OpenDownload, s.go_download)
+        // ── About: check update + version, at the bottom ──
+        // Version line closing: with a new release the text reads "current → latest" and
+        // the button switches to "Go download". The label/width/version
+        // line all come from the cache — the update state is part of the
+        // key, so the button never shows stale copy; btn_w feeds the
+        // version line's right boundary exactly as the old per-frame
+        // measure did.
+        y = self.section_label(target, None, pad, y, w, alpha, true);
+        let btn_hit = if model.update_available {
+            Hit::OpenDownload
         } else {
-            (Hit::CheckUpdate, update_label.as_str())
+            Hit::CheckUpdate
         };
-        let ver_line = if model.update_available
-            && let Some(Ok(info)) = model.update
-        {
-            s.version_new
-                .replace("{cur}", env!("CARGO_PKG_VERSION"))
-                .replace("{new}", info.tag.trim_start_matches('v'))
-        } else {
-            s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"))
+        let btn_w = texts.about.btn_w;
+        let ver_rect = D2D_RECT_F {
+            left: pad,
+            top: y + 7.0,
+            right: w - pad - btn_w - 12.0,
+            bottom: y + 23.0,
         };
-        let btn_w = (self.measure(btn_label, 12.0, 400, false) + 28.0).max(104.0);
-        self.text(
+        self.block_l(
             target,
-            &ver_line,
-            pad,
-            y + 7.0,
-            w - pad * 2.0 - btn_w - 12.0,
-            16.0,
-            12.0,
-            400,
+            &texts.about.ver_line,
+            &ver_rect,
             self.theme.text_tertiary,
             alpha,
         );
-        self.outline_button(
+        self.outline_button_blk(
             target,
             btn_hit,
             w - pad - btn_w,
             y + 1.0,
             btn_w,
             layout::BTN_H,
-            btn_label,
+            &texts.about.btn,
             alpha,
+        );
+        self.settings_texts = Some(texts);
+        self.settings_labels = labels_opt;
+    }
+
+    // ── Settings-page-specific widgets ──
+
+    /// Add-account form: platform → type → name/key, team appends org/project IDs.
+    /// The y chain is pinned to layout constants: drawing, the caret, and
+    /// the height formula share one source. Labels come from the caller's
+    /// frame caches (passed by reference — both were taken out of self).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn draw_add_form(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        labels: &SettingsLabels,
+        pad: f32,
+        cw: f32,
+        dy: f32,
+        y: f32,
+        alpha: f32,
+    ) {
+        let mut y = y;
+        // Add flow: platform → type → name/key, team appends org/project IDs.
+        y = self.sub_label(target, &labels.sub_platform, pad, y, cw, alpha);
+        let plats: [(Hit, &super::TextBlock); 2] = [
+            (Hit::Platform(Platform::Cn), &labels.seg_platform_cn),
+            (Hit::Platform(Platform::Intl), &labels.seg_platform_intl),
+        ];
+        let cur_plat = panel.pending_platform;
+        y = self.segmented_raw(
+            target,
+            &plats,
+            |h| matches!(h, Hit::Platform(v) if cur_plat == *v),
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        y = self.sub_label(target, &labels.sub_type, pad, y, cw, alpha);
+        // The row set and y chain follow the effective layout.
+        let team = panel.layout_team;
+        let team_sel = panel.pending_team;
+        let types: [(Hit, &super::TextBlock); 2] = [
+            (
+                Hit::AccountType(ScopeChoice::Personal),
+                &labels.seg_personal,
+            ),
+            (Hit::AccountType(ScopeChoice::Team), &labels.seg_team),
+        ];
+        y = self.segmented_raw(
+            target,
+            &types,
+            |h| matches!(h, Hit::AccountType(v) if team_sel == matches!(*v, ScopeChoice::Team)),
+            pad,
+            y,
+            cw,
+            alpha,
+        );
+        // y is pinned to layout constants: drawing, the caret, and the height formula share one source.
+        let input = &panel.input;
+        self.sub_label(target, &labels.sub_name, pad, y, cw, alpha);
+        let name_y = dy + layout::ADD_NAME_Y;
+        self.input_field(
+            panel,
+            target,
+            Hit::InputName,
+            name_y,
+            None,
+            FieldContent::Plain(&input.name),
+            "",
+            input.field == Some(InputField::Name),
+            alpha,
+        );
+        y = name_y + layout::INPUT_H + layout::INPUT_GAP;
+        self.sub_label(target, &labels.sub_key, pad, y, cw, alpha);
+        let key_y = dy + layout::ADD_KEY_Y;
+        // The key never lands on screen in full: focused shows monospace dots,
+        // unfocused with 12+ chars reveals only the first and last 4, and
+        // the in-field eye toggles plain text. Both focus states carry the
+        // masked parts when unrevealed — the display string materializes
+        // only on a cache miss, and the plaintext never enters the
+        // generic content parameter, so any future branch drawing
+        // `content` verbatim can only ever leak dots.
+        let key_active = input.field == Some(InputField::Key);
+        let key_content = if panel.key_revealed {
+            FieldContent::Plain(&input.key)
+        } else {
+            FieldContent::Masked {
+                key: &input.key,
+                active: key_active,
+            }
+        };
+        self.input_field(
+            panel,
+            target,
+            Hit::InputKey,
+            key_y,
+            Some((Hit::RevealKey, panel.key_revealed)),
+            key_content,
+            "",
+            key_active,
+            alpha,
+        );
+        y = key_y + layout::INPUT_H + layout::INPUT_GAP;
+        if team {
+            // Team: org / project IDs (request headers Bigmodel-Organization / Bigmodel-Project)
+            self.sub_label(target, &labels.sub_org, pad, y, cw, alpha);
+            let org_y = dy + layout::ADD_ORG_Y;
+            self.input_field(
+                panel,
+                target,
+                Hit::InputOrg,
+                org_y,
+                None,
+                FieldContent::Plain(&input.org),
+                "",
+                input.field == Some(InputField::Org),
+                alpha,
+            );
+            y = org_y + layout::INPUT_H + layout::INPUT_GAP;
+            self.sub_label(target, &labels.sub_project, pad, y, cw, alpha);
+            let project_y = dy + layout::ADD_PROJECT_Y;
+            self.input_field(
+                panel,
+                target,
+                Hit::InputProject,
+                project_y,
+                None,
+                FieldContent::Plain(&input.project),
+                "",
+                input.field == Some(InputField::Project),
+                alpha,
+            );
+            y = project_y + layout::INPUT_H + 12.0;
+        } else {
+            y += 6.0;
+        }
+        let pair_w = 88.0 * 2.0 + 12.0;
+        let bx = pad + (cw - pair_w) / 2.0;
+        self.pill_button(
+            target,
+            Hit::SaveAccount,
+            bx,
+            y,
+            88.0,
+            layout::SAVE_BTN_H,
+            &labels.pill_save,
+            alpha,
+            true,
+        );
+        self.pill_button(
+            target,
+            Hit::Back,
+            bx + 100.0,
+            y,
+            88.0,
+            layout::SAVE_BTN_H,
+            &labels.pill_cancel,
+            alpha,
+            false,
         );
     }
 
-    // ── 设置页专属小件 ──
+    /// Rebuild the constant-label set: keyed by the language alone, so it
+    /// lives in its own cache and survives key changes of the volatile
+    /// settings cache (account switches, update results). Each block's
+    /// size/weight is written here next to its field.
+    unsafe fn build_settings_labels(&mut self, s: &crate::ui::i18n::Strings) -> SettingsLabels {
+        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
+            super::TextBlock::new(r.make_layout(t, size, weight, false))
+        };
+        SettingsLabels {
+            nav_settings: blk(self, s.settings, 16.0, 400),
+            nav_add: blk(self, s.add_account, 16.0, 400),
+            sec_accounts: blk(self, s.accounts_section, 13.0, 600),
+            key_invalid: blk(self, s.key_invalid, 12.0, 400),
+            pill_add: blk(self, s.add_account, 13.0, 400),
+            sec_platform: blk(self, s.platform_section, 13.0, 600),
+            sub_platform: blk(self, s.account_platform, 13.0, 400),
+            seg_platform_cn: blk(self, s.platform_cn, 13.0, 400),
+            seg_platform_intl: blk(self, s.platform_intl, 13.0, 400),
+            sub_type: blk(self, s.account_type_label, 13.0, 400),
+            seg_personal: blk(self, s.type_personal, 13.0, 400),
+            seg_team: blk(self, s.type_team, 13.0, 400),
+            sub_name: blk(self, s.account_name, 13.0, 400),
+            sub_key: blk(self, s.api_key_label, 13.0, 400),
+            sub_org: blk(self, s.org_id_label, 13.0, 400),
+            sub_project: blk(self, s.project_id_label, 13.0, 400),
+            pill_save: blk(self, s.save, 13.0, 400),
+            pill_cancel: blk(self, s.cancel, 13.0, 400),
+            sec_interval: blk(self, s.poll_interval, 13.0, 600),
+            iv_1m: blk(self, s.interval_1m, 13.0, 400),
+            iv_5m: blk(self, s.interval_5m, 13.0, 400),
+            iv_15m: blk(self, s.interval_15m, 13.0, 400),
+            iv_30m: blk(self, s.interval_30m, 13.0, 400),
+            iv_custom: blk(self, s.interval_custom, 13.0, 400),
+            iv_unit: blk(self, s.interval_custom_unit, 12.0, 400),
+            btn_apply: blk(self, s.apply, 12.0, 400),
+            sec_notifications: blk(self, s.notifications, 13.0, 600),
+            t_threshold: blk(self, s.notify_threshold, 13.0, 400),
+            t_reset_5h: blk(self, s.notify_reset_5h_opt, 13.0, 400),
+            d_reset_5h: blk(self, s.notify_reset_5h_desc, 12.0, 400),
+            t_reset_weekly: blk(self, s.notify_reset_weekly_opt, 13.0, 400),
+            d_reset_weekly: blk(self, s.notify_reset_weekly_desc, 12.0, 400),
+            sec_peak: blk(self, s.peak_section, 13.0, 600),
+            peak_start: blk(self, s.peak_start_label, 12.0, 400),
+            peak_end: blk(self, s.peak_end_label, 12.0, 400),
+            sec_general: blk(self, s.settings_general, 13.0, 600),
+            sub_language: blk(self, s.language, 13.0, 400),
+            seg_follow_system: blk(self, s.follow_system, 13.0, 400),
+            seg_lang_zh: blk(self, s.lang_name_zh, 13.0, 400),
+            seg_lang_en: blk(self, s.lang_name_en, 13.0, 400),
+            sub_appearance: blk(self, s.appearance_section, 13.0, 400),
+            seg_light: blk(self, s.theme_light, 13.0, 400),
+            seg_dark: blk(self, s.theme_dark, 13.0, 400),
+            t_autostart: blk(self, s.autostart, 13.0, 400),
+            sec_network: blk(self, s.network_section, 13.0, 600),
+            sub_proxy: blk(self, s.proxy_label, 13.0, 400),
+            sec_backup: blk(self, s.backup_section, 13.0, 600),
+            btn_export: blk(self, s.export_config, 12.0, 400),
+            btn_import: blk(self, s.import_config, 12.0, 400),
+        }
+    }
 
-    /// 区块主标题：text_primary 色强调块 + 标题；子标签不带块以区分层级
+    /// Rebuild the volatile settings cache in one pass: threshold
+    /// description, about artifacts, and the account card. Each block's
+    /// size/weight is written here next to its field — the draw side
+    /// reads geometry only, so a typography change has one home.
+    unsafe fn build_settings_texts(
+        &mut self,
+        s: &crate::ui::i18n::Strings,
+        model: &PanelModel,
+        cw: f32,
+    ) -> SettingsTexts {
+        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
+            super::TextBlock::new(r.make_layout(t, size, weight, false))
+        };
+        let threshold_desc = blk(
+            self,
+            &s.notify_threshold_desc
+                .replace("{p}", &model.threshold_percent.to_string()),
+            12.0,
+            400,
+        );
+        // About artifacts follow the live update state: New swaps both the
+        // button copy ("go download") and the version line ("cur → new").
+        let update = match model.update {
+            Some(Ok(info)) if model.update_available => UpdateKey::New(info.tag.clone()),
+            Some(Ok(_)) => UpdateKey::OkNoUpdate,
+            Some(Err(_)) => UpdateKey::Err,
+            None => UpdateKey::Idle,
+        };
+        let cur = env!("CARGO_PKG_VERSION");
+        let plain_ver = || s.version_label.replace("{v}", cur);
+        let (btn_text, ver_text) = match &update {
+            UpdateKey::New(tag) => (
+                s.go_download.to_string(),
+                s.version_new
+                    .replace("{cur}", cur)
+                    .replace("{new}", tag.trim_start_matches('v')),
+            ),
+            UpdateKey::OkNoUpdate => (s.up_to_date.to_string(), plain_ver()),
+            UpdateKey::Err => (s.err_update.to_string(), plain_ver()),
+            UpdateKey::Idle => (s.check_update.to_string(), plain_ver()),
+        };
+        let btn = blk(self, &btn_text, 12.0, 400);
+        // Width from the same layout metrics the old per-frame measure
+        // read — the version line's right boundary is unchanged.
+        let btn_w = (btn.w + 28.0).max(104.0);
+        let about = AboutTexts {
+            btn,
+            btn_w,
+            ver_line: blk(self, &ver_text, 12.0, 400),
+        };
+        // Account card: badges (widths baked in) plus the name ellipsized
+        // against the badge-zone remainder. The pad cancels out of the
+        // walk, so cw alone pins the budget.
+        let (version, tier) = badge_labels(model);
+        let card = model.account.map(|acc| {
+            let platform = super::platform_with_team(s, acc.platform, acc.team, " | ");
+            let mk = |r: &Self, t: &str, mono: bool| {
+                let b = super::TextBlock::new(r.make_layout(t, 10.5, 400, mono));
+                CardBadge {
+                    w: b.w + super::BADGE_PAD_X,
+                    block: b,
+                }
+            };
+            let tier_badge =
+                tier.map(|t| (mk(self, t, false), crate::api::PlanTier::from_label(t)));
+            let version_badge = version.map(|v| mk(self, v, true));
+            let platform_badge = mk(self, &platform, false);
+            let (_, _, _, name_max) = Self::account_badge_walk(
+                cw,
+                tier_badge.as_ref().map(|(t, _)| t.w),
+                version_badge.as_ref().map(|v| v.w),
+                platform_badge.w,
+            );
+            let (name_disp, _) = self.ellipsize(acc.name, 15.0, name_max, 500, false);
+            AccountCardTexts {
+                tier: tier_badge,
+                version: version_badge,
+                platform: platform_badge,
+                name: super::TextBlock::new(self.make_layout(&name_disp, 15.0, 500, false)),
+            }
+        });
+        SettingsTexts {
+            key: SettingsKey {
+                lang: model.lang,
+                threshold: model.threshold_percent,
+                cw: cw.to_bits(),
+                update,
+                account: model.account.map(|acc| AccountKey {
+                    name: acc.name.to_string(),
+                    platform: acc.platform,
+                    team: acc.team,
+                    version,
+                    tier: tier.map(|t| t.to_string()),
+                }),
+            },
+            threshold_desc,
+            about,
+            card,
+        }
+    }
+
+    /// Outlined button drawing a cached label block: thin rounded
+    /// outline, hover tint + primary-color label; the hit rect grows
+    /// 4px past the visual box for an easier target
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn outline_button_blk(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        hit: Hit,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        label: &super::TextBlock,
+        alpha: f32,
+    ) {
+        let hovered = self.hover == Some(hit);
+        let r = D2D1_ROUNDED_RECT {
+            rect: D2D_RECT_F {
+                left: x,
+                top: y,
+                right: x + w,
+                bottom: y + h,
+            },
+            radiusX: RADIUS,
+            radiusY: RADIUS,
+        };
+        if hovered {
+            let b = self.brush(target, self.theme.track, alpha);
+            target.FillRoundedRectangle(&r, &b);
+        }
+        let edge = self.brush(target, self.theme.border, alpha * 0.9);
+        target.DrawRoundedRectangle(&r, &edge, 1.0, None);
+        let fg = if hovered {
+            self.theme.text_primary
+        } else {
+            self.theme.text_secondary
+        };
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y + 5.0,
+            right: x + w,
+            bottom: y + h - 4.0,
+        };
+        self.block_c(target, label, &rect, fg, alpha);
+        self.hits.push((
+            hit,
+            D2D_RECT_F {
+                left: x - 4.0,
+                top: y - 4.0,
+                right: x + w + 4.0,
+                bottom: y + h + 4.0,
+            },
+        ));
+    }
+
+    /// Section main title: text_primary-colored accent bar + title;
+    /// sub-labels carry no bar to distinguish hierarchy.
+    /// None draws the rule with no title (the about section's bare divider)
     #[allow(clippy::too_many_arguments)]
     unsafe fn section_label(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: Option<&super::TextBlock>,
         x: f32,
         y: f32,
         _w: f32,
@@ -655,69 +1094,51 @@ impl Renderer {
             self.divider(target, x, ny + 2.0, _w - x * 2.0, alpha);
             ny += layout::SECTION_RULE_GAP;
         }
-        if !label.is_empty() {
-            let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
-            // 柱子与文字同框垂直居中
-            target.FillRectangle(
-                &D2D_RECT_F {
-                    left: x,
-                    top: ny + 2.0,
-                    right: x + 3.0,
-                    bottom: ny + 15.0,
-                },
-                &bar,
-            );
-            self.text_aligned_vc(
-                target,
-                label,
-                &D2D_RECT_F {
-                    left: x + 7.0,
-                    top: ny,
-                    right: x + _w,
-                    bottom: ny + 17.0,
-                },
-                13.0,
-                600,
-                self.theme.text_tertiary,
-                alpha,
-                Align::Left,
-                false,
-            );
+        if let Some(label) = label {
+            // The title is vcentered in the ACCENT_ROW_H band right of the
+            // accent bar, its right boundary at the content edge _w - x —
+            // mirroring the left pad, same as the divider's span; main.rs's
+            // accent_label shares the same band geometry.
+            self.fill_accent_bar(target, x, ny, alpha);
+            let rect = D2D_RECT_F {
+                left: x + super::widgets::ACCENT_INSET,
+                top: ny,
+                right: _w - x,
+                bottom: ny + super::widgets::ACCENT_ROW_H,
+            };
+            self.block_lv(target, label, &rect, self.theme.text_tertiary, alpha);
             ny + layout::SECTION_LABEL_H
         } else {
-            // 纯分隔无标题，只留少量空隙给紧随内容。
+            // Pure divider without a title, leaving only a small gap for the content that follows.
             ny + 6.0
         }
     }
 
-    /// 区块内子项标签：13/400 次级色、无强调块
-    /// 字阶：16 导航 / 13·500 主标题 / 13·400 控件标签 / 12·400 描述
+    /// Sub-item label within a section: 13/400 secondary color, no accent bar
+    /// Type scale: 16 navigation / 13·600 section titles / 13·400 control labels / 12·400 descriptions
     unsafe fn sub_label(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: &super::TextBlock,
         x: f32,
         y: f32,
         w: f32,
         alpha: f32,
     ) -> f32 {
-        self.text(
-            target,
-            label,
-            x,
-            y + 1.0,
-            w,
-            17.0,
-            13.0,
-            400,
-            self.theme.text_secondary,
-            alpha,
-        );
+        let rect = D2D_RECT_F {
+            left: x,
+            top: y + 1.0,
+            right: x + w,
+            bottom: y + 18.0,
+        };
+        self.block_l(target, label, &rect, self.theme.text_secondary, alpha);
         y + layout::SECTION_LABEL_H
     }
 
-    /// 自绘光标：有键盘焦点且闪烁相位在亮段才画。cx 为框内光标 x，
-    /// 宽度取物理整像素，避免缩放比下抗锯齿出淡边。
+    /// Self-drawn caret: drawn only with keyboard focus and the blink phase in the on
+    /// segment. cx is the in-field caret x;
+    /// the width takes whole physical pixels to avoid faint anti-aliased edges at
+    /// fractional scale factors.
     unsafe fn draw_caret(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -733,7 +1154,7 @@ impl Renderer {
         if !focused || !panel.caret_blink().0 {
             return;
         }
-        let left = x + 6.0 + cx;
+        let left = x + layout::FIELD_TEXT_INSET + cx;
         let cw = panel.px(1).max(1) as f32 / panel.dpi;
         let caret = self.brush(target, self.theme.action, alpha);
         target.FillRectangle(
@@ -747,9 +1168,11 @@ impl Renderer {
         );
     }
 
-    /// 自绘输入框：光标直绘，IME 组合窗随光标定位。
-    /// 激活态按光标可视窗口绘制并高亮选区，失焦态画尾部切片。
-    /// 几何 x、宽、右端让位单源取自 field_geo。
+    /// Self-drawn input field: the caret is drawn directly, the IME composition window is
+    /// positioned at the caret.
+    /// The active state draws by the caret's visible window and highlights the selection;
+    /// the unfocused state draws a tail slice.
+    /// Geometry x, width, and right-edge clearance come from field_geo as the single source.
     #[allow(clippy::too_many_arguments)]
     unsafe fn input_field(
         &mut self,
@@ -758,7 +1181,7 @@ impl Renderer {
         hit: Hit,
         y: f32,
         eye: Option<(Hit, bool)>,
-        content: &str,
+        content: FieldContent<'_>,
         placeholder: &str,
         active: bool,
         alpha: f32,
@@ -766,7 +1189,10 @@ impl Renderer {
         let Some(field) = crate::ui::panel::input_field_of_hit(hit) else {
             return;
         };
-        let (x, w, tail) = crate::ui::panel::field_geo(field);
+        // The text typography shares INPUT_FONT with the caret width table;
+        // the placeholder stays non-mono (it never feeds the width table).
+        let (text_sz, text_wt, text_mono) = layout::INPUT_FONT;
+        let (x, w, tail) = crate::ui::panel::layout::field_geo(field);
         let rect = D2D_RECT_F {
             left: x,
             top: y,
@@ -782,49 +1208,50 @@ impl Renderer {
         };
         let edge = self.brush(target, edge_color, alpha);
         target.DrawRectangle(&rect, &edge, 1.2, None);
-        let text_rect = D2D_RECT_F {
-            left: x + 6.0,
-            top: y + 6.0,
-            right: x + w - tail,
-            bottom: y + 22.0,
-        };
         if content.is_empty() && !placeholder.is_empty() {
-            self.text_aligned(
-                target,
-                placeholder,
-                &text_rect,
+            let ph = self.input_block(
+                InputStyle::Placeholder,
+                field,
+                |s| s == placeholder,
+                || placeholder.to_string(),
                 12.0,
                 400,
-                self.theme.text_tertiary,
-                alpha,
-                Align::Left,
                 false,
             );
-            // 空缓冲聚焦态的光标画在框首。
+            self.draw_block_at(
+                target,
+                &ph,
+                x + layout::FIELD_TEXT_INSET,
+                y + 6.0,
+                self.theme.text_tertiary,
+                alpha,
+                false,
+            );
+            // In the focused state with an empty buffer, the caret is drawn at the start of the field.
             if active {
                 self.draw_caret(target, panel, x, 0.0, y, alpha);
             }
         } else if active {
-            let avail = (w - 6.0 - tail).max(1.0);
+            let avail = layout::field_avail(field);
             let cl = panel.caret_layout(self);
-            let chars: Vec<char> = content.chars().collect();
+            let chars = &cl.widths.chars;
             let start = cl.vis_start.min(chars.len());
             let mut end = start;
             while end < chars.len() && cl.seg(start, end + 1) <= avail {
                 end += 1;
             }
-            let vis: String = chars[start..end].iter().collect();
             if let Some((a, b)) = panel.input.edit.selection() {
                 let a = a.min(chars.len());
                 let b = b.min(chars.len());
                 let sx = |n: usize| cl.seg(start, n);
-                let sel_left = x + 6.0 + sx(a);
-                let sel_right = x + 6.0 + sx(b);
-                if sel_right > x + 6.0 && sel_left < x + w - tail {
+                let inset = x + layout::FIELD_TEXT_INSET;
+                let sel_left = inset + sx(a);
+                let sel_right = inset + sx(b);
+                if sel_right > inset && sel_left < x + w - tail {
                     let hl = self.brush(target, self.theme.action, alpha * 0.16);
                     target.FillRectangle(
                         &D2D_RECT_F {
-                            left: sel_left.max(x + 6.0),
+                            left: sel_left.max(inset),
                             top: y + 5.0,
                             right: sel_right.min(x + w - tail),
                             bottom: y + 21.0,
@@ -833,50 +1260,69 @@ impl Renderer {
                     );
                 }
             }
-            self.text_aligned(
+            // Cache hits compare the visible slice char-by-char and never
+            // materialize the string; only a real miss collects it.
+            let vis_blk = self.input_block(
+                InputStyle::Body,
+                field,
+                |s| s.chars().eq(chars[start..end].iter().copied()),
+                || chars[start..end].iter().collect(),
+                text_sz,
+                text_wt,
+                text_mono,
+            );
+            self.draw_block_at(
                 target,
-                &vis,
-                &text_rect,
-                12.0,
-                400,
+                &vis_blk,
+                x + layout::FIELD_TEXT_INSET,
+                y + 6.0,
                 self.theme.text_primary,
                 alpha,
-                Align::Left,
-                true,
+                false,
             );
-            // 光标 x 与 IME 定位取自同一布局产物。
+            // The caret x and IME positioning take the same layout product.
             self.draw_caret(target, panel, x, cl.cx, y, alpha);
         } else {
-            // 失焦态：尾部可视切片取最长可放入后缀；前缀宽表一次成型，
-            // 后缀宽 = 全宽 - 前缀宽，零逐候选测量。
-            let avail = (w - 6.0 - tail).max(1.0);
-            let chars: Vec<char> = content.chars().collect();
-            let mut vis = String::new();
-            if !chars.is_empty() {
-                let widths = self.prefix_widths(&chars, 12.0, 400, true);
-                let n = chars.len();
-                if widths[n] <= avail {
-                    vis = content.to_string();
-                } else {
-                    // 至少保尾 1 字符；找最小起点使后缀入宽[后缀宽随
-                    // 起点减小单调增，首个溢出前一位即最长可放入后缀]。
-                    let mut k = 0usize;
-                    while k + 1 < n && widths[n] - widths[k] > avail {
-                        k += 1;
-                    }
-                    vis = chars[k..].iter().collect();
+            // Unfocused state: the tail visual slice takes the longest
+            // suffix that fits; the char list and width table come from
+            // the shared (field, display) artifacts — repaint frames
+            // (minute heartbeat, hover, height transitions) build zero
+            // layouts and materialize zero strings; suffix width = full
+            // width - prefix width, zero per-candidate measuring.
+            let avail = layout::field_avail(field);
+            let art = panel.widths_of(self, field, &content);
+            // Slice range: the whole display when it fits, else the
+            // longest suffix that does [suffix width grows monotonically
+            // as the start decreases, so the position before the first
+            // overflow is the longest suffix that fits; keep at least the
+            // last 1 character].
+            let n = art.chars.len();
+            let start = if n == 0 || art.widths[n] <= avail {
+                0
+            } else {
+                let mut k = 0usize;
+                while k + 1 < n && art.widths[n] - art.widths[k] > avail {
+                    k += 1;
                 }
-            }
-            self.text_aligned(
+                k
+            };
+            let vis_blk = self.input_block(
+                InputStyle::Body,
+                field,
+                |s| s.chars().eq(art.chars[start..].iter().copied()),
+                || art.chars[start..].iter().collect(),
+                text_sz,
+                text_wt,
+                text_mono,
+            );
+            self.draw_block_at(
                 target,
-                &vis,
-                &text_rect,
-                12.0,
-                400,
+                &vis_blk,
+                x + layout::FIELD_TEXT_INSET,
+                y + 6.0,
                 self.theme.text_primary,
                 alpha,
-                Align::Left,
-                true,
+                false,
             );
         }
         if let Some((eye_hit, revealed)) = eye {
@@ -890,7 +1336,9 @@ impl Renderer {
                 self.theme.text_secondary,
                 alpha,
             );
-            // 眼睛命中区先于整框登记：hit_at 取首个命中，后登记会被整框吞掉。
+            // The eye hit zone is registered before the whole field:
+            // hit_at takes the first hit, and a later registration would be swallowed by
+            // the whole-field rect.
             self.hits.push((
                 eye_hit,
                 D2D_RECT_F {
@@ -917,40 +1365,30 @@ impl Renderer {
         &mut self,
         target: &ID2D1HwndRenderTarget,
         hit: Hit,
-        title: &str,
-        desc: &str,
+        title: &super::TextBlock,
+        desc: Option<&super::TextBlock>,
         on: bool,
         x: f32,
         y: f32,
         w: f32,
         alpha: f32,
     ) -> f32 {
-        self.text(
-            target,
-            title,
-            x,
-            y + 1.0,
-            w - 56.0,
-            layout::TOGGLE_TITLE_DRAW_H,
-            13.0,
-            400,
-            self.theme.text_primary,
-            alpha,
-        );
+        let title_rect = D2D_RECT_F {
+            left: x,
+            top: y + 1.0,
+            right: x + w - 56.0,
+            bottom: y + 1.0 + layout::TOGGLE_TITLE_DRAW_H,
+        };
+        self.block_l(target, title, &title_rect, self.theme.text_primary, alpha);
         let mut ty = y + layout::TOGGLE_TITLE_H;
-        if !desc.is_empty() {
-            self.text(
-                target,
-                desc,
-                x,
-                ty,
-                w - 56.0,
-                layout::TOGGLE_DESC_DRAW_H,
-                12.0,
-                400,
-                self.theme.text_tertiary,
-                alpha,
-            );
+        if let Some(desc) = desc {
+            let desc_rect = D2D_RECT_F {
+                left: x,
+                top: ty,
+                right: x + w - 56.0,
+                bottom: ty + layout::TOGGLE_DESC_DRAW_H,
+            };
+            self.block_l(target, desc, &desc_rect, self.theme.text_tertiary, alpha);
             ty += layout::TOGGLE_DESC_H;
         }
         let (tw, th) = (38.0, 22.0);
@@ -981,7 +1419,8 @@ impl Renderer {
             radiusY: knob / 2.0,
         };
         target.FillEllipse(&ellipse, &kb);
-        // 命中区只覆盖开关本体并含 8px 容差，点击行文字/空白不翻转。
+        // The hit zone covers only the toggle body plus an 8px tolerance;
+        // clicking the row's text/blank space does not flip it.
         self.hits.push((
             hit,
             D2D_RECT_F {
@@ -998,7 +1437,7 @@ impl Renderer {
     unsafe fn segmented_raw(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        items: &[(Hit, &str)],
+        items: &[(Hit, &super::TextBlock)],
         selected: impl Fn(&Hit) -> bool,
         x: f32,
         y: f32,
@@ -1048,17 +1487,7 @@ impl Renderer {
                 right: tx + seg_w,
                 bottom: y + h,
             };
-            self.text_aligned_vc(
-                target,
-                label,
-                &rect,
-                13.0,
-                400,
-                color,
-                alpha,
-                Align::Center,
-                false,
-            );
+            self.block_vc(target, label, &rect, color, alpha);
             self.hits.push((
                 *hit,
                 D2D_RECT_F {
@@ -1072,23 +1501,52 @@ impl Renderer {
         y + h + layout::SEGMENTED_GAP
     }
 
-    /// 单账号卡片
+    /// Badge-zone walk shared by the cache build and the card draw: from
+    /// the right boundary (56 for the × button), tier/version/platform
+    /// stack leftward with 6 between badges; returns (tier_x, version_x,
+    /// platform_x, name_max) in card-local x. One walk keeps the name's
+    /// truncation budget and the drawn badge row on the same numbers.
+    fn account_badge_walk(
+        w: f32,
+        tier_w: Option<f32>,
+        version_w: Option<f32>,
+        platform_w: f32,
+    ) -> (Option<f32>, Option<f32>, f32, f32) {
+        let mut bx = w - 56.0;
+        let tier_x = tier_w.map(|t| {
+            bx -= t;
+            let x = bx;
+            bx -= 6.0;
+            x
+        });
+        let version_x = version_w.map(|v| {
+            bx -= v;
+            let x = bx;
+            bx -= 6.0;
+            x
+        });
+        bx -= platform_w;
+        let platform_x = bx;
+        let name_max = (bx - 10.0 - 12.0).max(60.0);
+        (tier_x, version_x, platform_x, name_max)
+    }
+
+    /// Single account card, all text from the frame cache: badges carry
+    /// their baked widths, the name was ellipsized against the same badge
+    /// walk performed here (see build_settings_texts)
     #[allow(clippy::too_many_arguments)]
     unsafe fn account_card(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         remove: Hit,
-        name: &str,
-        platform: &str,
-        version: Option<&str>,
-        tier: Option<&str>,
+        card: &AccountCardTexts,
         x: f32,
         y: f32,
         w: f32,
         alpha: f32,
     ) {
         let h = 40.0;
-        let card = D2D1_ROUNDED_RECT {
+        let rect = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: x,
                 top: y,
@@ -1099,82 +1557,76 @@ impl Renderer {
             radiusY: CARD_RADIUS,
         };
         let fill = self.brush(target, self.theme.track, alpha);
-        target.FillRoundedRectangle(&card, &fill);
+        target.FillRoundedRectangle(&rect, &fill);
         let edge = self.brush(target, self.theme.card_border, alpha);
-        target.DrawRoundedRectangle(&card, &edge, 1.0, None);
-        // 徽标与关闭钮居右对齐，名称吃左侧剩余空间；从右界向左依次排 tier/version/platform。
+        target.DrawRoundedRectangle(&rect, &edge, 1.0, None);
+        // Badges and the close button align right, the name takes the remaining space on
+        // the left; tier/version/platform are laid out from the right boundary leftward in order.
+        // Colors stay per-frame (theme lookups) — only widths and layouts are cached;
+        // the positions come from the same walk the name budget was measured against.
         let by = y + (h - BADGE_H) / 2.0;
-        let mut bx = x + w - 56.0; // 徽标区右界，给右侧 × 留位
-        if let Some(tier) = tier {
-            let tw = self.measure(tier, 10.5, 400, false) + 14.0;
-            bx -= tw;
-            let (edge, fg) = self.tier_badge_colors(tier);
-            self.badge(target, tier, bx, by, tw, edge, fg, alpha, false);
-            bx -= 6.0;
+        let (tier_x, version_x, platform_x, name_max) = Self::account_badge_walk(
+            w,
+            card.tier.as_ref().map(|(t, _)| t.w),
+            card.version.as_ref().map(|v| v.w),
+            card.platform.w,
+        );
+        if let (Some((tier, class)), Some(tx)) = (card.tier.as_ref(), tier_x) {
+            let (edge, fg) = self.tier_badge_colors(*class);
+            self.badge_blk(target, &tier.block, x + tx, by, tier.w, edge, fg, alpha);
         }
-        if let Some(version) = version {
-            let vw = self.measure(version, 10.5, 400, true) + 14.0;
-            bx -= vw;
-            self.badge(
+        if let (Some(version), Some(vx)) = (card.version.as_ref(), version_x) {
+            self.badge_blk(
                 target,
-                version,
-                bx,
+                &version.block,
+                x + vx,
                 by,
-                vw,
+                version.w,
                 self.theme.border,
                 self.theme.text_secondary,
                 alpha,
-                true,
             );
-            bx -= 6.0;
         }
-        let pw = self.measure(platform, 10.5, 400, false) + 14.0;
-        bx -= pw;
-        self.badge(
+        self.badge_blk(
             target,
-            platform,
-            bx,
+            &card.platform.block,
+            x + platform_x,
             by,
-            pw,
+            card.platform.w,
             self.theme.border,
             self.theme.text_secondary,
             alpha,
-            false,
         );
-        let name_max = (bx - 10.0 - (x + 12.0)).max(60.0);
-        let (name_disp, _) = self.ellipsize(name, 15.0, name_max, 500, false);
-        self.text_aligned_vc(
+        let name_rect = D2D_RECT_F {
+            left: x + 12.0,
+            top: y,
+            right: x + 12.0 + name_max,
+            bottom: y + h,
+        };
+        self.block_lv(
             target,
-            &name_disp,
-            &D2D_RECT_F {
-                left: x + 12.0,
-                top: y,
-                right: x + 12.0 + name_max,
-                bottom: y + h,
-            },
-            15.0,
-            500,
+            &card.name,
+            &name_rect,
             self.theme.text_primary,
             alpha,
-            Align::Left,
-            false,
         );
         self.x_button(target, remove, x + w - 24.0, y + 15.0);
     }
 
-    /// 等级配色墨阶梯度：Max 最深、Pro 次之、Lite 最浅
-    fn tier_badge_colors(&self, tier: &str) -> ([f32; 4], [f32; 4]) {
-        let t = tier.trim().to_ascii_lowercase();
-        if t.contains("max") {
-            (self.theme.text_primary, self.theme.text_primary)
-        } else if t.contains("pro") {
-            (self.theme.text_secondary, self.theme.text_secondary)
-        } else {
-            (self.theme.border, self.theme.text_tertiary)
+    /// Tier color grayscale gradient keyed off the PlanTier classification — the
+    /// same ladder the data side derives; a tier-rule change propagates to the
+    /// badge automatically. Max darkest, Pro next, Lite and unknown lightest.
+    /// Takes the class (cached at build) instead of the label string, so no
+    /// per-frame to_ascii_lowercase.
+    fn tier_badge_colors(&self, tier: crate::api::PlanTier) -> ([f32; 4], [f32; 4]) {
+        match tier {
+            crate::api::PlanTier::Max => (self.theme.text_primary, self.theme.text_primary),
+            crate::api::PlanTier::Pro => (self.theme.text_secondary, self.theme.text_secondary),
+            _ => (self.theme.border, self.theme.text_tertiary),
         }
     }
 
-    /// 小圆角填充按钮
+    /// Small rounded filled button drawing a cached label block
     #[allow(clippy::too_many_arguments)]
     unsafe fn pill_button(
         &mut self,
@@ -1184,7 +1636,7 @@ impl Renderer {
         y: f32,
         w: f32,
         h: f32,
-        label: &str,
+        label: &super::TextBlock,
         alpha: f32,
         primary: bool,
     ) {
@@ -1224,17 +1676,7 @@ impl Renderer {
             right: x + w,
             bottom: y + h - 2.0,
         };
-        self.text_aligned_vc(
-            target,
-            label,
-            &rect,
-            13.0,
-            400,
-            fg,
-            alpha,
-            Align::Center,
-            false,
-        );
+        self.block_vc(target, label, &rect, fg, alpha);
         self.hits.push((
             hit,
             D2D_RECT_F {
@@ -1247,53 +1689,47 @@ impl Renderer {
     }
 }
 
-/// key 掩码显示串：聚焦或不足 12 位时逐字符圆点，圆点数与原串一致，
-/// 光标步宽仍对且短串不露明文；未聚焦且足 12 位只露首尾各 4 位
-fn mask_key(key: &str, active: bool) -> String {
-    let n = key.chars().count();
-    if active || n < 12 {
-        "•".repeat(n)
-    } else {
-        let head: String = key.chars().take(4).collect();
-        let tail: String = key.chars().skip(n - 4).collect();
-        format!("{head}…{tail}")
-    }
-}
-
-/// 掩码规则回归：12 位阈值两侧、聚焦强制全显圆点、短串与中段不露明文。
-/// 另钉轮询预设档位值，档位值漂移在此报警；标签与档位的配对靠渲染侧
-/// 按下标顺序维护，无自动防护。
+/// Masking rule regression: both sides of the 12-char threshold,
+/// focused forcing all dots, short strings and middles leaking no plain text.
+/// Also pins the poll preset values and count: value drift or adding a preset without
+/// updating the label slots alarms here.
 #[cfg(test)]
 mod tests {
-    use super::mask_key;
     use crate::ui::panel::layout::INTERVAL_PRESETS;
+    use crate::ui::panel::mask_key;
 
     #[test]
     fn interval_presets_pinned() {
-        // 只锁档位值；与四个标签的配对靠渲染侧按下标顺序维护，无防护。
         assert_eq!(INTERVAL_PRESETS, [60, 300, 900, 1800]);
+    }
+
+    /// Preset count equals the render-side label slot count: adding a preset must sync
+    /// both places; zip truncation alarms here
+    #[test]
+    fn interval_preset_count() {
+        assert_eq!(INTERVAL_PRESETS.len(), 4);
     }
 
     #[test]
     fn mask_key_threshold() {
-        // 不足 12 位：整串圆点，不截首尾
+        // Under 12 chars: all dots, no head/tail trimming
         assert_eq!(mask_key("abc123", false), "••••••");
-        // 恰 12 位：露首尾各 4 位
+        // Exactly 12 chars: reveal the first and last 4
         assert_eq!(mask_key("abcd1234wxyz", false), "abcd…wxyz");
-        // 超 12 位：同样只露首尾 4 位
+        // Over 12 chars: likewise reveal only the first and last 4
         assert_eq!(mask_key("abcd1234wxyz9999", false), "abcd…9999");
     }
 
     #[test]
     fn mask_key_active_full_dots() {
-        // 聚焦强制逐字符圆点，位数与原串一致。
+        // Focused forces per-character dots matching the original length.
         assert_eq!(mask_key("abcd1234wxyz9999", true), "•".repeat(16));
         assert_eq!(mask_key("abc", true), "•••");
     }
 
     #[test]
     fn mask_key_no_middle_plaintext() {
-        // 12 位以上中段不落屏。
+        // With 12+ chars the middle never lands on screen.
         let m = mask_key("abcdefghijkl", false);
         assert_eq!(m, "abcd…ijkl");
         assert!(!m.contains('e') && !m.contains('h'));

@@ -1,4 +1,4 @@
-//! 主视图
+//! Main view
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -20,30 +20,33 @@ use crate::ui::panel::layout;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::CARD_RADIUS;
 
-/// MCP 工具色板
+/// MCP tool palette
 const MCP_PALETTE: [[f32; 4]; 4] = [
-    [0.361, 0.616, 0.549, 1.0], // #5C9D8C 灰青
-    [0.431, 0.529, 0.659, 1.0], // #6E87A8 雾蓝
-    [0.584, 0.514, 0.624, 1.0], // #95839F 灰紫
-    [0.678, 0.624, 0.561, 1.0], // #AD9F8F 暖灰
+    [0.361, 0.616, 0.549, 1.0], // #5C9D8C gray-teal
+    [0.431, 0.529, 0.659, 1.0], // #6E87A8 mist blue
+    [0.584, 0.514, 0.624, 1.0], // #95839F gray-purple
+    [0.678, 0.624, 0.561, 1.0], // #AD9F8F warm gray
 ];
 
-/// 能量格几何
+/// Energy cell geometry
 const MCP_CELLS: usize = 20;
 const MCP_CELL_W: f32 = 12.0;
 const MCP_CELL_GAP: f32 = 2.0;
 const MCP_CELL_R: f32 = 2.0;
 
-/// Token 卡片排版规格：数字与单位的字号、数字字重、单位间隙、卡内
-/// 截断边距——测宽与绘制两侧同引
+/// Token card typography spec: font sizes of number and unit, number
+/// weight, unit gap, and in-card truncation inset — the measure and
+/// draw sides share this source
 const TOKEN_NUM_SIZE: f32 = 20.0;
 const TOKEN_NUM_WEIGHT: u16 = 700;
 const TOKEN_UNIT_SIZE: f32 = 11.0;
 const TOKEN_UNIT_GAP: f32 = 1.0;
 const TOKEN_CARD_INSET: f32 = 4.0;
 
-/// 能量条的待填区间序列（段序即绘制序）：数据段间未覆盖格位补
-/// 轨道空格段；颜色由调用侧配对——数据段用段色、空格段用轨道色。
+/// Pending-fill range sequence for the energy bar (segment order is the
+/// draw order): cell positions not covered between data segments get
+/// track gap segments; colors are paired by the caller — data segments
+/// use their segment color, gap segments use the track color.
 fn mcp_job_ranges(segs: &[(usize, usize, [f32; 4])]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut cursor = 0usize;
@@ -60,76 +63,154 @@ fn mcp_job_ranges(segs: &[(usize, usize, [f32; 4])]) -> Vec<(usize, usize)> {
     ranges
 }
 
-/// 图例徽标几何
+/// Legend badge geometry
 const MCP_BADGE_SIZE: f32 = 11.0;
 const MCP_SWATCH: f32 = 8.0;
 const MCP_SWATCH_GAP: f32 = 3.0;
 const MCP_BADGE_GAP: f32 = 6.0;
 
-/// 图例徽标
+/// Legend badge: swatch color and the prebuilt label layout — the
+/// over-width fallback layout is prebuilt alongside at cache build, so
+/// every frame path draws blocks and never re-measures
 struct McpBadge {
     color: [f32; 4],
-    text: String,
-    text_w: f32,
+    block: super::TextBlock,
 }
 
-/// MCP 构成区按 (快照时间, 内宽) 缓存的数据侧产物，命中时跳过排序、
-/// 分段与全部测宽；绘制按缓存分段逐格填圆角矩形。
+/// Data-side artifacts of the MCP composition section, cached by
+/// (snapshot time, inner width); a hit skips sorting, segmentation, and
+/// all width measuring; drawing fills one rounded rect per cell
+/// following the cached segments.
 pub(super) struct McpCompCache {
     key: chrono::DateTime<chrono::Local>,
     inner_w: f32,
-    segs: Vec<(usize, usize, [f32; 4])>,
+    /// Energy-bar fill sequence (gap-filled, colors already paired — data
+    /// segments keep their color, gaps take the track color): the draw
+    /// loop iterates straight through without rebuilding the range walk
+    /// or re-searching colors per frame.
+    ranges: Vec<(usize, usize, [f32; 4])>,
     badges: Vec<McpBadge>,
     shown: usize,
-    plus_w: f32,
+    /// Truncated first-badge label for the over-width fallback
+    /// (shown == 0): the largest tool stays visible as ellipsized text
+    fallback: super::TextBlock,
+    plus: super::TextBlock,
 }
 
-/// 主视图轮询稳定文本的帧缓存：跑马灯 30fps 全窗重绘期间不重建
-/// 顶栏副标题、行明细、百分比与余额串；倒计时行随秒变化，
-/// 按整秒独立缓存。标题缓存与快照无关，放 Renderer 侧。
+/// Frame cache of poll-stable text in the main view: text is held as
+/// prebuilt layout blocks, so zero layouts are created during the
+/// marquee's 30fps full-window repaints; countdown rows change per
+/// second and the footer per minute, each rebuilt independently. The
+/// title cache is snapshot-independent and lives on the Renderer side.
 pub(super) struct MainTexts {
-    /// (快照时间, 语言)：任一变化整缓存重建
-    key: (chrono::DateTime<chrono::Local>, crate::ui::i18n::Lang),
-    /// 顶栏副标题（版本 · 等级），缺则 None
-    meta: Option<String>,
-    /// 指标行文本，按绘制序（在场桶序）
+    /// (snapshot time, language, bucket discriminants): any change
+    /// rebuilds the whole cache. The discriminant sequence — not just a
+    /// count — guards a future snapshot-reuse path that copies a
+    /// timestamp with a different bucket set: same count with reordered
+    /// or substituted buckets would otherwise index the cached rows into
+    /// the wrong labels.
+    key: (
+        chrono::DateTime<chrono::Local>,
+        crate::ui::i18n::Lang,
+        Vec<u8>,
+    ),
+    /// Top bar subtitle (version · tier); None when absent
+    meta: Option<super::TextBlock>,
+    /// Metric row texts, in draw order (present bucket order)
     rows: Vec<RowTexts>,
-    /// 余额行整串
-    balance: Option<String>,
-    /// 倒计时行的缓存秒：秒推进才重建各行 reset 分量
+    /// Balance row
+    balance: Option<super::TextBlock>,
+    /// Full footer string (same source as the static footer); the swap
+    /// animation origin shares it via cached_footer
+    pub(super) footer_text: String,
+    /// Footer text block; the swap animation takes it via
+    /// take_footer_block as the origin
+    pub(super) footer: super::TextBlock,
+    /// Cached second for countdown rows: each row's reset part is
+    /// rebuilt only when the second advances
     resets_at: i64,
+    /// Footer cache key: rebuilt only when the minute advances
+    footer_at: i64,
 }
 
-/// 指标行文本：明细与百分比轮询稳定，倒计时随秒推进
+/// Metric row texts: detail and percent are poll-stable; the countdown
+/// advances per second
 struct RowTexts {
-    detail: Option<String>,
-    percent: String,
-    reset: Option<String>,
+    detail: Option<super::TextBlock>,
+    percent: super::TextBlock,
+    reset: Option<super::TextBlock>,
 }
 
-/// Token 卡片按快照时间缓存的排版产物：文本与测宽随轮询变，
-/// 动画帧不重算
+/// Bucket discriminant sequence of a snapshot: MainTexts' cache key
+/// compares the ordered variant tags, not just a count — a same-count
+/// substitution or reorder must rebuild rather than index rows into the
+/// wrong labels.
+fn bucket_tags(snap: &crate::api::UsageSnapshot) -> Vec<u8> {
+    snap.present_buckets().map(bucket_tag).collect()
+}
+
+fn bucket_tag(b: crate::api::PresentBucket<'_>) -> u8 {
+    match b {
+        crate::api::PresentBucket::FiveHour(_) => 0,
+        crate::api::PresentBucket::Weekly(_) => 1,
+        crate::api::PresentBucket::Mcp(_) => 2,
+    }
+}
+
+/// Ordered bucket-tag comparison without materializing: short-circuits
+/// on the first mismatch, so cache-hit frames allocate nothing.
+fn buckets_match(cached: &[u8], snap: &crate::api::UsageSnapshot) -> bool {
+    let mut cached = cached.iter().copied();
+    for b in snap.present_buckets() {
+        if cached.next() != Some(bucket_tag(b)) {
+            return false;
+        }
+    }
+    cached.next().is_none()
+}
+
+/// Layout cache of the main view's constant labels: section titles,
+/// bucket labels, Token card labels, and the peak badge copy; the content
+/// only changes with language
+pub(super) struct MainLabels {
+    usage: super::TextBlock,
+    tokens: super::TextBlock,
+    balance: super::TextBlock,
+    five_hour: super::TextBlock,
+    weekly: super::TextBlock,
+    mcp: super::TextBlock,
+    today: super::TextBlock,
+    week: super::TextBlock,
+    month: super::TextBlock,
+    peak_badge: super::TextBlock,
+}
+
+/// Typography artifacts of the Token cards, cached by snapshot time:
+/// layout blocks change with polls and are not recomputed on animation
+/// frames
 pub(super) struct TokenCells {
     key: chrono::DateTime<chrono::Local>,
     cells: [TokenCell; TOKEN_LEGS.len()],
 }
 
-/// 单卡排版产物：数字串、单位与各自测宽
+/// Single-card typography artifacts: prebuilt layouts for the number
+/// and unit
 struct TokenCell {
-    num: String,
-    unit: &'static str,
-    nw: f32,
-    uw: f32,
+    num: super::TextBlock,
+    unit: super::TextBlock,
 }
 
 impl Renderer {
-    /// 重建主文本缓存：轮询稳定部分（副标题、行明细、百分比、余额）
-    /// 全量产，倒计时行取当秒初值。
-    fn build_main_texts(
+    /// Rebuild the main text cache: the poll-stable parts (subtitle, row
+    /// details, percentages, balance) are fully prebuilt as layouts;
+    /// countdown rows take their initial value for the current second.
+    unsafe fn build_main_texts(
+        &mut self,
         s: &Strings,
         snap: &crate::api::UsageSnapshot,
         lang: crate::ui::i18n::Lang,
         now_sec: i64,
+        now_ms: i64,
     ) -> MainTexts {
         let v = snap.plan_version.label();
         let tier = snap.tier_label();
@@ -139,6 +220,7 @@ impl Renderer {
             (true, false) => Some(tier.to_string()),
             (true, true) => None,
         };
+        let meta = meta.map(|m| super::TextBlock::new(self.make_layout(&m, 12.0, 400, false)));
         let used_of = |cur: f64, tot: f64| {
             s.used_of
                 .replace("{cur}", &fmt::compact_number(cur))
@@ -160,8 +242,9 @@ impl Renderer {
                 ),
             };
             rows.push(RowTexts {
-                detail,
-                percent,
+                detail: detail
+                    .map(|d| super::TextBlock::new(self.make_layout(&d, 11.0, 400, false))),
+                percent: super::TextBlock::new(self.make_layout(&percent, 14.0, 600, true)),
                 reset: None,
             });
         }
@@ -173,20 +256,29 @@ impl Renderer {
             };
             format!("¥{amount}")
         });
+        let balance = balance.map(|l| super::TextBlock::new(self.make_layout(&l, 12.0, 500, true)));
+        let footer = fmt::updated_text(s, lang, snap.queried_at);
+        let footer_block = self.make_footer_block(&footer);
         let mut texts = MainTexts {
-            key: (snap.queried_at, lang),
+            key: (snap.queried_at, lang, bucket_tags(snap)),
             meta,
             rows,
             balance,
+            footer_text: footer,
+            footer: footer_block,
             resets_at: now_sec,
+            footer_at: footer_key(now_ms, snap.queried_at.timestamp_millis()),
         };
-        Self::refresh_resets(&mut texts.rows, s, snap, lang);
+        self.refresh_resets(&mut texts.rows, s, snap, lang);
         texts
     }
 
-    /// 倒计时行重建：秒推进触发，只写各行 reset。行序与行集同引
-    /// present_buckets，构建与重建天然对齐。
-    fn refresh_resets(
+    /// Countdown row rebuild: triggered when the second advances; only
+    /// the reset layout of each row is rebuilt. Row order and row set
+    /// share present_buckets, so build and rebuild stay aligned by
+    /// construction.
+    unsafe fn refresh_resets(
+        &mut self,
         rows: &mut [RowTexts],
         s: &Strings,
         snap: &crate::api::UsageSnapshot,
@@ -196,11 +288,33 @@ impl Renderer {
             r.map(|r| s.resets_line.replace("{t}", &fmt::countdown(r, lang)))
         };
         for (row, b) in rows.iter_mut().zip(snap.present_buckets()) {
-            row.reset = line(b.resets_at());
+            row.reset = line(b.resets_at())
+                .map(|l| super::TextBlock::new(self.make_layout(&l, 11.0, 400, false)));
         }
     }
 
-    /// 主视图：顶栏常驻；主体按「无快照、有错误、有数据」三态渲染
+    /// Constant label layout set: the whole set is rebuilt on language
+    /// change
+    unsafe fn build_main_labels(&mut self, s: &Strings) -> MainLabels {
+        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
+            super::TextBlock::new(r.make_layout(t, size, weight, false))
+        };
+        MainLabels {
+            usage: blk(self, s.usage_section, 12.0, 600),
+            tokens: blk(self, s.token_usage_section, 12.0, 600),
+            balance: blk(self, s.balance_label, 12.0, 600),
+            five_hour: blk(self, s.five_hour, 14.0, 400),
+            weekly: blk(self, s.weekly, 14.0, 400),
+            mcp: blk(self, s.mcp_tools, 14.0, 400),
+            today: blk(self, s.today_tokens, 10.0, 400),
+            week: blk(self, s.week_tokens, 10.0, 400),
+            month: blk(self, s.month_tokens, 10.0, 400),
+            peak_badge: blk(self, s.peak_badge, 12.0, 600),
+        }
+    }
+
+    /// Main view: the top bar is always present; the body renders as
+    /// three states: "no snapshot, error present, data present"
     #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn draw_main(
         &mut self,
@@ -216,66 +330,484 @@ impl Renderer {
         let pad = layout::CONTENT_PAD;
         let mut y = dy + layout::MAIN_TOP_PAD;
         let snap = model.snapshot;
-        // 主文本帧缓存（单一出口，函数尾放回）：跑马灯 30fps 全窗
-        // 重绘期间轮询稳定串零重建；倒计时行按整秒独立重建。
+        // Frame cache for main texts and constant labels (single exit,
+        // put back at function end): zero layout creation during the
+        // marquee's 30fps full-window repaints; countdown rows rebuild
+        // independently per whole second.
         let mut texts = self.main_texts.take();
+        let mut labels_opt = self.main_labels.take();
+        if labels_opt.as_ref().is_none_or(|(l, _)| *l != model.lang) {
+            labels_opt = Some((model.lang, self.build_main_labels(s)));
+        }
+        let labels = labels_opt
+            .as_ref()
+            .map(|(_, ls)| ls)
+            .expect("labels 上方必已置");
         if let Some(snap) = snap {
-            let now_sec = chrono::Utc::now().timestamp();
-            if texts
-                .as_ref()
-                .is_none_or(|t| t.key != (snap.queried_at, model.lang))
-            {
-                texts = Some(Self::build_main_texts(s, snap, model.lang, now_sec));
-            } else if let Some(t) = texts.as_mut()
-                && t.resets_at != now_sec
-            {
-                t.resets_at = now_sec;
-                Self::refresh_resets(&mut t.rows, s, snap, model.lang);
+            let now = chrono::Utc::now();
+            let (now_sec, now_ms) = (now.timestamp(), now.timestamp_millis());
+            if texts.as_ref().is_none_or(|t| {
+                t.key.0 != snap.queried_at
+                    || t.key.1 != model.lang
+                    || !buckets_match(&t.key.2, snap)
+            }) {
+                texts = Some(self.build_main_texts(s, snap, model.lang, now_sec, now_ms));
+            } else if let Some(t) = texts.as_mut() {
+                if t.resets_at != now_sec {
+                    t.resets_at = now_sec;
+                    self.refresh_resets(&mut t.rows, s, snap, model.lang);
+                }
+                let fk = footer_key(now_ms, snap.queried_at.timestamp_millis());
+                if t.footer_at != fk {
+                    t.footer_at = fk;
+                    let text = fmt::updated_text(s, model.lang, snap.queried_at);
+                    t.footer = self.make_footer_block(&text);
+                    t.footer_text = text;
+                }
             }
         } else {
-            // 无快照即换账号或退场：缓存连同旧账号的副标题一并作废，
-            // 加载态与错误卡不得残留上家内容。
+            // No snapshot means account switch or teardown: invalidate
+            // the cache along with the previous account's subtitle; the
+            // loading state and the error card must not retain the
+            // previous account's content.
             texts = None;
         }
-        // ── 顶栏：账号名 + 套餐副标题 ──
+        // ── Top bar: account name + plan subtitle ──
+        let meta = texts.as_ref().and_then(|t| t.meta.as_ref());
+        y = self.topbar(target, model, meta, pad, w, y, alpha);
+
+        // ── Body three states: empty/loading and the error card go to
+        // empty_or_error_card; the data section is the _ arm ──
+        match model.error {
+            // No snapshot: configured = loading, unconfigured = onboarding
+            // empty state.
+            None if snap.is_none() => {
+                self.empty_or_error_card(target, model, None, pad, w, y, dy, h, alpha)
+            }
+            // Error without data: two-line error card — the title carries
+            // the category, the body carries the code and hint.
+            Some(e) if snap.is_none() => {
+                self.empty_or_error_card(target, model, Some(e), pad, w, y, dy, h, alpha)
+            }
+            // With data the data section is the body; when an error is
+            // also present, stale data still renders normally and the
+            // error is demoted to the footer.
+            _ => {
+                if let Some(snap) = snap {
+                    let ty = self.section_header(target, &labels.usage, pad, y, w, alpha, false);
+                    if crate::ui::peak::is_peak_now(model.peak_range) {
+                        self.peak_badge(target, &labels.peak_badge, ty, w, alpha);
+                    }
+                    y = ty + layout::MAIN_MASTHEAD_ROW_H;
+
+                    // Row texts come from the cache in draw order: row
+                    // order and row set share present_buckets, so an
+                    // out-of-bounds index exposes row-set drift between
+                    // the two sides.
+                    for (ri, b) in snap.present_buckets().enumerate() {
+                        let row = &texts.as_ref().expect("数据分支 texts 必建").rows[ri];
+                        // All text goes through MainTexts prebuilt
+                        // layouts; row drawing is down to label dispatch;
+                        // the MCP row's composition section is the sole
+                        // bucket-specific addition.
+                        let (label, used) = match &b {
+                            crate::api::PresentBucket::FiveHour(b) => {
+                                (&labels.five_hour, b.used_percent)
+                            }
+                            crate::api::PresentBucket::Weekly(b) => {
+                                (&labels.weekly, b.used_percent)
+                            }
+                            crate::api::PresentBucket::Mcp(m) => (&labels.mcp, m.used_percent),
+                        };
+                        y = self.metric_row(target, label, row, used, y, w, alpha);
+                        if let crate::api::PresentBucket::Mcp(m) = &b
+                            // The composition section's display predicate
+                            // has the single source has_mcp_details,
+                            // shared with the height side.
+                            && snap.has_mcp_details()
+                        {
+                            y = self.mcp_composition(target, m, snap.queried_at, y, w, alpha);
+                        }
+                    }
+
+                    if let Some(ts) = &snap.token_stats {
+                        y += layout::MAIN_SECTION_GAP;
+                        let ty =
+                            self.section_header(target, &labels.tokens, pad, y, w, alpha, true);
+                        y = self.token_section(target, labels, ts, snap.queried_at, ty, alpha);
+                    }
+
+                    if let Some(t) = texts.as_ref().filter(|_| snap.balance.is_some()) {
+                        y += layout::MAIN_SECTION_GAP;
+                        let ty =
+                            self.section_header(target, &labels.balance, pad, y, w, alpha, true);
+                        if let Some(b) = t.balance.as_ref() {
+                            self.draw_block_r(
+                                target,
+                                b,
+                                w - pad,
+                                ty,
+                                self.theme.text_primary,
+                                alpha,
+                            );
+                        }
+                    }
+                }
+                // The footer is pinned to the bottom; when the viewport
+                // is squeezed too short for the content, it pins to the
+                // content bottom so it does not overlap the data section.
+                let footer_y = dy + h.max(content_h) - layout::MAIN_FOOTER_H;
+                // The error summary and the stale snapshot appear as a
+                // pair: the prefix segment reports the data age; without
+                // a snapshot no summary is shown.
+                if let (Some(e), Some(snap)) = (model.error, snap) {
+                    let avail = w - pad * 2.0;
+                    let anim_on = self.animations_on();
+                    // The cache key is a full-value tuple of the content
+                    // (snapshot time first; identity across frames
+                    // short-circuits): any change in the error payload,
+                    // visible width, language, or animation toggle
+                    // rebuilds it; on a hit there are zero measurements
+                    // and zero allocations, with no intermediate Display
+                    // strings. The hit test compares by reference; the
+                    // owned clone happens only on the rebuild path — the
+                    // marquee runs this at ~30fps.
+                    let cached = self.anim.error_scroll.as_ref().is_some_and(|sc| {
+                        sc.key.0 == snap.queried_at
+                            && &sc.key.1 == e
+                            && sc.key.2 == avail.to_bits()
+                            && sc.key.3 == model.lang
+                            && sc.key.4 == anim_on
+                    });
+                    if !cached {
+                        let key = (
+                            snap.queried_at,
+                            e.clone(),
+                            avail.to_bits(),
+                            model.lang,
+                            anim_on,
+                        );
+                        let head = s
+                            .data_as_of
+                            .replace("{t}", &snap.queried_at.format("%H:%M").to_string());
+                        let tail = footer_error_tail(s, e);
+                        let cat = category_label(s, e.category()).to_string();
+                        // Layouts are prebuilt: scroll frames reuse them
+                        // via direct drawing instead of rebuilding COM
+                        // layouts per frame; widths are read from the
+                        // layouts, and font size/weight share the same
+                        // source as direct drawing so they are written in
+                        // one place only. Block-boundary brackets are
+                        // bold and content is regular: the three blocks
+                        // share one pair of bracket layouts.
+                        let size = ERROR_SCROLL_SIZE;
+                        let bw = ERROR_SCROLL_BRACKET_WEIGHT;
+                        let bracket = ScrollBlock::new(self.make_layout("[", size, bw, false));
+                        let bracket_end = ScrollBlock::new(self.make_layout("] ", size, bw, false));
+                        let mut blocks = [
+                            ScrollBlock::new(self.make_layout(&head, size, 400, false)),
+                            ScrollBlock::new(self.make_layout(&cat, size, 400, false)),
+                            ScrollBlock::new(self.make_layout(&tail, size, 400, false)),
+                        ];
+                        let pair = bracket.w + bracket_end.w;
+                        let over = belt_width(&blocks.each_ref().map(|b| b.w), pair) > avail;
+                        let scrolling = over && anim_on;
+                        if over && !anim_on {
+                            // Over-width with animations disabled does
+                            // not scroll: each block is ellipsized into
+                            // a static string — the prefix and category
+                            // keep the full string, the tail segment is
+                            // truncated with an ellipsis; all go through
+                            // the layout path, and widths reuse the
+                            // values computed by truncation.
+                            let rest0 = (avail - 3.0 * pair).max(0.0);
+                            let (hd, hw) = self.ellipsize(&head, size, rest0, 400, false);
+                            let rest = (rest0 - hw).max(0.0);
+                            let (cd, cw) = self.ellipsize(&cat, size, rest, 400, false);
+                            let rest = (rest - cw).max(0.0);
+                            let (td, tw) = self.ellipsize(&tail, size, rest, 400, false);
+                            // Hand-built instead of ScrollBlock::new: the
+                            // width must be the truncation-budget value
+                            // (the constructor would recompute it from the
+                            // truncated layout and drift from the reserved
+                            // space); h is unread — marquee consumers use
+                            // .w only.
+                            let trunc = |s: &str, w: f32| ScrollBlock {
+                                layout: self.make_layout(s, size, 400, false),
+                                w,
+                                h: 0.0,
+                            };
+                            blocks = [trunc(&hd, hw), trunc(&cd, cw), trunc(&td, tw)];
+                        }
+                        self.anim.error_scroll = Some(ErrorScroll {
+                            key,
+                            blocks,
+                            bracket,
+                            bracket_end,
+                            scrolling,
+                            frozen: false,
+                            offset: 0.0,
+                            resume_at: std::time::Instant::now() + ERROR_SCROLL_PAUSE,
+                            // last aligns with the resume point: the
+                            // initial pause does not count as offset.
+                            last: std::time::Instant::now() + ERROR_SCROLL_PAUSE,
+                        });
+                        // The wall clock is handled uniformly at WM_PAINT
+                        // wrap-up: the outer layer of the render frame
+                        // holds the App reference, and re-taking the
+                        // reference would invalidate it.
+                    }
+                    // Summary clip region: left edge at pad, spanning the
+                    // full width; the height is pinned to the
+                    // section-height single source.
+                    let clip = D2D_RECT_F {
+                        left: pad,
+                        top: footer_y,
+                        right: pad + avail,
+                        bottom: footer_y + layout::MAIN_FOOTER_H,
+                    };
+                    target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                    // Take out the marquee state: drawing references the
+                    // cached layouts and truncation artifacts directly
+                    // throughout, with zero clones and zero allocations
+                    // within the frame; single exit, put back at function
+                    // end.
+                    let mut sc_taken = self.anim.error_scroll.take();
+                    if let Some(sc) = sc_taken.as_mut() {
+                        // Direct-draw path (scrolling, static, and
+                        // truncated share it): one brush of the same
+                        // color and alpha is shared throughout.
+                        let brush = self.brush(target, self.theme.text_secondary, alpha);
+                        let mut draw_pair = |x: f32| {
+                            let mut bx = x;
+                            for b in sc.blocks.iter() {
+                                // Empty blocks are skipped: they take
+                                // part in neither advancement nor
+                                // drawing, leaving no trailing blank in
+                                // the period; blocks whose truncation
+                                // budget ran out have zero width and are
+                                // skipped the same way.
+                                if b.w <= 0.0 {
+                                    continue;
+                                }
+                                if let Some(l) = sc.bracket.layout.as_ref() {
+                                    self.draw_layout(target, l, bx, footer_y + 6.0, &brush, false);
+                                }
+                                if let Some(l) = b.layout.as_ref() {
+                                    self.draw_layout(
+                                        target,
+                                        l,
+                                        bx + sc.bracket.w,
+                                        footer_y + 6.0,
+                                        &brush,
+                                        false,
+                                    );
+                                }
+                                let end_x = bx + sc.bracket.w + b.w;
+                                if let Some(l) = sc.bracket_end.layout.as_ref() {
+                                    self.draw_layout(
+                                        target,
+                                        l,
+                                        end_x,
+                                        footer_y + 6.0,
+                                        &brush,
+                                        false,
+                                    );
+                                }
+                                bx = end_x + sc.bracket_end.w;
+                            }
+                        };
+                        if sc.scrolling {
+                            // Conveyor tiling: two copies of the text
+                            // join at the period, exiting left and
+                            // entering right in a seamless loop.
+                            let period = sc.total_w();
+                            let mut x = pad - sc.offset;
+                            while x < pad + avail {
+                                draw_pair(x);
+                                x += period;
+                            }
+                        } else {
+                            // Not over-width, or settled after
+                            // truncation: widths are already cached;
+                            // draw directly.
+                            draw_pair(pad);
+                        }
+                    }
+                    self.anim.error_scroll = sc_taken;
+                    target.PopAxisAlignedClip();
+                } else if self
+                    .anim
+                    .footer
+                    .as_ref()
+                    .is_some_and(|f| !f.tween.finished())
+                {
+                    // Pac-Man swap: take out the animation state; the
+                    // draw section's &mut self calls conflict with the
+                    // borrow; single exit, put back at the end of this
+                    // section.
+                    let mut fa_taken = self.anim.footer.take();
+                    if let Some(fa) = fa_taken.as_mut() {
+                        let (old_w, new_w) = (fa.old.w, fa.new.w);
+                        let tween = fa.tween;
+                        let old_home = w / 2.0 - old_w / 2.0;
+                        let new_home = w / 2.0 - new_w / 2.0;
+                        let raw = tween.progress();
+                        let travel = w + 2.0 * PACMAN_R + 8.0;
+                        let start = -PACMAN_R - 4.0;
+                        let eat_end = old_home + old_w + PACMAN_R;
+                        let frac_eat = ((eat_end - start) / travel).clamp(0.3, 0.85);
+                        let p = if raw < 0.72 {
+                            (raw / 0.72) * frac_eat
+                        } else {
+                            let t = (raw - 0.72) / 0.28;
+                            frac_eat + t * t * (1.0 - frac_eat)
+                        };
+                        let cy = footer_y + 16.5;
+                        let cx = start + p * travel;
+                        let clip = D2D_RECT_F {
+                            left: cx,
+                            top: footer_y,
+                            right: w,
+                            bottom: footer_y + layout::MAIN_FOOTER_H,
+                        };
+                        unsafe {
+                            target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                        }
+                        self.draw_block(
+                            target,
+                            &fa.old,
+                            old_home,
+                            footer_y + 8.0,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
+                        unsafe {
+                            target.PopAxisAlignedClip();
+                        }
+                        self.pacman_at(
+                            target,
+                            cx,
+                            cy,
+                            super::widgets::PACMAN_R,
+                            raw,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
+                        let bite = raw * 8.0;
+                        let (phase, idx) = (bite.fract(), bite.floor() as u32);
+                        let age = (phase - 0.8 + 1.0) % 1.0;
+                        if p < frac_eat && age < 0.5 {
+                            let t = age / 0.5;
+                            let fall = t * t * 14.0;
+                            // Alpha is quantized to 32 levels: levels
+                            // are reused across rounds, so the brush
+                            // cache does not grow with the animation.
+                            let a = (alpha * (1.0 - t * t) * 32.0).round() / 32.0;
+                            let cb = self.brush(target, self.theme.text_tertiary, a);
+                            let born = if phase >= 0.8 {
+                                idx
+                            } else {
+                                idx.saturating_sub(1)
+                            };
+                            let mid = ((born * 31) % 5) as f32 - 2.0;
+                            for (base, dir) in
+                                [(mid, 0.0f32), (mid - 3.0, -1.0f32), (mid + 3.5, 1.0f32)]
+                            {
+                                let dx = base + dir * t * 5.0;
+                                let cr = D2D_RECT_F {
+                                    left: cx + PACMAN_R * 0.45 + dx,
+                                    top: cy + 3.0 + fall,
+                                    right: cx + PACMAN_R * 0.45 + dx + 4.2,
+                                    bottom: cy + 3.0 + fall + 4.2,
+                                };
+                                target.FillRectangle(&cr, &cb);
+                            }
+                        }
+                        let nx = (cx - PACMAN_R - new_w - 10.0).min(new_home);
+                        self.draw_block(
+                            target,
+                            &fa.new,
+                            nx,
+                            footer_y + 8.0,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
+                    }
+                    self.anim.footer = fa_taken;
+                } else if model.snapshot.is_some() {
+                    // The footer goes through MainTexts' minute-granularity
+                    // cache: marquee and animation frames cause zero
+                    // rebuilds and zero layout creation.
+                    if let Some(t) = texts.as_ref() {
+                        self.draw_block_c(
+                            target,
+                            &t.footer,
+                            w / 2.0,
+                            footer_y + 8.0,
+                            self.theme.text_tertiary,
+                            alpha,
+                        );
+                    }
+                }
+            }
+        }
+        // Frame caches are put back unconditionally: single exit; the
+        // snapshot-absent arm returns them as-is.
+        self.main_texts = texts;
+        self.main_labels = labels_opt;
+    }
+
+    /// Top bar: logo, account name and plan subtitle, switch chevron,
+    /// and the refresh and settings buttons. Returns the top bar's
+    /// bottom y; the title truncation cache key is (source string,
+    /// available width), with zero builds during marquee repaints
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn topbar(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        model: &PanelModel,
+        meta: Option<&super::TextBlock>,
+        pad: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
         let title = model.account.map(|a| a.name).unwrap_or("Quotify");
         let (logo_size, logo_y) = (38.0, y + 7.0);
         self.logo(target, pad, logo_y, logo_size, alpha);
         let tx = pad + logo_size + 10.0;
         let chevron_w = if model.accounts_count > 1 { 18.0 } else { 0.0 };
         let tw = w - tx - 88.0 - chevron_w;
-        // 标题截断缓存与快照无关：键为 (源串, 可用宽)，跑马灯重绘期
-        // 零文本构建；单一出口，函数尾放回。
+        // The title truncation cache is snapshot-independent: the key is
+        // (source string, available width) and the value is a prebuilt
+        // layout; zero text builds and zero layout creation during
+        // marquee repaints; single exit, put back at function end.
         let mut title_cache = self.title_cache.take();
         if title_cache
             .as_ref()
             .is_none_or(|(k, _)| k.0 != title || k.1 != tw)
         {
-            let (d, dw) = self.ellipsize(title, 16.0, tw, 500, false);
-            title_cache = Some(((title.to_string(), tw), (d, dw)));
+            let (d, _) = self.ellipsize(title, 16.0, tw, 500, false);
+            let tb = super::TextBlock::new(self.make_layout(&d, 16.0, 500, false));
+            title_cache = Some(((title.to_string(), tw), tb));
         }
-        let (title_disp, title_disp_w) = title_cache
-            .as_ref()
-            .map(|(_, (d, w))| (d.as_str(), *w))
-            .unwrap();
-        let meta = texts.as_ref().and_then(|t| t.meta.as_deref());
+        let title_block = &title_cache.as_ref().expect("title_cache 上方必已置").1;
         let block_h = if meta.is_some() { 39.0 } else { 22.0 };
         let block_top = y + 26.0 - block_h / 2.0;
-        self.text(
+        self.draw_block(
             target,
-            title_disp,
+            title_block,
             tx,
             block_top,
-            tw,
-            22.0,
-            16.0,
-            500,
             self.theme.text_primary,
             alpha,
         );
         if model.accounts_count > 1 {
-            // chevron 紧跟标题尾：宽度直接用 ellipsize 的返回值，不再复测。
-            let ax = tx + title_disp_w + 6.0;
+            // The chevron sits right after the title tail: the position
+            // uses the layout block's current width directly, with no
+            // re-measure.
+            let ax = tx + title_block.w + 6.0;
             self.chevron(
                 target,
                 ax,
@@ -295,18 +827,26 @@ impl Renderer {
             ));
         }
         if let Some(m) = meta {
-            self.text(
+            // The subtitle block comes from an unbounded prebuilt layout:
+            // an unrecognized plan label can run free-form long, so clip to
+            // the title's width budget — it must never overdraw the chevron
+            // or the buttons. Real copy is far shorter and never clipped.
+            let clip = D2D_RECT_F {
+                left: tx,
+                top: block_top + 22.0,
+                right: tx + tw,
+                bottom: block_top + 22.0 + m.h.max(14.0),
+            };
+            target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            self.draw_block(
                 target,
                 m,
                 tx + 1.0,
                 block_top + 22.0,
-                tw,
-                17.0,
-                12.0,
-                400,
                 self.theme.text_secondary,
                 alpha,
             );
+            target.PopAxisAlignedClip();
         }
         let btn_r = 16.0;
         let refresh_cx = w - pad - btn_r - 30.0;
@@ -314,12 +854,34 @@ impl Renderer {
         let btn_cy = y + 26.0;
         self.icon_button(target, Hit::Refresh, refresh_cx, btn_cy, self.anim.spin);
         self.sliders(target, Hit::Settings, settings_cx, btn_cy, btn_r);
-        y += layout::MAIN_TOPBAR_H;
+        self.title_cache = title_cache;
+        y + layout::MAIN_TOPBAR_H
+    }
 
-        // ── 主体三态：空/加载、错误卡、数据区 ──
-        match (snap, model.error) {
-            // 无快照：已配置=加载中，未配置=引导空态。
-            (None, None) => {
+    /// Empty state and error card: the body when there is no snapshot.
+    /// The configured-loading / unconfigured-onboarding empty states
+    /// render centered; errors use the two-line card (title carries the
+    /// category, body carries the code and hint).
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn empty_or_error_card(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        model: &PanelModel,
+        error: Option<&crate::api::FetchError>,
+        pad: f32,
+        w: f32,
+        y: f32,
+        dy: f32,
+        h: f32,
+        alpha: f32,
+    ) {
+        // The strings reference comes through model — the same source the
+        // rest of the body reads.
+        let s = model.strings;
+        match error {
+            // No snapshot: configured = loading, unconfigured = onboarding
+            // empty state.
+            None => {
                 let configured = model.account.is_some();
                 let body_top = y + 6.0;
                 let body_h = (dy + h - 16.0) - body_top;
@@ -371,10 +933,11 @@ impl Renderer {
                     );
                 }
             }
-            // 无数据有错误：错误卡两行制——标题加大类、正文放码与提示。
-            (None, Some(e)) => {
+            // Error without data: two-line error card — the title carries
+            // the category, the body carries the code and hint.
+            Some(e) => {
                 let title = category_label(s, e.category());
-                let body = error_card_body(s, e);
+                let body = self.cached_error_body(s, e, model.lang);
                 let body_top = y + 10.0;
                 let body_h = (dy + h - 16.0) - body_top;
                 let has_body = !body.is_empty();
@@ -431,8 +994,9 @@ impl Renderer {
                         right: w - pad - 12.0,
                         bottom: card_top + 78.0,
                     };
-                    // 自动换行至多两行：单行文案照常一行，长文第二行
-                    // 末按矩形截断。
+                    // Word-wrap up to two lines: single-line copy still
+                    // takes one line; for long text the end of the
+                    // second line is clipped by the rect.
                     self.text_wrapped(
                         target,
                         &body,
@@ -446,392 +1010,24 @@ impl Renderer {
                     );
                 }
             }
-            // 有数据即以数据区为主体；同时带错误时旧数据照常展示，错误降级页脚。
-            _ => {
-                if let Some(snap) = snap {
-                    let ty = self.section_header(
-                        target,
-                        s.usage_section,
-                        pad,
-                        y,
-                        w,
-                        w - pad * 2.0 - 7.0,
-                        alpha,
-                        false,
-                    );
-                    if crate::ui::peak::is_peak_now(model.peak_range) {
-                        self.peak_badge(target, ty, w, alpha, s);
-                    }
-                    y = ty + layout::MAIN_MASTHEAD_ROW_H;
-
-                    // 行文本按绘制序取缓存：行序与行集同引 present_buckets，
-                    // 索引越界即暴露两侧行集漂移。
-                    for (ri, b) in snap.present_buckets().enumerate() {
-                        let row = &texts.as_ref().unwrap().rows[ri];
-                        match b {
-                            crate::api::PresentBucket::FiveHour(b) => {
-                                y = self.metric_row(
-                                    target,
-                                    s.five_hour,
-                                    b.used_percent,
-                                    row.detail.as_deref(),
-                                    &row.percent,
-                                    row.reset.as_deref(),
-                                    y,
-                                    w,
-                                    alpha,
-                                );
-                            }
-                            crate::api::PresentBucket::Weekly(b) => {
-                                y = self.metric_row(
-                                    target,
-                                    s.weekly,
-                                    b.used_percent,
-                                    row.detail.as_deref(),
-                                    &row.percent,
-                                    row.reset.as_deref(),
-                                    y,
-                                    w,
-                                    alpha,
-                                );
-                            }
-                            crate::api::PresentBucket::Mcp(m) => {
-                                y = self.metric_row(
-                                    target,
-                                    s.mcp_tools,
-                                    m.used_percent,
-                                    row.detail.as_deref(),
-                                    &row.percent,
-                                    row.reset.as_deref(),
-                                    y,
-                                    w,
-                                    alpha,
-                                );
-                                // 构成区陈列判定单源于 has_mcp_details，与高度侧同引。
-                                if snap.has_mcp_details() {
-                                    y = self.mcp_composition(
-                                        target,
-                                        m,
-                                        snap.queried_at,
-                                        y,
-                                        w,
-                                        alpha,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if let Some(ts) = &snap.token_stats {
-                        y += layout::MAIN_SECTION_GAP;
-                        let ty = self.section_header(
-                            target,
-                            s.token_usage_section,
-                            pad,
-                            y,
-                            w,
-                            w - pad * 2.0 - 7.0,
-                            alpha,
-                            true,
-                        );
-                        y = self.token_section(target, s, ts, snap.queried_at, ty, alpha);
-                    }
-
-                    if let (Some(_), Some(t)) = (&snap.balance, texts.as_ref()) {
-                        y += layout::MAIN_SECTION_GAP;
-                        let ty = self.section_header(
-                            target,
-                            s.balance_label,
-                            pad,
-                            y,
-                            w,
-                            140.0,
-                            alpha,
-                            true,
-                        );
-                        if let Some(line) = t.balance.as_deref() {
-                            self.text_mono_r(
-                                target,
-                                line,
-                                w - pad - 140.0,
-                                ty,
-                                140.0,
-                                layout::MAIN_BALANCE_ROW_H,
-                                12.0,
-                                500,
-                                self.theme.text_primary,
-                                alpha,
-                            );
-                        }
-                    }
-                }
-                // 页脚钉底；视口被压矮时装不下内容，钉内容底免叠数据区。
-                let footer_y = dy + h.max(content_h) - layout::MAIN_FOOTER_H;
-                // 错误摘要与旧快照成对在场：前缀段报数据年龄，无快照
-                // 不出摘要。
-                if let (Some(e), Some(snap)) = (model.error, snap) {
-                    let avail = w - pad * 2.0;
-                    let anim_on = self.animations_on();
-                    // 缓存键是内容指纹：错误负载、快照时间、可视宽、语言
-                    // 与动效开关全入哈希，任一变化即重建；命中时零测量零
-                    // 分配，指纹直接哈希字段，无 Display 中间串。
-                    let key = {
-                        use std::hash::{Hash, Hasher};
-                        let mut h = std::hash::DefaultHasher::new();
-                        e.hash(&mut h);
-                        snap.queried_at.hash(&mut h);
-                        avail.to_bits().hash(&mut h);
-                        model.lang.hash(&mut h);
-                        anim_on.hash(&mut h);
-                        h.finish()
-                    };
-                    let cached = self
-                        .anim
-                        .error_scroll
-                        .as_ref()
-                        .is_some_and(|sc| sc.key == key);
-                    if !cached {
-                        let head = s
-                            .data_as_of
-                            .replace("{t}", &snap.queried_at.format("%H:%M").to_string());
-                        let tail = footer_error_tail(s, e);
-                        let cat = category_label(s, e.category()).to_string();
-                        // 布局预建：滚动帧直绘复用，不逐帧重建 COM 布局；
-                        // 宽度从布局读，字号字重与直绘同源只写一处。
-                        // 块界中括号加粗、内容常规：三块共享一对括号布局。
-                        let size = ERROR_SCROLL_SIZE;
-                        let bw = ERROR_SCROLL_BRACKET_WEIGHT;
-                        let bracket = ScrollBlock::new(self.make_layout("[", size, bw, false));
-                        let bracket_end = ScrollBlock::new(self.make_layout("] ", size, bw, false));
-                        let mut blocks = [
-                            ScrollBlock::new(self.make_layout(&head, size, 400, false)),
-                            ScrollBlock::new(self.make_layout(&cat, size, 400, false)),
-                            ScrollBlock::new(self.make_layout(&tail, size, 400, false)),
-                        ];
-                        let pair = bracket.w + bracket_end.w;
-                        let over = belt_width(&blocks.each_ref().map(|b| b.w), pair) > avail;
-                        let scrolling = over && anim_on;
-                        if over && !anim_on {
-                            // 减动效超宽不滚：逐块截断成静态串，前缀与
-                            // 大类全串，尾段截断加省略号；同走布局路径，
-                            // 宽沿用截断计算的值。
-                            let rest0 = (avail - 3.0 * pair).max(0.0);
-                            let (hd, hw) = self.ellipsize(&head, size, rest0, 400, false);
-                            let rest = (rest0 - hw).max(0.0);
-                            let (cd, cw) = self.ellipsize(&cat, size, rest, 400, false);
-                            let rest = (rest - cw).max(0.0);
-                            let (td, tw) = self.ellipsize(&tail, size, rest, 400, false);
-                            let trunc = |s: &str, w: f32| ScrollBlock {
-                                layout: self.make_layout(s, size, 400, false),
-                                w,
-                            };
-                            blocks = [trunc(&hd, hw), trunc(&cd, cw), trunc(&td, tw)];
-                        }
-                        self.anim.error_scroll = Some(ErrorScroll {
-                            key,
-                            blocks,
-                            bracket,
-                            bracket_end,
-                            scrolling,
-                            frozen: false,
-                            offset: 0.0,
-                            resume_at: std::time::Instant::now() + ERROR_SCROLL_PAUSE,
-                            // last 对齐恢复点：首个暂停不计入位移。
-                            last: std::time::Instant::now() + ERROR_SCROLL_PAUSE,
-                        });
-                        // 挂钟由 WM_PAINT 收尾统一处理：渲染帧外层持有
-                        // App 引用，重取引用会使其失效。
-                    }
-                    // 摘要可视区：左起 pad、占满全宽。
-                    let clip = D2D_RECT_F {
-                        left: pad,
-                        top: footer_y,
-                        right: pad + avail,
-                        bottom: footer_y + 34.0,
-                    };
-                    target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                    // take 出跑马灯状态：绘制全程直接引用缓存布局与截断
-                    // 产物，帧内零克隆零分配；单一出口，函数尾放回。
-                    let mut sc_taken = self.anim.error_scroll.take();
-                    if let Some(sc) = sc_taken.as_mut() {
-                        // 直绘路（滚动、静态与截断共线）：同色同透明度一把
-                        // 刷子全程共用。
-                        let brush = self.brush(target, self.theme.text_secondary, alpha);
-                        let mut draw_pair = |x: f32| {
-                            let mut bx = x;
-                            for b in sc.blocks.iter() {
-                                // 空块跳过：推进与绘制都不参与，周期无尾随空白；
-                                // 截断预算耗尽的块宽为零，同此跳过。
-                                if b.w <= 0.0 {
-                                    continue;
-                                }
-                                if let Some(l) = sc.bracket.layout.as_ref() {
-                                    self.draw_layout(target, l, bx, footer_y + 6.0, &brush);
-                                }
-                                if let Some(l) = b.layout.as_ref() {
-                                    self.draw_layout(
-                                        target,
-                                        l,
-                                        bx + sc.bracket.w,
-                                        footer_y + 6.0,
-                                        &brush,
-                                    );
-                                }
-                                let end_x = bx + sc.bracket.w + b.w;
-                                if let Some(l) = sc.bracket_end.layout.as_ref() {
-                                    self.draw_layout(target, l, end_x, footer_y + 6.0, &brush);
-                                }
-                                bx = end_x + sc.bracket_end.w;
-                            }
-                        };
-                        if sc.scrolling {
-                            // 传送带平铺：两份文本以周期相接，左出右进无缝循环。
-                            let period = sc.total_w();
-                            let mut x = pad - sc.offset;
-                            while x < pad + avail {
-                                draw_pair(x);
-                                x += period;
-                            }
-                        } else {
-                            // 不超宽或截断后落定：宽度已缓存，直接绘制。
-                            draw_pair(pad);
-                        }
-                    }
-                    self.anim.error_scroll = sc_taken;
-                    target.PopAxisAlignedClip();
-                } else if let Some(fa) = self.anim.footer.as_ref().filter(|f| !f.tween.finished()) {
-                    // 吃豆人换装
-                    let (old_text, new_text, tween) =
-                        (fa.old_text.clone(), fa.new_text.clone(), fa.tween);
-                    let (old_w, new_w) = (fa.old_w, fa.new_w);
-                    let old_home = w / 2.0 - old_w / 2.0;
-                    let new_home = w / 2.0 - new_w / 2.0;
-                    let raw = tween.progress();
-                    let travel = w + 2.0 * PACMAN_R + 8.0;
-                    let start = -PACMAN_R - 4.0;
-                    let eat_end = old_home + old_w + PACMAN_R;
-                    let frac_eat = ((eat_end - start) / travel).clamp(0.3, 0.85);
-                    let p = if raw < 0.72 {
-                        (raw / 0.72) * frac_eat
-                    } else {
-                        let t = (raw - 0.72) / 0.28;
-                        frac_eat + t * t * (1.0 - frac_eat)
-                    };
-                    let cy = footer_y + 16.5;
-                    let cx = start + p * travel;
-                    let clip = D2D_RECT_F {
-                        left: cx,
-                        top: footer_y,
-                        right: w,
-                        bottom: footer_y + 34.0,
-                    };
-                    unsafe {
-                        target.PushAxisAlignedClip(&clip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                    }
-                    self.text_aligned(
-                        target,
-                        &old_text,
-                        &D2D_RECT_F {
-                            left: old_home,
-                            top: footer_y + 8.0,
-                            right: old_home + old_w,
-                            bottom: footer_y + 25.0,
-                        },
-                        12.0,
-                        400,
-                        self.theme.text_tertiary,
-                        alpha,
-                        Align::Left,
-                        false,
-                    );
-                    unsafe {
-                        target.PopAxisAlignedClip();
-                    }
-                    self.pacman(target, cx, cy, raw, alpha);
-                    let bite = raw * 8.0;
-                    let (phase, idx) = (bite.fract(), bite.floor() as u32);
-                    let age = (phase - 0.8 + 1.0) % 1.0;
-                    if p < frac_eat && age < 0.5 {
-                        let t = age / 0.5;
-                        let fall = t * t * 14.0;
-                        // alpha 量化 32 档：档位跨轮复用，刷子缓存
-                        // 不随动画膨胀。
-                        let a = (alpha * (1.0 - t * t) * 32.0).round() / 32.0;
-                        let cb = self.brush(target, self.theme.text_tertiary, a);
-                        let born = if phase >= 0.8 {
-                            idx
-                        } else {
-                            idx.saturating_sub(1)
-                        };
-                        let mid = ((born * 31) % 5) as f32 - 2.0;
-                        for (base, dir) in
-                            [(mid, 0.0f32), (mid - 3.0, -1.0f32), (mid + 3.5, 1.0f32)]
-                        {
-                            let dx = base + dir * t * 5.0;
-                            let cr = D2D_RECT_F {
-                                left: cx + PACMAN_R * 0.45 + dx,
-                                top: cy + 3.0 + fall,
-                                right: cx + PACMAN_R * 0.45 + dx + 4.2,
-                                bottom: cy + 3.0 + fall + 4.2,
-                            };
-                            target.FillRectangle(&cr, &cb);
-                        }
-                    }
-                    let nx = (cx - PACMAN_R - new_w - 10.0).min(new_home);
-                    self.text_aligned(
-                        target,
-                        &new_text,
-                        &D2D_RECT_F {
-                            left: nx,
-                            top: footer_y + 8.0,
-                            right: nx + new_w,
-                            bottom: footer_y + 25.0,
-                        },
-                        12.0,
-                        400,
-                        self.theme.text_tertiary,
-                        alpha,
-                        Align::Left,
-                        false,
-                    );
-                } else if let Some(snap) = model.snapshot {
-                    let text = fmt::updated_text(s, model.lang, snap.queried_at);
-                    self.text_aligned(
-                        target,
-                        &text,
-                        &D2D_RECT_F {
-                            left: pad,
-                            top: footer_y + 8.0,
-                            right: w - pad,
-                            bottom: footer_y + 25.0,
-                        },
-                        12.0,
-                        400,
-                        self.theme.text_tertiary,
-                        alpha,
-                        Align::Center,
-                        false,
-                    );
-                }
-            }
         }
-        // 主文本与标题缓存无条件放回：单一出口，快照缺席臂原样归还。
-        self.main_texts = texts;
-        self.title_cache = title_cache;
     }
 
-    /// 数据段区块头：分隔线 + 强调条 + 标题；返回标题行顶 y，段内后续
-    /// 推进（usage 叠高峰徽标后走刊头行高、Token 接卡片、余额即文本
-    /// 行）由调用点自定。刊头用实线且低 2px 挂段起点，数据段虚线贴段起点
+    /// Data-section header: divider + accent bar + prebuilt-layout
+    /// title; returns the title row's top y. Advancement within the
+    /// section after it (usage goes through the masthead row height
+    /// after stacking the peak badge, Token continues with the cards,
+    /// balance is just a text row) is decided by the call site. The
+    /// masthead uses a solid line hung 2px below the section start;
+    /// data sections use a dashed line flush with the section start
     #[allow(clippy::too_many_arguments)]
     unsafe fn section_header(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: &super::TextBlock,
         pad: f32,
         y: f32,
         w: f32,
-        title_w: f32,
         alpha: f32,
         dashed: bool,
     ) -> f32 {
@@ -840,60 +1036,119 @@ impl Renderer {
         } else {
             self.divider(target, pad, y + 2.0, w - pad * 2.0, alpha);
         }
-        // 两种段的标题距段起点同为 12：刊头是段起点起算，数据段是分隔线起算。
+        // Both section kinds place the title 12 from the section start:
+        // for the masthead it is measured from the section start, for
+        // data sections from the divider.
         let ty = y + if dashed {
             layout::MAIN_SECTION_HEAD
         } else {
             layout::MAIN_MASTHEAD_RULE_GAP
         };
-        let bar = self.brush(target, self.theme.text_primary, alpha * 0.9);
-        // 柱子与文字同框垂直居中
-        target.FillRectangle(
-            &D2D_RECT_F {
-                left: pad,
-                top: ty + 2.0,
-                right: pad + 3.0,
-                bottom: ty + 15.0,
-            },
-            &bar,
-        );
-        self.text_aligned_vc(
-            target,
-            label,
-            &D2D_RECT_F {
-                left: pad + 7.0,
-                top: ty,
-                right: pad + 7.0 + title_w,
-                bottom: ty + 17.0,
-            },
-            12.0,
-            600,
-            self.theme.text_tertiary,
-            alpha,
-            Align::Left,
-            false,
-        );
+        self.accent_label(target, label, pad, ty, alpha);
         ty
     }
 
-    /// 指标行：标签 + 百分比 + 进度条，底行左倒计时右已用明细；文本
-    /// 串由 MainTexts 帧缓存预产，此处只绘制。返回下一行 y
+    /// Accent bar + directly drawn prebuilt-layout title; the row geometry
+    /// (inset, height) comes from widgets' ACCENT_INSET/ACCENT_ROW_H
+    /// single source, shared with settings' section_label, so header
+    /// tweaks cannot drift between the two views.
+    unsafe fn accent_label(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        label: &super::TextBlock,
+        x: f32,
+        y: f32,
+        alpha: f32,
+    ) {
+        self.fill_accent_bar(target, x, y, alpha);
+        if let Some(l) = label.layout.as_ref() {
+            let brush = self.brush(target, self.theme.text_tertiary, alpha);
+            let cy = y + (super::widgets::ACCENT_ROW_H - label.h) / 2.0;
+            self.draw_layout(
+                target,
+                l,
+                x + super::widgets::ACCENT_INSET,
+                cy,
+                &brush,
+                false,
+            );
+        }
+    }
+
+    /// Left-aligned direct drawing of a prebuilt layout
+    unsafe fn draw_block(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        b: &super::TextBlock,
+        x: f32,
+        y: f32,
+        color: [f32; 4],
+        alpha: f32,
+    ) {
+        self.draw_block_at(target, b, x, y, color, alpha, false);
+    }
+
+    /// Right-aligned direct drawing of a prebuilt layout; x is the right
+    /// edge
+    unsafe fn draw_block_r(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        b: &super::TextBlock,
+        right: f32,
+        y: f32,
+        color: [f32; 4],
+        alpha: f32,
+    ) {
+        self.draw_block_at(target, b, right - b.w, y, color, alpha, false);
+    }
+
+    /// Centered direct drawing of a prebuilt layout; x is the center
+    unsafe fn draw_block_c(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        b: &super::TextBlock,
+        cx: f32,
+        y: f32,
+        color: [f32; 4],
+        alpha: f32,
+    ) {
+        self.draw_block_at(target, b, cx - b.w / 2.0, y, color, alpha, false);
+    }
+
+    /// Left-aligned snap-disabled direct drawing of a prebuilt layout:
+    /// used by chain-advanced badges, whose spacing would be skewed by
+    /// snapping offsets
+    unsafe fn draw_block_nosnap(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        b: &super::TextBlock,
+        x: f32,
+        y: f32,
+        color: [f32; 4],
+        alpha: f32,
+    ) {
+        self.draw_block_at(target, b, x, y, color, alpha, true);
+    }
+
+    /// Metric row: label + percentage + progress bar, with the countdown
+    /// on the left and the used detail on the right of the bottom line;
+    /// all text goes through MainTexts prebuilt layouts and only drawing
+    /// happens here. Returns the next row's y
     #[allow(clippy::too_many_arguments)]
     unsafe fn metric_row(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: &super::TextBlock,
+        row: &RowTexts,
         used_percent: f64,
-        detail: Option<&str>,
-        pct: &str,
-        resets: Option<&str>,
         y: f32,
         w: f32,
         alpha: f32,
     ) -> f32 {
         let pad = layout::CONTENT_PAD;
-        // ≥90% 数值与进度条入危险色，阈值与托盘图标红档一致。
-        let critical = used_percent >= 90.0;
+        // Values and the progress bar turn danger-colored; the threshold
+        // shares the tray icon's red tier.
+        let critical = used_percent >= crate::ui::icon::CRITICAL_PCT;
         let (c_label, c_value, c_caption, c_track) = (
             self.theme.text_primary,
             if critical {
@@ -905,30 +1160,8 @@ impl Renderer {
             self.theme.track,
         );
 
-        self.text(
-            target,
-            label,
-            pad,
-            y + 2.0,
-            w - pad * 2.0 - 110.0,
-            19.0,
-            14.0,
-            400,
-            c_label,
-            alpha,
-        );
-        self.text_mono_r(
-            target,
-            pct,
-            w - pad - 100.0,
-            y + 1.0,
-            100.0,
-            19.0,
-            14.0,
-            600,
-            c_value,
-            alpha,
-        );
+        self.draw_block(target, label, pad, y + 2.0, c_label, alpha);
+        self.draw_block_r(target, &row.percent, w - pad, y + 1.0, c_value, alpha);
 
         let bar_h = 5.0;
         let bar_y = y + 22.0;
@@ -941,7 +1174,8 @@ impl Renderer {
         let track_brush = self.brush(target, c_track, alpha);
         target.FillRectangle(&track, &track_brush);
         let frac = (used_percent / 100.0).clamp(0.0, 1.0) as f32;
-        // 占比不足 0.4% 不画填充；画出时保底 2px 宽。
+        // Fractions below 0.4% draw no fill; when drawn, the fill is at
+        // least 2px wide.
         if frac > 0.004 {
             let fg_w = ((w - pad * 2.0) * frac).max(2.0);
             let fg = D2D_RECT_F {
@@ -954,47 +1188,28 @@ impl Renderer {
             target.FillRectangle(&fg, &fill);
         }
 
-        // 底行左右分栏：左 55% 倒计时，右侧对齐已用明细。
-        if let Some(line) = resets {
-            self.text(
-                target,
-                line,
-                pad,
-                bar_y + bar_h + 5.0,
-                (w - pad * 2.0) * 0.55,
-                16.0,
-                11.0,
-                400,
-                c_caption,
-                alpha,
-            );
+        // Bottom line split left/right: countdown takes the left 55%,
+        // the used detail is right-aligned.
+        if let Some(r) = row.reset.as_ref() {
+            self.draw_block(target, r, pad, bar_y + bar_h + 5.0, c_caption, alpha);
         }
-        if let Some(d) = detail {
-            self.text_aligned(
-                target,
-                d,
-                &D2D_RECT_F {
-                    left: pad + (w - pad * 2.0) * 0.55,
-                    top: bar_y + bar_h + 5.0,
-                    right: w - pad,
-                    bottom: bar_y + bar_h + 21.0,
-                },
-                11.0,
-                400,
-                c_caption,
-                alpha,
-                Align::Right,
-                false,
-            );
+        if let Some(d) = row.detail.as_ref() {
+            self.draw_block_r(target, d, w - pad, bar_y + bar_h + 5.0, c_caption, alpha);
         }
         y + layout::MAIN_METRIC_ROW_H
     }
 
-    /// MCP 工具构成区：直角外框内一条圆角格能量条[满串 = 工具
-    /// 消耗合计]加一行三格徽标图例[色块|名称|次数]。格段与徽标色块按用量
-    /// 降序取低饱和四色板，第 5+ 工具并入第四色；图例装不下整枚徽标截尾
-    /// +N、首枚超宽截名称。数据只随轮询变化，分段/徽标/装填结果按
-    /// (快照时间, 内宽) 缓存，动画帧不重算。返回下一行 y
+    /// MCP tool composition section: inside a square-cornered frame, one
+    /// rounded-cell energy bar [full string = total tool consumption]
+    /// plus one row of three-part badges as the legend [swatch | name |
+    /// count]. Cell segments and badge swatches take a low-saturation
+    /// four-color palette ordered by descending usage, with the 5th+
+    /// tools merged into the fourth color; when the legend does not fit,
+    /// trailing whole badges are dropped for +N, and an over-width first
+    /// badge has its name truncated. Data only changes with polls;
+    /// segmentation, badges, and fitting results are cached by (snapshot
+    /// time, inner width) and not recomputed on animation frames.
+    /// Returns the next row's y
     unsafe fn mcp_composition(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -1018,10 +1233,12 @@ impl Renderer {
         let stroke = self.brush(target, self.theme.border, alpha);
         target.DrawRectangle(&frame, &stroke, 1.0, None);
 
-        // 数据侧产物按 (快照时间, 内宽) 缓存：命中时跳过排序、分段与全部
-        // 测宽；宽度入键因装填结果随面板宽变化（跨 DPI 显示器）。take
-        // 取走所有权，绘制段才能自由调用 &mut self 的绘制方法；本函数
-        // 单一出口，函数尾放回。
+        // Data-side artifacts are cached by (snapshot time, inner width):
+        // a hit skips sorting, segmentation, and all width measuring;
+        // width is part of the key because fitting results change with
+        // panel width (across-DPI monitors). take() moves ownership out
+        // so the draw section can freely call &mut self drawing methods;
+        // this function has a single exit, put back at function end.
         let mut cache = self.mcp_cache.take();
         if cache
             .as_ref()
@@ -1029,8 +1246,7 @@ impl Renderer {
         {
             cache = Some(self.build_mcp_cache(m, queried_at, inner_w));
         }
-        let c = cache.unwrap();
-        let segs = &c.segs;
+        let c = cache.expect("mcp_cache 上方必已置");
         let badges = &c.badges;
         let shown = c.shown;
 
@@ -1038,16 +1254,12 @@ impl Renderer {
         let bar_y = top + 1.0 + layout::MAIN_MCP_COMP_PAD_Y;
         let bar_w = MCP_CELLS as f32 * MCP_CELL_W + (MCP_CELLS - 1) as f32 * MCP_CELL_GAP;
         let x0 = inner_x + (inner_w - bar_w) / 2.0;
-        // 待填段：区间序列与缓存建时同源（mcp_job_ranges），数据段取
-        // 段色、空格段取轨道色，逐格填圆角矩形。
-        let track = self.theme.track;
-        for r in mcp_job_ranges(segs) {
-            let color = segs
-                .iter()
-                .find(|(s, e, _)| (*s, *e) == r)
-                .map_or(track, |(_, _, c)| *c);
-            let b = self.brush(target, color, alpha);
-            for i in r.0..r.1 {
+        // Pending-fill segments come pre-paired from the cache: the draw
+        // loop fills one rounded rect per cell with no per-frame range
+        // walk or color lookup.
+        for (rs, re, color) in &c.ranges {
+            let b = self.brush(target, *color, alpha);
+            for i in *rs..*re {
                 let left = x0 + i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
                 let cell = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -1077,22 +1289,21 @@ impl Renderer {
             radiusY: MCP_CELL_R,
         };
         let mut x = inner_x;
+        // Badge text is vertically centered (the former text_raw
+        // vcenter behavior); y is derived from the row height
+        let text_y = |h: f32| leg_y + (leg_h - h) / 2.0;
         if shown == 0 && !badges.is_empty() {
-            // 首枚即超宽：截文本兜底，最大工具保底可见。
+            // The first badge is already over-width: the prebuilt
+            // truncated fallback keeps the largest tool visible; drawing
+            // is block-only, no per-frame measuring.
             let b = &badges[0];
             let sw = self.brush(target, b.color, alpha);
             target.FillRoundedRectangle(&swatch(x), &sw);
-            let avail = inner_w - MCP_SWATCH - MCP_SWATCH_GAP;
-            let (t, _) = self.ellipsize(&b.text, MCP_BADGE_SIZE, avail, 400, true);
-            self.text_nosnap(
+            self.draw_block_nosnap(
                 target,
-                &t,
+                &c.fallback,
                 x + MCP_SWATCH + MCP_SWATCH_GAP,
-                leg_y,
-                avail,
-                leg_h,
-                MCP_BADGE_SIZE,
-                400,
+                text_y(c.fallback.h),
                 self.theme.text_secondary,
                 alpha,
             );
@@ -1104,33 +1315,23 @@ impl Renderer {
                 let sw = self.brush(target, b.color, alpha);
                 target.FillRoundedRectangle(&swatch(x), &sw);
                 x += MCP_SWATCH + MCP_SWATCH_GAP;
-                self.text_nosnap(
+                self.draw_block_nosnap(
                     target,
-                    &b.text,
+                    &b.block,
                     x,
-                    leg_y,
-                    b.text_w + 2.0,
-                    leg_h,
-                    MCP_BADGE_SIZE,
-                    400,
+                    text_y(b.block.h),
                     self.theme.text_secondary,
                     alpha,
                 );
-                x += b.text_w;
+                x += b.block.w;
             }
             if shown < badges.len() {
-                let t = format!("+{}", badges.len() - shown);
-                let tw = c.plus_w;
                 x += MCP_BADGE_GAP;
-                self.text_nosnap(
+                self.draw_block_nosnap(
                     target,
-                    &t,
+                    &c.plus,
                     x,
-                    leg_y,
-                    tw + 2.0,
-                    leg_h,
-                    MCP_BADGE_SIZE,
-                    400,
+                    text_y(c.plus.h),
                     self.theme.text_tertiary,
                     alpha,
                 );
@@ -1140,14 +1341,17 @@ impl Renderer {
         y + layout::MAIN_MCP_COMP_H
     }
 
-    /// 重建 MCP 构成区缓存：工具排序、能量条分段与徽标测宽装填
+    /// Rebuild the MCP composition cache: tool sorting, energy bar
+    /// segmentation, and badge width-measured fitting
     unsafe fn build_mcp_cache(
         &mut self,
         m: &crate::api::McpUsage,
         queried_at: chrono::DateTime<chrono::Local>,
         inner_w: f32,
     ) -> McpCompCache {
-        // 工具降序；段界累计取整，段间无缝不重叠，末段吃满整串。
+        // Tools in descending order; segment boundaries are rounded
+        // cumulative shares, seamless and non-overlapping between
+        // segments, with the last segment filling the whole bar.
         let mut items: Vec<&crate::api::McpDetail> = m.details.iter().collect();
         items.sort_by(|a, b| {
             b.usage
@@ -1173,9 +1377,17 @@ impl Renderer {
                 }
             }
         }
-        // 图例为徽标串[色块|名称·次数]：色块与能量条分段同色，名称首字母
-        // 大写仅动显示层。装填按宽度驱动：装下当前枚后若仍有剩余，须再
-        // 容得下徽标间空隙 + 「+N」才继续装，尾部概括数即剩余工具数。
+        // The legend is a run of badges [swatch | name · count]: swatch
+        // colors match the energy bar segments, and capitalizing the
+        // first letter of names only affects the display layer. Fitting
+        // is width-driven: after the current badge fits, continuing
+        // requires the remaining width to also hold the inter-badge gap
+        // + "+N"; the trailing summary count is the number of remaining
+        // tools.
+        // The raw strings live only for this build pass (the over-width
+        // fallback layout is built right after fitting); the cache holds
+        // blocks alone, so no frame path re-measures.
+        let mut texts: Vec<String> = Vec::with_capacity(items.len());
         let badges: Vec<McpBadge> = items
             .iter()
             .enumerate()
@@ -1186,15 +1398,16 @@ impl Renderer {
                     None => String::new(),
                 };
                 let text = format!("{name} {}", fmt::compact_number(d.usage));
-                let text_w = self.measure(&text, MCP_BADGE_SIZE, 400, true);
+                let block =
+                    super::TextBlock::new(self.make_layout(&text, MCP_BADGE_SIZE, 400, true));
+                texts.push(text);
                 McpBadge {
                     color: MCP_PALETTE[i.min(MCP_PALETTE.len() - 1)],
-                    text,
-                    text_w,
+                    block,
                 }
             })
             .collect();
-        let badge_w = |b: &McpBadge| MCP_SWATCH + MCP_SWATCH_GAP + b.text_w;
+        let badge_w = |b: &McpBadge| MCP_SWATCH + MCP_SWATCH_GAP + b.block.w;
         let mut shown = 0usize;
         let mut cur = 0.0f32;
         for (i, b) in badges.iter().enumerate() {
@@ -1216,27 +1429,46 @@ impl Renderer {
             cur += add;
             shown = i + 1;
         }
-        let plus_w = if shown < badges.len() {
-            self.measure(
-                &format!("+{}", badges.len() - shown),
-                MCP_BADGE_SIZE,
-                400,
-                true,
-            )
+        let plus = if shown < badges.len() {
+            let t = format!("+{}", badges.len() - shown);
+            super::TextBlock::new(self.make_layout(&t, MCP_BADGE_SIZE, 400, true))
         } else {
-            0.0
+            super::TextBlock::new(None)
         };
+        let fallback = if shown == 0 && !texts.is_empty() {
+            let avail = inner_w - MCP_SWATCH - MCP_SWATCH_GAP;
+            let (t, _) = self.ellipsize(&texts[0], MCP_BADGE_SIZE, avail, 400, true);
+            super::TextBlock::new(self.make_layout(&t, MCP_BADGE_SIZE, 400, true))
+        } else {
+            super::TextBlock::new(None)
+        };
+        // Gap-fill the bar once at build: data segments keep their color,
+        // gaps take the track color — pairing here keeps the draw loop a
+        // straight iteration.
+        let track = self.theme.track;
+        let ranges = mcp_job_ranges(&segs)
+            .into_iter()
+            .map(|(s, e)| {
+                let color = segs
+                    .iter()
+                    .find(|(ps, pe, _)| (*ps, *pe) == (s, e))
+                    .map_or(track, |(_, _, c)| *c);
+                (s, e, color)
+            })
+            .collect();
         McpCompCache {
             key: queried_at,
             inner_w,
-            segs,
+            ranges,
             badges,
             shown,
-            plus_w,
+            fallback,
+            plus,
         }
     }
 
-    /// 重建 Token 卡片缓存：格式化、测宽与超宽截断一次成型
+    /// Rebuild the Token card cache: formatting, measuring, and
+    /// over-width truncation in one pass
     unsafe fn build_token_cells(
         &mut self,
         ts: &crate::api::TokenStats,
@@ -1248,15 +1480,18 @@ impl Renderer {
                 Some(v) => fmt::compact_number_split(v),
                 None => (fmt::MISSING.to_string(), ""),
             };
-            // Consolas 只有 400/700 两档字重，700 明示粗体。
+            // Consolas only has the 400/700 weight tiers; 700 explicitly
+            // means bold.
             let nw = self.measure(&num, TOKEN_NUM_SIZE, TOKEN_NUM_WEIGHT, true);
             let uw = if unit.is_empty() {
                 0.0
             } else {
                 self.measure_static(unit, TOKEN_UNIT_SIZE, 400, false)
             };
-            // 荒谬大值可超卡宽：截尾入宽，不越描边压邻卡。
-            let (num, nw) = if nw + uw + TOKEN_UNIT_GAP > avail {
+            // Absurdly large values can exceed the card width: truncate
+            // into the width rather than crossing the stroke and
+            // crowding the neighboring card.
+            let num = if nw + uw + TOKEN_UNIT_GAP > avail {
                 self.ellipsize(
                     &num,
                     TOKEN_NUM_SIZE,
@@ -1264,10 +1499,19 @@ impl Renderer {
                     TOKEN_NUM_WEIGHT,
                     true,
                 )
+                .0
             } else {
-                (num, nw)
+                num
             };
-            TokenCell { num, unit, nw, uw }
+            TokenCell {
+                num: super::TextBlock::new(self.make_layout(
+                    &num,
+                    TOKEN_NUM_SIZE,
+                    TOKEN_NUM_WEIGHT,
+                    true,
+                )),
+                unit: super::TextBlock::new(self.make_layout(unit, TOKEN_UNIT_SIZE, 400, false)),
+            }
         });
         TokenCells {
             key: queried_at,
@@ -1275,12 +1519,13 @@ impl Renderer {
         }
     }
 
-    /// Token 三卡区块：排版缓存按快照命中，重建一次成型；单一出口，
-    /// take 出的缓存函数尾必放回。返回区块底 y
+    /// Three Token cards section: the typography cache hits by snapshot;
+    /// rebuilds complete in one pass; single exit — the cache taken out
+    /// must be put back at function end. Returns the section's bottom y
     unsafe fn token_section(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        s: &Strings,
+        labels: &MainLabels,
         ts: &crate::api::TokenStats,
         queried_at: chrono::DateTime<chrono::Local>,
         y: f32,
@@ -1292,13 +1537,14 @@ impl Renderer {
         if cells.as_ref().is_none_or(|c| c.key != queried_at) {
             cells = Some(self.build_token_cells(ts, queried_at));
         }
-        let cells = cells.unwrap();
-        // 标签按档位穷尽分派：配对内聚，增删档编译器背书。
+        let cells = cells.expect("token_cells 上方必已置");
+        // Labels are dispatched exhaustively by tier: pairing stays
+        // cohesive, and adding/removing tiers is compiler-checked.
         for (i, (leg, _, _)) in TOKEN_LEGS.iter().enumerate() {
             let label = match leg {
-                TokenLeg::Today => s.today_tokens,
-                TokenLeg::Week => s.week_tokens,
-                TokenLeg::Month => s.month_tokens,
+                TokenLeg::Today => &labels.today,
+                TokenLeg::Week => &labels.week,
+                TokenLeg::Month => &labels.month,
             };
             self.token_card(
                 target,
@@ -1313,49 +1559,13 @@ impl Renderer {
         cy + layout::TOKEN_CARD_H
     }
 
-    /// 禁用像素吸附的文本绘制：吸附偏移随位置独立抖动，会拉花链式
-    /// 推进的徽标间距；仅徽标图例使用。mono + 垂直居中，走 text_raw
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn text_nosnap(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        s: &str,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        size: f32,
-        weight: u16,
-        color: [f32; 4],
-        alpha: f32,
-    ) {
-        let rect = D2D_RECT_F {
-            left: x,
-            top: y,
-            right: x + w,
-            bottom: y + h,
-        };
-        self.text_raw(
-            target,
-            s,
-            &rect,
-            size,
-            weight,
-            color,
-            alpha,
-            Align::Left,
-            true,
-            false,
-            true,
-            true,
-        );
-    }
-
-    /// Token 卡片：透明底细描边容器；数字与单位分离排版，标签沉底。
+    /// Token card: transparent-fill thin-stroke container; number and
+    /// unit are laid out separately (prebuilt layouts), with the label
+    /// sitting at the bottom.
     unsafe fn token_card(
         &mut self,
         target: &ID2D1HwndRenderTarget,
-        label: &str,
+        label: &super::TextBlock,
         cell: &TokenCell,
         x: f32,
         y: f32,
@@ -1374,72 +1584,52 @@ impl Renderer {
         };
         let edge = self.brush(target, self.theme.card_border, alpha);
         target.DrawRoundedRectangle(&rect, &edge, 1.0, None);
-        // 数字与单位组合整体居中；单位上标挂数字右上角。
-        let nx = x + (cw - cell.nw - cell.uw - TOKEN_UNIT_GAP) / 2.0;
-        let num_rect = D2D_RECT_F {
-            left: nx,
-            top: y + layout::TOKEN_CARD_NUM_Y,
-            right: nx + cell.nw,
-            bottom: y + layout::TOKEN_CARD_NUM_Y + layout::TOKEN_CARD_NUM_H,
-        };
-        self.text_aligned(
+        // The number-unit combination is centered as a whole; the unit
+        // hangs at the number's top-right corner as a superscript.
+        let nx = x + (cw - cell.num.w - cell.unit.w - TOKEN_UNIT_GAP) / 2.0;
+        self.draw_block(
             target,
             &cell.num,
-            &num_rect,
-            TOKEN_NUM_SIZE,
-            TOKEN_NUM_WEIGHT,
+            nx,
+            y + layout::TOKEN_CARD_NUM_Y,
             self.theme.text_primary,
             alpha,
-            Align::Left,
-            true,
         );
-        if !cell.unit.is_empty() {
-            self.text(
+        if cell.unit.w > 0.0 {
+            self.draw_block(
                 target,
-                cell.unit,
-                nx + cell.nw + TOKEN_UNIT_GAP,
+                &cell.unit,
+                nx + cell.num.w + TOKEN_UNIT_GAP,
                 y + layout::TOKEN_CARD_NUM_Y,
-                cell.uw + 2.0,
-                16.0,
-                TOKEN_UNIT_SIZE,
-                400,
                 self.theme.text_secondary,
                 alpha,
             );
         }
-        let label_rect = D2D_RECT_F {
-            left: x,
-            top: y + layout::TOKEN_CARD_LABEL_Y,
-            right: x + cw,
-            bottom: y + layout::TOKEN_CARD_LABEL_Y + layout::TOKEN_CARD_LABEL_H,
-        };
-        self.text_aligned(
+        self.draw_block_c(
             target,
             label,
-            &label_rect,
-            10.0,
-            400,
+            x + cw / 2.0,
+            y + layout::TOKEN_CARD_LABEL_Y,
             self.theme.text_secondary,
             alpha,
-            Align::Center,
-            false,
         );
     }
 
-    /// 「高峰」徽标：闪电 + 文字居标题行右侧，悬停命中登记 UsageInfo
+    /// "Peak" badge: bolt + text on the right of the title row; the label
+    /// is a MainLabels block, so peak-hour frames create zero layouts;
+    /// hover hit registration records UsageInfo
     unsafe fn peak_badge(
         &mut self,
         target: &ID2D1HwndRenderTarget,
+        label: &super::TextBlock,
         title_y: f32,
         w: f32,
         alpha: f32,
-        s: &Strings,
     ) {
         let pad = layout::CONTENT_PAD;
         let bh = 14.0;
         let bw = bh * (7.0 / 13.0);
-        // 徽标文字是 i18n 常量文本，走帧内去重测宽。
-        let badge_w = bw + 4.0 + self.measure_static(s.peak_badge, 12.0, 600, false);
+        let badge_w = bw + 4.0 + label.w;
         let bx = w - pad - badge_w;
         if self.bolt_geo.is_none() {
             self.bolt_geo = self.build_bolt_glyph();
@@ -1459,18 +1649,7 @@ impl Renderer {
             target.SetTransform(&Matrix3x2::identity());
         }
         let tx = bx + bw + 4.0;
-        self.text(
-            target,
-            s.peak_badge,
-            tx,
-            title_y,
-            w - tx,
-            17.0,
-            12.0,
-            600,
-            self.theme.peak,
-            alpha,
-        );
+        self.draw_block_at(target, label, tx, title_y, self.theme.peak, alpha, false);
         let hit_w = badge_w;
         self.hits.push((
             Hit::UsageInfo,
@@ -1486,7 +1665,7 @@ impl Renderer {
         }
     }
 
-    /// 峰谷悬停说明卡片
+    /// Peak/off-peak hover tip card
     pub(super) unsafe fn tip_card(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -1531,9 +1710,35 @@ impl Renderer {
             false,
         );
     }
+
+    /// Error card body (cached): the key is a full-value pair of error
+    /// content and language, so marquee frames rebuild nothing; leaving
+    /// out the language would keep stale copy after a language switch.
+    /// An Rc refcount clone replaces a full deep copy of the string —
+    /// hit registration still needs &mut self mid-drawing, so it cannot
+    /// be borrowed out.
+    fn cached_error_body(
+        &mut self,
+        s: &Strings,
+        e: &FetchError,
+        lang: crate::ui::i18n::Lang,
+    ) -> std::rc::Rc<str> {
+        // Reference comparison on the hit path; the owned clone only on a
+        // rebuild — the marquee calls this every frame while scrolling.
+        if let Some((k, b)) = self.err_card.as_ref()
+            && k.0 == *e
+            && k.1 == lang
+        {
+            return std::rc::Rc::clone(b);
+        }
+        let key = (e.clone(), lang);
+        let b: std::rc::Rc<str> = error_card_body(s, e).into();
+        self.err_card = Some((key, std::rc::Rc::clone(&b)));
+        b
+    }
 }
 
-/// 大类标题文案
+/// Category title copy
 fn category_label(s: &Strings, c: ErrorCategory) -> &'static str {
     match c {
         ErrorCategory::Unauthenticated => s.err_cat_auth,
@@ -1545,9 +1750,21 @@ fn category_label(s: &Strings, c: ErrorCategory) -> &'static str {
     }
 }
 
-/// FetchError 的展示取材：官方错误信息与该类无官方提示时的兜底
-/// 文案；信息为 None 的类走裸文案直出，无降级链。错误卡与页脚
-/// 尾段同引，两视图的回退配对不分叉。
+/// Footer cache key: the minute bucket delegates to fmt::elapsed_minutes —
+/// the same source the text tiers read, so key transitions land exactly at
+/// whole elapsed minutes. Taking a whole-second timestamp would drop the
+/// snapshot's sub-second part; the key transition would lead the real one
+/// by up to a second, and crossing a tier would cache the stale copy under
+/// the new key, displaying it a full minute late
+fn footer_key(now_ms: i64, at_ms: i64) -> i64 {
+    crate::ui::fmt::elapsed_minutes(now_ms - at_ms)
+}
+
+/// Display material for FetchError: the official error info and the
+/// fallback copy for categories with no official hint; categories whose
+/// info is None emit the raw copy directly, with no fallback chain. The
+/// error card and the footer tail segment share this source; the two
+/// views' fallback pairing never diverges.
 fn error_parts<'a>(e: &'a FetchError, s: &'a Strings) -> (Option<&'a ErrorInfo>, &'a str) {
     match e {
         FetchError::Unauthenticated(info) => (Some(info), s.err_auth_hint),
@@ -1558,40 +1775,60 @@ fn error_parts<'a>(e: &'a FetchError, s: &'a Strings) -> (Option<&'a ErrorInfo>,
     }
 }
 
-/// 错误卡正文降级链
-/// 取材判定单源 `ErrorInfo::detail`，此处只做卡片模板拼装。
-fn error_card_body(s: &Strings, e: &FetchError) -> String {
-    // 空态是引导正文，不走降级链。
-    if matches!(e, FetchError::Empty) {
-        return s.err_empty_hint.to_string();
-    }
+/// Error display material shared by the card body and the footer tail:
+/// a (code, message) pair each surface renders its own way, or plain
+/// text (code-only template, raw message, fallback copy). One ladder —
+/// the two views' material selection cannot diverge.
+enum ErrorMaterial<'a> {
+    CodeMsg(i64, std::borrow::Cow<'a, str>),
+    Text(std::borrow::Cow<'a, str>),
+}
+
+/// Material selection has the single source `ErrorInfo::detail`
+fn error_material<'a>(e: &'a FetchError, s: &'a Strings) -> ErrorMaterial<'a> {
     match error_parts(e, s) {
         (Some(info), fallback) => match info.detail() {
-            ErrorDetail::CodeAndMsg { code, msg } => s
-                .err_code_msg
-                .replace("{code}", &code.to_string())
-                .replace("{msg}", msg),
-            ErrorDetail::CodeOnly { code } => s.err_code_only.replace("{code}", &code.to_string()),
-            ErrorDetail::Msg(msg) => msg.into_owned(),
-            ErrorDetail::Fallback => fallback.to_string(),
+            ErrorDetail::CodeAndMsg { code, msg } => {
+                ErrorMaterial::CodeMsg(code, std::borrow::Cow::Borrowed(msg))
+            }
+            ErrorDetail::CodeOnly { code } => ErrorMaterial::Text(code_only_body(s, code).into()),
+            ErrorDetail::Msg(msg) => ErrorMaterial::Text(msg),
+            ErrorDetail::Fallback => ErrorMaterial::Text(fallback.into()),
         },
-        (None, raw) => raw.to_string(),
+        (None, raw) => ErrorMaterial::Text(raw.into()),
     }
 }
 
-/// 页脚摘要的后缀段
-/// 取材判定与错误卡同源 `ErrorInfo::detail`，空串表示无尾段。
-fn footer_error_tail(s: &Strings, e: &FetchError) -> String {
-    match error_parts(e, s) {
-        (Some(info), fallback) => match info.detail() {
-            ErrorDetail::CodeAndMsg { msg: m, .. } => m.to_string(),
-            ErrorDetail::Msg(m) => m.into_owned(),
-            ErrorDetail::CodeOnly { code } => s.err_code_only.replace("{code}", &code.to_string()),
-            ErrorDetail::Fallback if fallback.is_empty() => String::new(),
-            ErrorDetail::Fallback => fallback.to_string(),
-        },
-        (None, raw) => raw.to_string(),
+/// Error card body: only the card template assembly happens here.
+fn error_card_body(s: &Strings, e: &FetchError) -> String {
+    // The empty state is onboarding body text and does not go through
+    // the fallback chain.
+    if matches!(e, FetchError::Empty) {
+        return s.err_empty_hint.to_string();
     }
+    match error_material(e, s) {
+        ErrorMaterial::CodeMsg(code, msg) => s
+            .err_code_msg
+            .replace("{code}", &code.to_string())
+            .replace("{msg}", &msg),
+        ErrorMaterial::Text(t) => t.into_owned(),
+    }
+}
+
+/// Suffix segment of the footer summary; an empty string means no tail
+/// segment.
+fn footer_error_tail(s: &Strings, e: &FetchError) -> String {
+    match error_material(e, s) {
+        ErrorMaterial::CodeMsg(_, msg) => msg.into_owned(),
+        ErrorMaterial::Text(t) => t.into_owned(),
+    }
+}
+
+/// Code-only error body: shared by the error card and the footer tail — the
+/// two views are mutually exclusive states of the same error and must not
+/// render it differently.
+fn code_only_body(s: &Strings, code: i64) -> String {
+    s.err_code_only.replace("{code}", &code.to_string())
 }
 
 #[cfg(test)]
@@ -1600,7 +1837,19 @@ mod tests {
 
     const C: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 
-    /// 档位与回退天数、日志标签配对钉位
+    /// Footer key and copy tiers share the same boundary: transitions
+    /// land exactly at whole elapsed minutes; the snapshot's sub-second
+    /// part never makes the key early or late
+    #[test]
+    fn footer_key_matches_text_tiers() {
+        let at = 1_000_000i64 * 60_000 + 700;
+        assert_eq!(footer_key(at + 59_999, at), 0);
+        assert_eq!(footer_key(at + 60_000, at), 1);
+        assert_eq!(footer_key(at + 119_999, at), 1);
+        assert_eq!(footer_key(at + 120_000, at), 2);
+    }
+
+    /// Pinned pairing of tiers with fallback day counts and log labels
     #[test]
     fn token_legs_pinned() {
         assert_eq!(TOKEN_LEGS[0], (TokenLeg::Today, 0, "today"));
@@ -1608,17 +1857,18 @@ mod tests {
         assert_eq!(TOKEN_LEGS[2], (TokenLeg::Month, 29, "month"));
     }
 
-    /// 能量条待填区间：数据段原样保留，未覆盖格位补轨道段，
-    /// 首尾按需补齐，段序即绘制序
+    /// Energy bar pending-fill ranges: data segments are kept as-is,
+    /// uncovered cell positions get track segments, the head and tail
+    /// are padded as needed, and segment order is the draw order
     #[test]
     fn mcp_ranges_cover_track_gaps() {
-        // 无数据：整条都是轨道
+        // No data: the whole bar is track
         assert_eq!(mcp_job_ranges(&[]), vec![(0, MCP_CELLS)]);
-        // 单段吃满：无轨道
+        // A single segment fills everything: no track
         assert_eq!(mcp_job_ranges(&[(0, 20, C)]), vec![(0, 20)]);
-        // 头部缺口
+        // Head gap
         assert_eq!(mcp_job_ranges(&[(5, 20, C)]), vec![(0, 5), (5, 20)]);
-        // 中段缺口，数据段连续衔接
+        // Mid gap; data segments join contiguously
         assert_eq!(
             mcp_job_ranges(&[(2, 6, C), (6, 10, C), (14, 20, C)]),
             vec![(0, 2), (2, 6), (6, 10), (10, 14), (14, 20)]

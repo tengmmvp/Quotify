@@ -1,4 +1,4 @@
-//! 账号切换弹窗视图
+//! Account switcher popup view
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -6,24 +6,90 @@ use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
-use super::{Align, Hit, Renderer};
-use crate::ui::panel::anim::ease_out_cubic;
+use super::{Hit, Renderer};
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::CARD_RADIUS;
 
-/// 弹窗逻辑宽
+/// Popup logical width
 pub const POPUP_W: f32 = 220.0;
-/// 账号行高
+/// Account row height
 pub const ROW_H: f32 = 36.0;
+/// Popup horizontal padding: the row insets, the badge anchor, and the hit
+/// rects share it (row build and row draw must not drift apart)
+const PAD: f32 = 10.0;
 
-/// 弹窗逻辑高：标题区 + 账号行 + 上下留白
+/// Popup logical height: title area + account rows + top/bottom padding
 pub fn popup_height(accounts: usize) -> i32 {
     (36.0 + accounts as f32 * ROW_H + 12.0).round() as i32
 }
 
+/// Row badge geometry chain shared by the row build and the row draw:
+/// badge width → badge x. One source keeps the drawn badge box on the
+/// budget the name's truncation was measured against.
+fn row_badge_x(w: f32, badge_w: f32) -> (f32, f32) {
+    let pw = badge_w + super::BADGE_PAD_X;
+    (pw, w - PAD - pw)
+}
+
+/// One account row's cache entry: the leading identity fields double as the
+/// per-frame account-set fingerprint; the blocks hold the row's prebuilt
+/// text artifacts
+struct PopupRow {
+    name: String,
+    platform: crate::api::Platform,
+    team: bool,
+    /// Ellipsized account name, laid out at the row's drawn weight (600
+    /// selected, 500 otherwise); truncation itself always measures at 600 —
+    /// preserving this legacy weight mismatch keeps cached rows identical to
+    /// the former per-frame output
+    name_blk: super::TextBlock,
+    /// Platform badge label (10.5/400); its width fixes both the badge box
+    /// and the name's truncation budget
+    badge_blk: super::TextBlock,
+}
+
+/// Frame cache of the account popup: the heading and every row's name and
+/// badge layouts are prebuilt, so fade-in and hover frames create zero
+/// layouts and allocate zero strings. The content changes only with the key
+/// below, so the key comparison alone also invalidates a stale cache left
+/// over from a previous open
+pub(super) struct PopupTexts {
+    lang: crate::ui::i18n::Lang,
+    w: f32,
+    /// Selected row index: the name's drawn weight (600 vs 500) follows it,
+    /// so a selection change must rebuild the name blocks
+    selected: Option<usize>,
+    /// Heading ("switch account"); content depends on the language only
+    title: super::TextBlock,
+    rows: Vec<PopupRow>,
+}
+
+impl PopupTexts {
+    /// Full key check without allocation: width, language, selected index,
+    /// row count, and each row's (name, platform, team)
+    fn matches(
+        &self,
+        w: f32,
+        lang: crate::ui::i18n::Lang,
+        selected: Option<usize>,
+        accounts: &[crate::app::config::Account],
+    ) -> bool {
+        self.w == w
+            && self.lang == lang
+            && self.selected == selected
+            && self.rows.len() == accounts.len()
+            && self
+                .rows
+                .iter()
+                .zip(accounts)
+                .all(|(r, a)| r.name == a.name && r.platform == a.platform && r.team == a.team)
+    }
+}
+
 impl Renderer {
-    /// 弹窗一帧；骨架同面板 paint：ensure_target + BeginDraw/EndDraw，
-    /// 返回 false 表示设备已丢失，调用方须丢弃整个 Renderer
+    /// One popup frame; skeleton same as the panel paint: ensure_target +
+    /// BeginDraw/EndDraw; returning false means the device is lost and
+    /// the caller must drop the whole Renderer
     pub fn paint_popup(
         &mut self,
         hwnd: windows::Win32::Foundation::HWND,
@@ -32,26 +98,14 @@ impl Renderer {
         dpi: f32,
     ) -> bool {
         unsafe {
-            let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
-                return true;
-            };
-            let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
-            let h = (rect_phys.bottom - rect_phys.top) as f32 / dpi;
-            self.hits.clear();
-            self.frame_measures.clear();
-            target.BeginDraw();
-            self.draw_account_popup(&target, model, w, h);
-            match target.EndDraw(None, None) {
-                Ok(()) => true,
-                Err(e) => {
-                    crate::platform::log(&format!("[Quotify] 弹窗 EndDraw 失败: {e}"));
-                    false
-                }
-            }
+            self.paint_frame(hwnd, rect_phys, dpi, "弹窗", |s, t, w, h| {
+                s.draw_account_popup(t, model, w, h)
+            })
         }
     }
 
-    /// 账号列表：弱化标题 + 行；当前项左竖条，hover 整行淡填充
+    /// Account list: subdued title + rows; the current item gets a left
+    /// vertical bar, and hover fills the whole row lightly
     unsafe fn draw_account_popup(
         &mut self,
         target: &ID2D1HwndRenderTarget,
@@ -60,16 +114,11 @@ impl Renderer {
         h: f32,
     ) {
         let s = model.strings;
-        let pad = 10.0;
 
-        // 弹出动画：内容上浮渐入；背景必须不透明全幅绘制，否则首帧露交换链。
-        let (dy, alpha) = match &self.anim.appear {
-            Some(t) if self.anim_allowed => {
-                let p = ease_out_cubic(t.progress());
-                ((1.0 - p) * 6.0, p)
-            }
-            _ => (0.0, 1.0),
-        };
+        // Pop animation: content floats up with a fade-in; the
+        // background must be drawn opaquely at full size, or the first
+        // frame exposes the swap chain.
+        let (dy, alpha) = self.appear_offset();
         let bg = self.brush(target, self.theme.bg, 1.0);
         target.FillRectangle(
             &D2D_RECT_F {
@@ -81,33 +130,41 @@ impl Renderer {
             &bg,
         );
 
-        let title_rect = D2D_RECT_F {
-            left: 0.0,
-            top: dy + 13.0,
-            right: w,
-            bottom: dy + 29.0,
-        };
-        self.text_aligned(
+        let selected = model.account.map(|a| a.index);
+
+        // Row cache (single exit, put back at function end): the fade-in
+        // and hover frames reuse the prebuilt name/badge layouts; a
+        // change in language, width, selection, or the account set
+        // rebuilds — the key comparison alone also invalidates the
+        // leftovers of a previously closed popup.
+        let mut texts = self.popup_texts.take();
+        if texts
+            .as_ref()
+            .is_none_or(|t| !t.matches(w, model.lang, selected, model.accounts))
+        {
+            texts = Some(self.build_popup_texts(s, model.lang, selected, model.accounts, w));
+        }
+        let cached = texts.as_ref().expect("popup 缓存上方必已置");
+
+        // Heading: horizontally centered in the popup, top of its band
+        self.draw_block_at(
             target,
-            s.switch_account,
-            &title_rect,
-            12.0,
-            400,
+            &cached.title,
+            (w - cached.title.w) / 2.0,
+            dy + 13.0,
             self.theme.text_tertiary,
             alpha,
-            Align::Center,
             false,
         );
 
-        let selected = model.account.map(|a| a.index);
         let mut y = dy + 36.0;
-        for (i, acc) in model.accounts.iter().enumerate() {
+        for (i, row) in cached.rows.iter().enumerate() {
             if self.hover == Some(Hit::PickAccount(i)) {
                 let row = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: pad - 4.0,
+                        left: PAD - 4.0,
                         top: y + 2.0,
-                        right: w - pad + 4.0,
+                        right: w - PAD + 4.0,
                         bottom: y + ROW_H - 2.0,
                     },
                     radiusX: CARD_RADIUS,
@@ -118,12 +175,12 @@ impl Renderer {
             }
             let cur = selected == Some(i);
             if cur {
-                // 高度与账号名字号一致
+                // Height matches the account name's font size
                 let bar = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
-                        left: pad - 4.0,
+                        left: PAD - 4.0,
                         top: y + 11.25,
-                        right: pad - 1.0,
+                        right: PAD - 1.0,
                         bottom: y + 24.75,
                     },
                     radiusX: 1.5,
@@ -132,55 +189,97 @@ impl Renderer {
                 let b = self.brush(target, self.theme.accent, alpha);
                 target.FillRoundedRectangle(&bar, &b);
             }
-            // 右端徽标：平台，团队版追加团队标；弹窗窄，放不下 key 前缀徽标。
-            let platform = if acc.platform == crate::api::Platform::Cn {
-                s.platform_cn
-            } else {
-                s.platform_intl
-            };
-            let platform_label = if acc.team {
-                format!("{platform} · {}", s.team_badge)
-            } else {
-                platform.to_string()
-            };
-            let pw = self.measure(&platform_label, 10.5, 400, false) + 14.0;
-            let px = w - pad - pw;
-            self.badge(
+            // Right-end badge: platform, with the team badge appended for
+            // team accounts; the popup is narrow and cannot fit a
+            // key-prefix badge. The label mapping goes through
+            // platform_with_team and the box geometry through badge_blk,
+            // both shared with the settings card — the two views' badges
+            // cannot drift apart.
+            let (pw, px) = row_badge_x(w, row.badge_blk.w);
+            self.badge_blk(
                 target,
-                &platform_label,
+                &row.badge_blk,
                 px,
                 y + 12.5,
                 pw,
                 self.theme.border,
                 self.theme.text_secondary,
                 alpha,
-                false,
             );
-            let name_right = px - 8.0;
-            let name_w = (name_right - (pad + 6.0)).max(56.0);
-            let (name, _) = self.ellipsize(&acc.name, 13.5, name_w, 600, false);
-            self.text(
+            self.draw_block_at(
                 target,
-                &name,
-                pad + 6.0,
+                &row.name_blk,
+                PAD + 6.0,
                 y + 9.0,
-                name_w,
-                18.0,
-                13.5,
-                if cur { 600 } else { 500 },
                 self.theme.text_primary,
                 alpha,
+                false,
             );
             self.hits.push((
                 Hit::PickAccount(i),
                 D2D_RECT_F {
-                    left: pad - 4.0,
+                    left: PAD - 4.0,
                     top: y,
-                    right: w - pad + 4.0,
+                    right: w - PAD + 4.0,
                     bottom: y + ROW_H,
                 },
             ));
             y += ROW_H;
+        }
+        // Frame cache put back unconditionally: single exit
+        self.popup_texts = texts;
+    }
+
+    /// Rebuild the popup text cache: the heading, each row's platform badge
+    /// label (via the platform_with_team mapping shared with the settings
+    /// card), and each row's ellipsized name at its drawn weight. The badge
+    /// width also settles the name's truncation budget, so one build fixes
+    /// the whole row's text geometry
+    unsafe fn build_popup_texts(
+        &mut self,
+        s: &crate::ui::i18n::Strings,
+        lang: crate::ui::i18n::Lang,
+        selected: Option<usize>,
+        accounts: &[crate::app::config::Account],
+        w: f32,
+    ) -> PopupTexts {
+        let title = super::TextBlock::new(self.make_layout(s.switch_account, 12.0, 400, false));
+        let rows = accounts
+            .iter()
+            .enumerate()
+            .map(|(i, acc)| {
+                let badge_blk = super::TextBlock::new(self.make_layout(
+                    &super::platform_with_team(s, acc.platform, acc.team, " · "),
+                    10.5,
+                    400,
+                    false,
+                ));
+                // Same geometry chain as the former per-frame path: badge
+                // width → badge x → name right boundary → name budget
+                let (_, px) = row_badge_x(w, badge_blk.w);
+                let name_w = (px - 8.0 - (PAD + 6.0)).max(56.0);
+                let (name, _) = self.ellipsize(&acc.name, 13.5, name_w, 600, false);
+                let name_blk = super::TextBlock::new(self.make_layout(
+                    &name,
+                    13.5,
+                    if selected == Some(i) { 600 } else { 500 },
+                    false,
+                ));
+                PopupRow {
+                    name: acc.name.clone(),
+                    platform: acc.platform,
+                    team: acc.team,
+                    name_blk,
+                    badge_blk,
+                }
+            })
+            .collect();
+        PopupTexts {
+            lang,
+            w,
+            selected,
+            title,
+            rows,
         }
     }
 }

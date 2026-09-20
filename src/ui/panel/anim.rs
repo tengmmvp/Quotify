@@ -74,4 +74,27 @@ mod tests {
         let t = Tween::now(100);
         assert_eq!(t.progress(), 0.0);
     }
+
+    /// Pins compose_anim_period: coexisting tiers take the earlier, a lone wake is capped at one minute, idle falls back to one frame, zero never disarms below 1ms.
+    #[test]
+    fn compose_anim_period_tiers() {
+        use crate::ui::panel::compose_anim_period;
+        // Frame tier alone paces the clock: 16ms full frame, 33ms marquee tier
+        assert_eq!(compose_anim_period(Some(16), None), 16);
+        assert_eq!(compose_anim_period(Some(33), None), 33);
+        // Frame + precise wake coexist: the earlier one wins either way
+        assert_eq!(compose_anim_period(Some(16), Some(30)), 16);
+        assert_eq!(compose_anim_period(Some(16), Some(5)), 5);
+        assert_eq!(compose_anim_period(Some(16), Some(16)), 16);
+        // Lone wake: as-is below the ceiling, clamped to one minute beyond
+        assert_eq!(compose_anim_period(None, Some(250)), 250);
+        assert_eq!(compose_anim_period(None, Some(60_000)), 60_000);
+        assert_eq!(compose_anim_period(None, Some(u32::MAX)), 60_000);
+        // Idle: one frame
+        assert_eq!(compose_anim_period(None, None), 16);
+        // A composed 0 would read as "timer stopped": floored to 1ms
+        assert_eq!(compose_anim_period(Some(0), None), 1);
+        assert_eq!(compose_anim_period(None, Some(0)), 1);
+        assert_eq!(compose_anim_period(Some(2), Some(0)), 1);
+    }
 }

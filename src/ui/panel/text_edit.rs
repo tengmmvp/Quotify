@@ -480,6 +480,46 @@ mod tests {
         assert_eq!(e.caret, 2);
     }
 
+    /// Paste byte-budget boundary: with 1 or 2 bytes of room a 3-byte
+    /// CJK char is rejected whole — the buffer never holds a split
+    /// UTF-8 char. A whole-paste rejection leaves no undo snapshot;
+    /// given the room, the char lands in full.
+    #[test]
+    fn paste_cjk_byte_budget_rejects_whole_char() {
+        // Room 1 and 2: not even the first char fits, the paste abandons
+        // entirely — no partial insert, no undo step
+        for max in [3usize, 4] {
+            let mut t = "ab".to_string();
+            let mut e = es(2);
+            e.paste(&mut t, "中", max);
+            assert_eq!(t, "ab");
+            assert_eq!(e.caret, 2);
+            assert!(e.history.is_empty());
+        }
+
+        // Room 2 behind a 1-byte ASCII char: the CJK char is dropped
+        // whole, truncation never splits mid-char
+        let mut t = "ab".to_string();
+        let mut e = es(2);
+        e.paste(&mut t, "a中", 4);
+        assert_eq!(t, "aba");
+        assert_eq!(e.caret, 3);
+
+        // Room exactly 3: the CJK char fits and lands intact
+        let mut t = "ab".to_string();
+        let mut e = es(2);
+        e.paste(&mut t, "中", 5);
+        assert_eq!(t, "ab中");
+        assert_eq!(e.caret, 3);
+
+        // Mid-run truncation also drops whole chars: room for one 中 only
+        let mut t = "ab".to_string();
+        let mut e = es(2);
+        e.paste(&mut t, "中中", 5);
+        assert_eq!(t, "ab中");
+        assert_eq!(e.caret, 3);
+    }
+
     #[test]
     fn undo_redo_and_typing_merge() {
         let mut t = String::new();

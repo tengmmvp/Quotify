@@ -590,3 +590,58 @@ pub(super) fn pacman_mouth(p: f32) -> f32 {
     };
     0.02 + ratio * 0.94
 }
+
+#[cfg(test)]
+mod tests {
+    use super::pacman_mouth;
+
+    /// Endpoints pinned: p=0 and p=1 are the same closed mouth (0.02),
+    /// as is every exact eighth in between
+    #[test]
+    fn pacman_mouth_endpoints_closed() {
+        assert_eq!(pacman_mouth(0.0), 0.02);
+        assert_eq!(pacman_mouth(1.0), 0.02);
+        for p in [0.125f32, 0.25, 0.5, 0.75] {
+            assert_eq!(pacman_mouth(p), 0.02);
+        }
+    }
+
+    /// Phase 0.65 is the open/close switch: widest (0.96) at the seam,
+    /// opening before it, closing after it, and no jump across it
+    #[test]
+    fn pacman_mouth_switches_at_phase_065() {
+        let at = |phase: f32| pacman_mouth(phase / 8.0);
+        assert!((at(0.65) - 0.96).abs() < 1e-6);
+        assert!(at(0.50) < at(0.60) && at(0.60) < at(0.65));
+        assert!(at(0.65) > at(0.70) && at(0.70) > at(0.80));
+        // The two arms agree at the seam itself
+        assert!((at(0.65) - at(0.6499)).abs() < 0.01);
+    }
+
+    /// Out-of-range p: a negative phase floors through smoothstep's
+    /// clamp to the closed mouth; p past 1 wraps by period, no clamping
+    #[test]
+    fn pacman_mouth_out_of_range_input() {
+        assert_eq!(pacman_mouth(-0.05), 0.02);
+        assert_eq!(pacman_mouth(-0.3), 0.02);
+        assert_eq!(pacman_mouth(-1.0), 0.02);
+        assert!((pacman_mouth(1.07) - pacman_mouth(0.07)).abs() < 1e-6);
+        assert!((pacman_mouth(10.5) - pacman_mouth(0.5)).abs() < 1e-6);
+    }
+
+    /// Continuity: a 1/512 grid never jumps between adjacent samples —
+    /// smoothstep's slope bound stays far under the threshold, while a
+    /// seam mismatch between the arms would break it
+    #[test]
+    fn pacman_mouth_continuous_across_phase() {
+        let steps = 512;
+        let mut prev = pacman_mouth(0.0);
+        for i in 1..=steps {
+            let m = pacman_mouth(i as f32 / steps as f32);
+            assert!((m - prev).abs() < 0.08);
+            prev = m;
+        }
+        // The wrap seam joins the closing arm's tail back to closed
+        assert!((pacman_mouth(1.0) - pacman_mouth(1.0 - 1.0 / steps as f32)).abs() < 0.08);
+    }
+}

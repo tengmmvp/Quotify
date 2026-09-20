@@ -1,18 +1,24 @@
-//! Quotify — Windows 任务栏托盘的 GLM Coding Plan 用量小组件
+//! Quotify — a tray widget for GLM Coding Plan usage on the Windows taskbar
 //!
-//! 分层：`app` 装配 / `api` 数据 / `ui` 界面 / `platform` 平台服务 / `service` 后台服务
+//! Layering: `app` assembly / `api` data / `ui` interface / `platform` platform services
+//! / `service` background services
 
-// release 用 GUI 子系统：控制台窗口被关闭会杀死进程。debug 保留控制台看日志。
+// Release builds use the GUI subsystem: closing the console window would kill the
+// process. Debug keeps a console for logs.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod api;
 mod app;
+mod locks;
 mod platform;
 mod service;
 mod ui;
 
 fn main() {
-    // 单实例：已有实例时唤醒它弹出面板，然后静默退出。
+    // The api layer's log sink is injected here: the data layer stays platform-agnostic.
+    api::set_log_hook(platform::log);
+    // Single instance: when an instance already exists, wake it to pop out the panel,
+    // then exit silently.
     let guard = platform::instance::acquire();
     if !guard.is_first() {
         guard.wake_existing();

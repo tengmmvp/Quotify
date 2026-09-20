@@ -1,7 +1,9 @@
-//! 托盘菜单跟随主题
+//! Tray menu follows the theme
 //!
-//! 菜单暗色无官方 API：uxtheme 仅按序号导出（135=SetPreferredAppMode、
-//! 136=FlushMenuThemes），Win10 1809+ 可用；取不到时保持系统默认浅色菜单。
+//! No official API exists for dark menus: uxtheme exports these only by
+//! ordinal (135=SetPreferredAppMode, 136=FlushMenuThemes), available on
+//! Win10 1809+; when they cannot be resolved, the system default light
+//! menu stays.
 
 use std::sync::OnceLock;
 
@@ -14,12 +16,14 @@ use super::wide;
 type SetMode = unsafe extern "system" fn(i32) -> i32;
 type Flush = unsafe extern "system" fn();
 
-/// 进程级菜单主题入口，加载一次缓存；任一序号缺失则整体不可用
+/// Process-wide menu theme entry points, loaded once and cached; if either
+/// ordinal is missing, the whole feature is unavailable.
 fn entries() -> Option<(SetMode, Flush)> {
     static FNS: OnceLock<Option<(SetMode, Flush)>> = OnceLock::new();
     *FNS.get_or_init(|| unsafe {
         let lib = LoadLibraryW(PCWSTR(wide("uxtheme.dll").as_ptr())).ok()?;
-        // GetProcAddress 约定：名字指针数值 < 0x10000 时按序号解析。
+        // GetProcAddress convention: a name pointer whose numeric value is
+        // < 0x10000 is resolved as an ordinal.
         let set = GetProcAddress(lib, PCSTR(135usize as *const u8))?;
         let flush = GetProcAddress(lib, PCSTR(136usize as *const u8))?;
         Some((
@@ -29,12 +33,15 @@ fn entries() -> Option<(SetMode, Flush)> {
     })
 }
 
-/// 锁定此后弹出菜单的深浅，与面板 resolved 外观同步
+/// Locks the light/dark mode of menus popped from now on, in sync with the
+/// panel's resolved appearance.
 pub fn apply(dark: bool) {
     if let Some((set, flush)) = entries() {
         unsafe {
-            // PreferredAppMode：Default=0/AllowDark=1/ForceDark=2/ForceLight=3，
-            // 用 Force 值直接钉住目标态，不依赖系统当前的 AppsUseLightTheme。
+            // PreferredAppMode: Default=0/AllowDark=1/ForceDark=2/
+            // ForceLight=3. Use the Force values to pin the target state
+            // directly, without depending on the system's current
+            // AppsUseLightTheme.
             set(if dark { 2 } else { 3 });
             flush();
         }
@@ -43,7 +50,8 @@ pub fn apply(dark: bool) {
 
 #[cfg(test)]
 mod tests {
-    /// 真机 uxtheme 存在时 apply 可往返调用不 panic；缺失时静默降级
+    /// When uxtheme exists on the machine, apply can be called round-trip
+    /// without panicking; when missing, it degrades silently.
     #[test]
     fn apply_roundtrip_smoke() {
         super::apply(true);

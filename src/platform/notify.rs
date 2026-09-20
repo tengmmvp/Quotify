@@ -1,13 +1,15 @@
-//! 系统 Toast 通知
+//! System toast notifications
 
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::core::HSTRING;
 
-/// Toast 归属标识：未在注册表登记的标识发通知会被系统直接丢弃
+/// Toast ownership identifier: notifications sent under an identifier not
+/// registered in the registry are dropped outright by the system.
 const AUMID: &str = "Quotify.Quotify";
 
-/// 启动时登记 AUMID：通知中心里显示应用名 Quotify；重复调用无副作用
+/// Register the AUMID at startup: the Action Center then shows the app
+/// name Quotify; repeated calls have no side effects.
 pub fn ensure_aumid() {
     match windows_registry::CURRENT_USER
         .create(r"Software\Classes\AppUserModelId\Quotify.Quotify")
@@ -18,9 +20,10 @@ pub fn ensure_aumid() {
     }
 }
 
-/// 弹出系统 Toast：标题一行加粗 + 正文一行
+/// Show a system toast: one bold title line plus one body line.
 pub fn show(title: &str, body: &str) {
-    // 文案拼进 XML，&<> 转义防破坏结构
+    // The text is spliced into XML; escape &<> so it cannot break the
+    // structure.
     let esc = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")

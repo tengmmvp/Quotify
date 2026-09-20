@@ -1,4 +1,4 @@
-//! 配置持久化
+//! Configuration persistence
 
 use std::path::{Path, PathBuf};
 
@@ -7,31 +7,31 @@ use serde::{Deserialize, Serialize};
 use crate::api::Platform;
 use crate::service::poller::DEFAULT_INTERVAL_SECS;
 
-/// 全局偏好
+/// Global preferences
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct General {
-    /// 轮询间隔（秒）
+    /// Polling interval (seconds)
     pub poll_interval_secs: u64,
-    /// 界面语言；None = 跟随系统
+    /// UI language; None = follow the system
     pub language: Option<String>,
-    /// 外观模式；None = 跟随系统，可选 "light" / "dark"
+    /// Appearance; None = follow the system, accepts "light" / "dark"
     pub appearance: Option<String>,
-    /// 网络代理地址；None = 直连，形如 "http://host:port" / "socks5://host:port"
+    /// Proxy address; None = direct connection, e.g. "http://host:port" / "socks5://host:port"
     pub proxy: Option<String>,
-    /// 用量阈值预警开关
+    /// Usage threshold alert toggle
     pub notify_threshold_enabled: bool,
-    /// 预警阈值百分比
+    /// Alert threshold percentage
     pub notify_threshold_percent: u8,
-    /// 5 小时窗口重置提醒
+    /// 5-hour window reset notification
     pub notify_reset_5h_enabled: bool,
-    /// 周额度重置提醒
+    /// Weekly quota reset notification
     pub notify_reset_weekly_enabled: bool,
-    /// 高峰区间开始 HH:MM
+    /// Peak window start HH:MM
     pub peak_start: String,
-    /// 高峰区间结束 HH:MM
+    /// Peak window end HH:MM
     pub peak_end: String,
-    /// 已读动态的日期（YYYY-MM-DD）
+    /// Date of the last read repo news item (YYYY-MM-DD)
     pub last_news_read: Option<String>,
 }
 
@@ -53,31 +53,32 @@ impl Default for General {
     }
 }
 
-/// 一个受监控的 GLM 账号
-/// 字段序同添加页表单（名称→平台→类型→组织→项目），凭据收尾；
-/// 此序即 config.toml 写出顺序
+/// One monitored GLM account
+/// Field order mirrors the add-account form (name → platform → type →
+/// org → project) with credentials last; this order is also the
+/// config.toml write-out order
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Account {
-    /// 稳定 id
+    /// Stable id
     pub id: String,
-    /// 显示名
+    /// Display name
     pub name: String,
-    /// 站点：国内 open.bigmodel.cn / 国际 api.z.ai
+    /// Site: CN open.bigmodel.cn / international api.z.ai
     pub platform: Platform,
-    /// 团队版标记，仅国内站；请求走 `?type=2` + 组织/项目选择头
+    /// Team-edition flag, CN site only; requests carry `?type=2` + the org/project selection headers
     #[serde(default)]
     pub team: bool,
-    /// 团队版：`Bigmodel-Organization` 头的值
+    /// Team edition: value of the `Bigmodel-Organization` header
     #[serde(default)]
     pub org_id: String,
-    /// 团队版：`Bigmodel-Project` 头的值
+    /// Team edition: value of the `Bigmodel-Project` header
     #[serde(default)]
     pub project_id: String,
     /// API key
     pub api_key: String,
 }
 
-/// 应用全量配置
+/// Full application configuration
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -87,25 +88,56 @@ pub struct Config {
 }
 
 impl Config {
-    /// 生成账号 id
+    /// Generates an account id: session entropy plus an in-process
+    /// counter. The two cover everything — the counter distinguishes
+    /// remove-then-add within the same millisecond, the entropy
+    /// distinguishes ids across sessions and imports (an imported id is
+    /// reused as-is, never regenerated), and stacking timestamp or
+    /// sub-second parts on top only lengthens what lands in the user's
+    /// config file.
     pub fn new_account_id(&self) -> String {
-        let now = chrono::Utc::now();
-        let ms = now.timestamp_subsec_millis() as i64;
-        let sec = now.timestamp();
-        format!("acc_{sec:x}{ms:x}{}", self.accounts.len())
+        use std::hash::{BuildHasher, Hasher};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        static SESSION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let entropy = *SESSION.get_or_init(|| {
+            std::collections::hash_map::RandomState::new()
+                .build_hasher()
+                .finish()
+        });
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        format!("acc_{entropy:x}{seq:x}")
     }
 
-    /// 选中账号
-    pub fn selected_account(&self) -> Option<&Account> {
+    /// The selected account and its index: looked up by selected, falling
+    /// back to the first entry when missing. The single implementation of
+    /// the selection-fallback semantics, shared by the polling target and
+    /// the presentation layer.
+    pub fn selected_account(&self) -> Option<(usize, &Account)> {
         let sel = self.selected.as_deref()?;
         self.accounts
             .iter()
-            .find(|a| a.id == sel)
-            .or_else(|| self.accounts.first())
+            .enumerate()
+            .find(|(_, a)| a.id == sel)
+            .or_else(|| self.accounts.first().map(|a| (0, a)))
+    }
+
+    /// selected missing or dangling backfills the first account: shared by
+    /// normalization and account removal. While dangling, the polling
+    /// target still works through selected_account's first-entry fallback,
+    /// but the config would keep persisting a dead reference.
+    pub(crate) fn backfill_selected(&mut self) {
+        let valid = self
+            .accounts
+            .iter()
+            .any(|a| self.selected.as_deref() == Some(a.id.as_str()));
+        if !valid {
+            self.selected = self.accounts.first().map(|a| a.id.clone());
+        }
     }
 }
 
-/// 配置文件路径
+/// Config file path
 pub fn config_path() -> PathBuf {
     std::env::current_exe()
         .ok()
@@ -114,7 +146,8 @@ pub fn config_path() -> PathBuf {
         .join("config.toml")
 }
 
-/// 首次启动写出的模板：可选项用注释示例，赋空串会与 Default 的 None 不等
+/// Template written on first launch: optional keys are shown as commented
+/// examples — assigning an empty string would differ from Default's None
 const TEMPLATE: &str = r#"# Quotify 配置文件
 # 通常通过面板内「设置」页管理，无需手动编辑；改完重启生效。
 # API key 明文保存在本机，请勿分享此文件。
@@ -154,7 +187,8 @@ peak_end = "18:00"
 # selected = ""
 "#;
 
-/// 解析配置文本：损坏时坏文件改名留档并回退默认配置
+/// Parses config text: on corruption the broken file is renamed for the
+/// record and the default config is used as fallback
 fn parse_or_default(text: &str, path: &Path) -> (Config, bool) {
     toml::from_str(text)
         .map(|c| (c, false))
@@ -181,7 +215,8 @@ fn parse_or_default(text: &str, path: &Path) -> (Config, bool) {
         })
 }
 
-/// 坏文件改名 .bak 留档后再回退默认，用户手改的内容有处可寻
+/// Renames the broken file to .bak for the record before falling back to
+/// defaults, so the user's hand-edited content remains retrievable
 fn backup_broken(path: &Path) {
     if path.exists() {
         let bak = path.with_extension("toml.bak");
@@ -193,15 +228,18 @@ fn backup_broken(path: &Path) {
     }
 }
 
-/// 读取配置：解析失败留档回退默认；不存在写模板；其余读失败
-/// 只回退默认不动磁盘。
+/// Loads the config: parse failure keeps the file for the record and
+/// falls back to defaults; a missing file writes the template; any other
+/// read failure only falls back to defaults without touching disk.
 pub fn load() -> Config {
     let path = config_path();
-    // 清理上次进程在 write→rename 之间被杀时遗留的临时文件。
+    // Clean up the temp file left behind when the previous process was
+    // killed between write → rename.
     let _ = std::fs::remove_file(path.with_extension("toml.tmp"));
     match std::fs::read_to_string(&path) {
         Ok(text) => {
-            // 旧版本写下的文件没有收紧过 ACL，启动时统一补一次[幂等]。
+            // Files written by older versions never had their ACL tightened;
+            // catch up once for all at startup [idempotent].
             crate::platform::secure_file_acl(&path);
             let (cfg, broken) = parse_or_default(&text, &path);
             if broken {
@@ -211,13 +249,11 @@ pub fn load() -> Config {
             cfg
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // 模板本身不含 key，但用户可能直接手填，落盘即统一收紧；
-            // 写失败时无文件可加固，只记日志。
-            match std::fs::write(&path, TEMPLATE) {
-                Ok(()) => crate::platform::secure_file_acl(&path),
-                Err(e) => {
-                    crate::platform::log(&format!("config.toml 模板写入失败: {e}"));
-                }
+            // The template itself carries no key, but the user may fill one
+            // in by hand: tighten at creation — no window where the file
+            // lands on disk first and gets its ACL changed afterwards.
+            if let Err(e) = crate::platform::write_private(&path, TEMPLATE) {
+                crate::platform::log(&format!("config.toml 模板写入失败: {e}"));
             }
             Config::default()
         }
@@ -228,7 +264,8 @@ pub fn load() -> Config {
     }
 }
 
-/// 写回配置文件；先写临时文件再改名覆盖，中途失败原文件不被截断
+/// Persists the config file; writes a temp file first then renames over
+/// the original, so a mid-way failure never truncates the original
 pub fn save(config: &Config) {
     let path = config_path();
     let tmp = path.with_extension("toml.tmp");
@@ -239,14 +276,14 @@ pub fn save(config: &Config) {
             return;
         }
     };
-    if let Err(e) = std::fs::write(&tmp, &text) {
+    // The tmp file carries a restricted DACL at creation, then rename
+    // finalizes it: renaming preserves the security descriptor, so there
+    // is never a "plain text exposed first" window.
+    if let Err(e) = crate::platform::write_private(&tmp, &text) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));
         let _ = std::fs::remove_file(&tmp);
         return;
     }
-    // tmp 先收紧再 rename：改名保留安全描述符，落定后无需再写 ACL，
-    // 省一次 SD 写；tmp 收紧失败的罕见场景由下次启动 load 补紧兜底。
-    crate::platform::secure_file_acl(&tmp);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         crate::platform::log(&format!("config.toml 写入失败: {e}"));
         let _ = std::fs::remove_file(&tmp);
@@ -257,8 +294,11 @@ pub fn save(config: &Config) {
 mod tests {
     use super::*;
 
-    /// 模板解析结果与默认配置逐字段相等，TEMPLATE 与 Default 漂移在此全量报警；
-    /// 先断言可解析——parse_or_default 吞错回退默认，语法损坏时相等断言空真
+    /// The parsed template must equal the default config field by field;
+    /// any drift between TEMPLATE and Default is fully flagged here. Assert
+    /// parseability first — parse_or_default swallows errors into the
+    /// default fallback, making the equality assertion vacuously true on
+    /// broken syntax.
     #[test]
     fn template_parses_back() {
         toml::from_str::<Config>(TEMPLATE).expect("TEMPLATE 必须可解析");
@@ -267,7 +307,8 @@ mod tests {
         assert_eq!(cfg, Config::default());
     }
 
-    /// 损坏文本回退默认配置并置回退标记，不 panic、不部分采用
+    /// Corrupted text falls back to the default config with the fallback
+    /// flag set: no panic, no partial adoption
     #[test]
     fn corrupted_text_falls_back_to_default() {
         let (cfg, broken) = parse_or_default(
@@ -283,7 +324,8 @@ mod tests {
         assert!(cfg.selected.is_none());
     }
 
-    /// 旧版配置缺团队字段时按默认值反序列化
+    /// Configs from older versions missing team fields deserialize with
+    /// default values
     #[test]
     fn account_team_fields_default_when_missing() {
         let text = r#"

@@ -85,7 +85,7 @@ impl<T: Send> BackgroundTask<T> {
             }) {
             Ok(_) => true,
             Err(e) => {
-                crate::platform::log(&format!("[Quotify] 后台线程创建失败: {e}"));
+                crate::platform::log(&format!("后台线程创建失败: {e}"));
                 false
             }
         }

@@ -119,6 +119,8 @@ pub struct Strings {
     pub platform_section: &'static str,
     pub add_account: &'static str,
     pub account_name: &'static str,
+    /// Fallback name when the add form's name is left empty
+    pub default_account_name: &'static str,
     pub account_platform: &'static str,
     pub platform_cn: &'static str,
     pub platform_intl: &'static str,
@@ -182,6 +184,8 @@ pub struct Strings {
     pub import_done: &'static str,
     pub import_done_proxy_skipped: &'static str,
     pub import_failed: &'static str,
+    /// Import rejection: the file's account count exceeds MAX_ACCOUNTS
+    pub import_failed_too_many: &'static str,
     pub import_confirm_title: &'static str,
     pub import_confirm_body: &'static str,
     pub check_update: &'static str,
@@ -195,6 +199,8 @@ pub struct Strings {
     pub link_repo: &'static str,
     pub link_issues: &'static str,
     pub link_diag: &'static str,
+    /// Heading of the recent-logs section appended to the copied diagnostics text
+    pub diag_recent_logs: &'static str,
     pub whats_new_section: &'static str,
     /// Quote shown after the easter egg has been fully consumed
     pub egg_quote: &'static str,
@@ -207,8 +213,11 @@ pub struct Strings {
     pub notify_diag_copied: &'static str,
     /// Copy-diagnostics failure feedback (clipboard busy, etc.)
     pub notify_copy_failed: &'static str,
+    pub notify_interval_invalid: &'static str,
     pub notify_proxy_invalid: &'static str,
     pub notify_team_required: &'static str,
+    /// Add-form rejection: the account count is at MAX_ACCOUNTS
+    pub notify_account_limit: &'static str,
 }
 
 const ZH: Strings = Strings {
@@ -277,6 +286,7 @@ const ZH: Strings = Strings {
     platform_section: "账号信息",
     add_account: "添加账号",
     account_name: "名称",
+    default_account_name: "默认账号",
     account_platform: "平台",
     platform_cn: "国内版",
     platform_intl: "国际版",
@@ -339,6 +349,7 @@ const ZH: Strings = Strings {
     import_done: "配置已导入",
     import_done_proxy_skipped: "已导入；代理地址无效，沿用原代理",
     import_failed: "导入失败：文件不可读或格式无效",
+    import_failed_too_many: "导入失败：账号数超上限",
     import_confirm_title: "导入确认",
     import_confirm_body: "导入将整体覆盖当前的账号与设置，代理若不同也会切换。确定继续？",
     check_update: "检查更新",
@@ -352,6 +363,7 @@ const ZH: Strings = Strings {
     link_repo: "开源仓库",
     link_issues: "问题反馈",
     link_diag: "复制诊断",
+    diag_recent_logs: "最近日志",
     whats_new_section: "最新动态",
     egg_quote: "人不能两次踏进同一条河流。",
 
@@ -362,8 +374,10 @@ const ZH: Strings = Strings {
     notify_config_broken: "config.toml 解析失败，已回退默认配置，原文件留档为 config.toml.bak，账号与设置需重新配置",
     notify_diag_copied: "诊断信息已复制到剪贴板",
     notify_copy_failed: "复制失败：剪贴板被占用，请稍后重试",
+    notify_interval_invalid: "自定义间隔无效：{v}",
     notify_proxy_invalid: "代理地址无效，未保存",
     notify_team_required: "团队账号需填写组织 ID 与项目 ID",
+    notify_account_limit: "账号数已达上限（100）",
 };
 
 const EN: Strings = Strings {
@@ -432,6 +446,7 @@ const EN: Strings = Strings {
     platform_section: "Account details",
     add_account: "Add account",
     account_name: "Name",
+    default_account_name: "Default",
     account_platform: "Platform",
     platform_cn: "China",
     platform_intl: "Global",
@@ -494,6 +509,7 @@ const EN: Strings = Strings {
     import_done: "Configuration imported",
     import_done_proxy_skipped: "Imported; invalid proxy kept the previous one",
     import_failed: "Import failed: unreadable or invalid file",
+    import_failed_too_many: "Import failed: too many accounts",
     import_confirm_title: "Import confirmation",
     import_confirm_body: "Importing replaces all current accounts and settings; a different proxy also takes effect. Continue?",
     check_update: "Check for updates",
@@ -507,6 +523,7 @@ const EN: Strings = Strings {
     link_repo: "Repository",
     link_issues: "Feedback",
     link_diag: "Copy diagnostics",
+    diag_recent_logs: "Recent logs",
     whats_new_section: "What's New",
     egg_quote: "No man ever steps in the same river twice.",
 
@@ -517,8 +534,10 @@ const EN: Strings = Strings {
     notify_config_broken: "config.toml failed to parse; defaults restored and the original saved as config.toml.bak. Accounts and settings need to be re-entered",
     notify_diag_copied: "Diagnostics copied to clipboard",
     notify_copy_failed: "Copy failed: the clipboard is busy, try again shortly",
+    notify_interval_invalid: "Invalid custom interval: {v}",
     notify_proxy_invalid: "Invalid proxy address; not saved",
     notify_team_required: "Team accounts require Organization ID and Project ID",
+    notify_account_limit: "Account limit reached (100)",
 };
 
 impl Lang {
@@ -602,6 +621,11 @@ mod tests {
             ("notify_threshold_desc", ZH.notify_threshold_desc, &["p"]),
             ("version_label", ZH.version_label, &["v"]),
             ("version_new", ZH.version_new, &["cur", "new"]),
+            (
+                "notify_interval_invalid",
+                ZH.notify_interval_invalid,
+                &["v"],
+            ),
         ];
         for (name, text, expect) in cases {
             assert_eq!(&placeholder_set(text), expect, "占位符漂移: {name}");

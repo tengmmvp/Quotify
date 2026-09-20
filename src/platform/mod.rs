@@ -9,7 +9,7 @@ pub mod post;
 
 use windows::Win32::Foundation::{HANDLE, HWND};
 use windows::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-use windows::Win32::UI::WindowsAndMessaging::WM_APP;
+use windows::Win32::UI::WindowsAndMessaging::{HICON, WM_APP};
 use windows::core::PCWSTR;
 
 /// str → UTF-16
@@ -17,10 +17,76 @@ pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-/// Unified diagnostic logging
+/// Ring capacity for recent log lines: 64 entries × 512 bytes ≈ 32 KiB
+/// worst case, within the lightweight-memory red line.
+const LOG_RING_CAP: usize = 64;
+/// Per-entry byte cap for ring lines.
+const LOG_ENTRY_MAX_BYTES: usize = 512;
+
+/// Tail of recent log lines backing the diagnostics export's recent-logs
+/// section.
+static RECENT_LOGS: std::sync::Mutex<std::collections::VecDeque<String>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+/// Byte-level truncation landing on a char boundary: slicing into a
+/// multi-byte sequence's interior would panic, so the cut backs off to
+/// that character's start. Shared by the log ring and input-field
+/// prefill clamping — one truncation policy, not one per caller.
+pub(crate) fn truncate_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Push one line into the ring, dropping the oldest entry when full.
+fn ring_push(ring: &mut std::collections::VecDeque<String>, line: &str) {
+    if ring.len() >= LOG_RING_CAP {
+        ring.pop_front();
+    }
+    ring.push_back(truncate_bytes(line, LOG_ENTRY_MAX_BYTES).to_string());
+}
+
+/// Masks the account-name segment of a `\Users\<name>\` path as `***` so
+/// diagnostics output carries no Windows account name; anything outside
+/// that segment passes through unchanged. ASCII lowercasing is
+/// byte-for-byte, so indices found in the lowered copy stay valid here.
+pub(crate) fn redact_user_segment(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    let Some(start) = lower.find("\\users\\") else {
+        return path.to_string();
+    };
+    let name_start = start + "\\users\\".len();
+    let name_end = path[name_start..]
+        .find('\\')
+        .map_or(path.len(), |i| name_start + i);
+    // An empty name is not a profile segment; pass through unchanged.
+    if name_end == name_start {
+        return path.to_string();
+    }
+    format!("{}***{}", &path[..name_start], &path[name_end..])
+}
+
+/// Unified diagnostic logging: the `[Quotify] ` prefix is single-sourced
+/// here (call sites stay bare), and the whole prefixed line passes the
+/// profile-name redaction before it leaves the process — the debug output
+/// and the recent ring (the diagnostics export's tail) share the same
+/// redacted line, so an embedded config path leaks no account name into
+/// either sink.
 pub fn log(msg: &str) {
-    let w = wide(msg);
+    let line = redact_user_segment(&format!("[Quotify] {msg}"));
+    ring_push(&mut crate::locks::borrow(&RECENT_LOGS), &line);
+    let w = wide(&line);
     unsafe { OutputDebugStringW(PCWSTR(w.as_ptr())) };
+}
+
+/// Oldest-first snapshot clone of the recent log lines
+pub fn recent_logs() -> Vec<String> {
+    crate::locks::borrow(&RECENT_LOGS).iter().cloned().collect()
 }
 
 /// Whether the foreground window belongs to this program: shared by the
@@ -35,6 +101,37 @@ pub fn foreground_is_self() -> bool {
         }
         windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(fg, None)
             == windows::Win32::System::Threading::GetCurrentThreadId()
+    }
+}
+
+/// Load the embedded icon resource (resource ID 1; the matching .ico layer
+/// is chosen by size). Two consumption modes share this single loader:
+/// the tray path passes a concrete pixel size with shared = false and owns
+/// the returned handle — the caller destroys it; the window-class path
+/// passes px = 0 with shared = true for LR_DEFAULTSIZE | LR_SHARED, whose
+/// handle belongs to the system — never destroy it. Resource loading
+/// stays on the platform side so neither the window-class boilerplate nor
+/// the tray code carries its own copy.
+pub(crate) fn load_resource_icon(px: i32, shared: bool) -> Option<HICON> {
+    let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()? };
+    #[allow(clippy::manual_dangling_ptr)]
+    let resid = 1usize as *const u16;
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::LoadImageW(
+            Some(hinst.into()),
+            PCWSTR(resid),
+            windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
+            px,
+            px,
+            if shared {
+                windows::Win32::UI::WindowsAndMessaging::LR_DEFAULTSIZE
+                    | windows::Win32::UI::WindowsAndMessaging::LR_SHARED
+            } else {
+                Default::default()
+            },
+        )
+        .ok()
+        .map(|h| HICON(h.0))
     }
 }
 
@@ -59,7 +156,7 @@ pub fn register_wnd_class(
             hInstance: hinst.into(),
             lpszClassName: PCWSTR(name.as_ptr()),
             hbrBackground: windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut()),
-            hIcon: crate::ui::icon::app_icon(hinst.into()).unwrap_or_default(),
+            hIcon: load_resource_icon(0, true).unwrap_or_default(),
             ..Default::default()
         };
         RegisterClassW(&wc) != 0
@@ -103,7 +200,7 @@ pub fn create_tool_window(
             None,
         )
         .unwrap_or_else(|e| {
-            log(&format!("[Quotify] {log_tag}创建失败: {e}"));
+            log(&format!("{log_tag}创建失败: {e}"));
             windows::Win32::Foundation::HWND::default()
         });
         if hwnd.is_invalid() {
@@ -147,7 +244,7 @@ pub mod msg {
 /// Open a link in the default browser
 pub fn open_url(url: &str) {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
-        log(&format!("[Quotify] 拒绝非 http(s) 链接: {url}"));
+        log(&format!("拒绝非 http(s) 链接: {url}"));
         return;
     }
     use windows::Win32::UI::Shell::ShellExecuteW;
@@ -166,7 +263,7 @@ pub fn open_url(url: &str) {
     };
     // A return value <= 32 indicates failure.
     if r.0 as isize <= 32 {
-        log(&format!("[Quotify] 打开链接失败: {url}"));
+        log(&format!("打开链接失败: {url}"));
     }
 }
 
@@ -244,7 +341,7 @@ pub fn secure_file_acl(path: &std::path::Path) {
     match PrivateAcl::build() {
         Ok(acl) => tighten_best_effort(path, &acl),
         Err(e) => log(&format!(
-            "[Quotify] 文件 ACL 加固失败[尽力而为]: {} ({e})",
+            "文件 ACL 加固失败[尽力而为]: {} ({e})",
             path.display()
         )),
     }
@@ -255,7 +352,7 @@ pub fn secure_file_acl(path: &std::path::Path) {
 fn tighten_best_effort(path: &std::path::Path, acl: &PrivateAcl) {
     if let Err(e) = set_restrictive_dacl(path, acl.acl) {
         log(&format!(
-            "[Quotify] 文件 ACL 加固失败[尽力而为]: {} ({e})",
+            "文件 ACL 加固失败[尽力而为]: {} ({e})",
             path.display()
         ));
     }
@@ -318,7 +415,7 @@ pub fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<
     let acl = match private_acl() {
         Ok(acl) => Some(acl),
         Err(e) => {
-            crate::platform::log(&format!("[Quotify] 受限 ACL 构建失败，回退普通写入: {e}"));
+            crate::platform::log(&format!("受限 ACL 构建失败，回退普通写入: {e}"));
             None
         }
     };
@@ -649,5 +746,106 @@ mod tests {
         super::write_private(&p, "new").expect("受限创建应成功");
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "new");
         let _ = std::fs::remove_file(&p);
+    }
+
+    /// Ring mechanics on a local deque: over-capacity pushes drop the
+    /// oldest, and the per-entry byte cap truncates onto char boundaries.
+    #[test]
+    fn ring_push_cap_and_truncation() {
+        use super::{LOG_ENTRY_MAX_BYTES, LOG_RING_CAP, ring_push};
+        let mut ring = std::collections::VecDeque::new();
+        for i in 0..LOG_RING_CAP + 10 {
+            ring_push(&mut ring, &format!("line-{i}"));
+        }
+        assert_eq!(ring.len(), LOG_RING_CAP);
+        assert_eq!(ring.front().unwrap(), "line-10");
+        assert_eq!(ring.back().unwrap(), &format!("line-{}", LOG_RING_CAP + 9));
+        // Short lines pass through unchanged.
+        ring_push(&mut ring, "ok");
+        assert_eq!(ring.back().unwrap(), "ok");
+        // 3-byte characters: byte 512 lands mid-character, so the cut
+        // backs off to the boundary at 510 bytes (170 characters).
+        let wide = "中".repeat(LOG_ENTRY_MAX_BYTES);
+        ring_push(&mut ring, &wide);
+        let last = ring.back().unwrap();
+        assert!(last.len() <= LOG_ENTRY_MAX_BYTES);
+        assert!(std::str::from_utf8(last.as_bytes()).is_ok());
+        assert_eq!(last.chars().count(), LOG_ENTRY_MAX_BYTES / 3);
+        assert!(wide.starts_with(last));
+    }
+
+    /// log() lands the prefixed line in the shared ring and the snapshot
+    /// sees it; containment assertions stay robust against other tests
+    /// logging concurrently.
+    #[test]
+    fn log_ring_snapshot_has_prefix() {
+        super::log("环测 marker-log-ring");
+        assert!(
+            super::recent_logs()
+                .iter()
+                .any(|l| l == "[Quotify] 环测 marker-log-ring")
+        );
+    }
+
+    /// The profile-name segment is masked and nothing else: non-ASCII
+    /// names, case-variant separators, non-profile paths, and an empty
+    /// name segment
+    #[test]
+    fn redact_user_segment_masks_profile_name() {
+        use super::redact_user_segment;
+        assert_eq!(
+            redact_user_segment(r"C:\Users\滕腾\Downloads\Quotify\config.toml"),
+            r"C:\Users\***\Downloads\Quotify\config.toml"
+        );
+        assert_eq!(
+            redact_user_segment(r"c:\users\bob\config.toml"),
+            r"c:\users\***\config.toml"
+        );
+        assert_eq!(redact_user_segment(r"C:\Users\bob"), r"C:\Users\***");
+        assert_eq!(
+            redact_user_segment(r"D:\Apps\Quotify\config.toml"),
+            r"D:\Apps\Quotify\config.toml"
+        );
+        assert_eq!(
+            redact_user_segment(r"C:\Users\\config.toml"),
+            r"C:\Users\\config.toml"
+        );
+    }
+
+    /// The whole log line passes the redaction before landing in the ring:
+    /// an ACL-hardening failure log embedding the full config path must not
+    /// leak the account name into the diagnostics export's recent-logs
+    /// tail — the copy-side redaction of the Config line alone misses ring
+    /// lines. Containment assertions stay robust against other tests
+    /// logging concurrently.
+    #[test]
+    fn log_line_redacts_user_segment() {
+        super::log(&format!(
+            "环测 marker-log-redact: 无法加固 {}",
+            r"C:\Users\bob\AppData\Roaming\Quotify\config.toml"
+        ));
+        assert!(
+            super::recent_logs()
+                .iter()
+                .any(|l| l.contains(r"C:\Users\***\AppData") && !l.contains(r"\Users\bob"))
+        );
+    }
+
+    /// A poisoned ring must not take the log path down: locks::borrow
+    /// recovers the guard, so logging keeps working after a panic while
+    /// holding the lock. The ring stays poisoned afterwards and every
+    /// later access still goes through the same recovery.
+    #[test]
+    fn log_ring_poison_recovery() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = crate::locks::borrow(&super::RECENT_LOGS);
+            panic!("deliberate poisoning");
+        }));
+        super::log("poison-marker");
+        assert!(
+            super::recent_logs()
+                .iter()
+                .any(|l| l == "[Quotify] poison-marker")
+        );
     }
 }

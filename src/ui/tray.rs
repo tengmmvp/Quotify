@@ -76,7 +76,7 @@ impl TrayIcon {
             let ok = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
             if !ok {
                 log(&format!(
-                    "[Quotify] 托盘 NIM_ADD 失败: {}",
+                    "托盘 NIM_ADD 失败: {}",
                     windows::core::HRESULT::from_thread()
                 ));
             }
@@ -120,7 +120,7 @@ impl TrayIcon {
         let ok = unsafe { Shell_NotifyIconW(NIM_ADD, &nid).as_bool() };
         if !ok {
             log(&format!(
-                "[Quotify] 托盘重注册失败: {}",
+                "托盘重注册失败: {}",
                 windows::core::HRESULT::from_thread()
             ));
         }

@@ -16,7 +16,7 @@ pub fn ensure_aumid() {
         .and_then(|key| key.set_string("DisplayName", "Quotify"))
     {
         Ok(()) => {}
-        Err(e) => crate::platform::log(&format!("[Quotify] AUMID 登记失败，通知将不可用: {e}")),
+        Err(e) => crate::platform::log(&format!("AUMID 登记失败，通知将不可用: {e}")),
     }
 }
 
@@ -39,7 +39,7 @@ pub fn show(title: &str, body: &str) {
         return;
     };
     if doc.LoadXml(&HSTRING::from(xml.as_str())).is_err() {
-        crate::platform::log("[Quotify] Toast XML 解析失败");
+        crate::platform::log("Toast XML 解析失败");
         return;
     }
     let Ok(toast) = ToastNotification::CreateToastNotification(&doc) else {
@@ -49,11 +49,11 @@ pub fn show(title: &str, body: &str) {
     {
         Ok(n) => n,
         Err(e) => {
-            crate::platform::log(&format!("[Quotify] Toast notifier 创建失败: {e}"));
+            crate::platform::log(&format!("Toast notifier 创建失败: {e}"));
             return;
         }
     };
     if let Err(e) = notifier.Show(&toast) {
-        crate::platform::log(&format!("[Quotify] Toast 发送失败: {e}"));
+        crate::platform::log(&format!("Toast 发送失败: {e}"));
     }
 }

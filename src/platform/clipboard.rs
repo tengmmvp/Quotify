@@ -90,7 +90,7 @@ pub fn write_text(owner: HWND, text: &str) -> bool {
         };
 
         if !open_clipboard_retried(Some(owner)) {
-            crate::platform::log("[Quotify] 剪贴板打开失败");
+            crate::platform::log("剪贴板打开失败");
             return false;
         }
         let ok = (|| {
@@ -128,7 +128,7 @@ pub fn write_text(owner: HWND, text: &str) -> bool {
         })();
         let _ = CloseClipboard();
         if !ok {
-            crate::platform::log("[Quotify] 剪贴板写入失败");
+            crate::platform::log("剪贴板写入失败");
         }
         ok
     }

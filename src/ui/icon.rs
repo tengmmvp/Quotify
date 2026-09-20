@@ -25,43 +25,10 @@ pub(crate) fn tray_px() -> i32 {
 
 /// Loads an owned icon handle at the given size from the embedded resource,
 /// taking the matching layer of assets/icon.ico;
-/// the caller destroys it. No LR_SHARED — shared handles belong to the system, and
-/// destroying one would corrupt the shared cache
+/// the caller destroys it. Shared-handle loading and the resource-loading
+/// idiom live in the single platform-side source (`load_resource_icon`).
 pub fn resource_icon(px: i32) -> Option<HICON> {
-    let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()? };
-    #[allow(clippy::manual_dangling_ptr)]
-    let resid = 1usize as *const u16;
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::LoadImageW(
-            Some(hinst.into()),
-            windows::core::PCWSTR(resid),
-            windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
-            px,
-            px,
-            Default::default(),
-        )
-        .ok()
-        .map(|h| HICON(h.0))
-    }
-}
-
-/// Loads the app icon from the embedded resource
-pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
-    #[allow(clippy::manual_dangling_ptr)]
-    let resid = 1usize as *const u16;
-    unsafe {
-        windows::Win32::UI::WindowsAndMessaging::LoadImageW(
-            Some(hinst),
-            windows::core::PCWSTR(resid),
-            windows::Win32::UI::WindowsAndMessaging::IMAGE_ICON,
-            0,
-            0,
-            windows::Win32::UI::WindowsAndMessaging::LR_DEFAULTSIZE
-                | windows::Win32::UI::WindowsAndMessaging::LR_SHARED,
-        )
-        .ok()
-        .map(|h| HICON(h.0))
-    }
+    crate::platform::load_resource_icon(px, false)
 }
 
 /// Critical usage threshold (percent): shared by the tray icon's red tier and

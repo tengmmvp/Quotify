@@ -1,4 +1,4 @@
-//! 后台轮询线程
+//! Background polling thread
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -10,18 +10,21 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForMultipleO
 use crate::api::AccountSpec;
 use crate::platform::msg::WM_APP_POLL_RESULT;
 
-/// 默认轮询间隔（秒）
+/// Default polling interval (seconds)
 pub const DEFAULT_INTERVAL_SECS: u64 = 300;
-/// 轮询间隔下限（秒）
+/// Minimum polling interval (seconds)
 pub const MIN_POLL_SECS: u64 = 10;
-/// 轮询间隔上限（秒）= 1 天
+/// Maximum polling interval (seconds) = 1 day
 pub const MAX_POLL_SECS: u64 = 86_400;
-/// 429 指数退避基数（秒）：受限期间数据持续变化，快速重试争取恢复。
+/// 429 exponential backoff base (seconds): data keeps changing while the
+/// account is throttled, so quick retries strive for recovery.
 const RATE_LIMIT_BACKOFF_BASE_SECS: u64 = 30;
 
-/// 429 的下一次等待：连续失败翻倍封顶。
-/// Retry-After 头只作用本次，与指数档取大，不外溢到后续；
-/// 上限已在 client 侧钳过，此处不重复钳。
+/// Next wait after a 429: doubling per consecutive failure, capped.
+/// The Retry-After header applies to this round only, taken as the max
+/// against the exponential tier, never spilling into later rounds. The
+/// header value is ≤ the backoff cap by construction (FetchError::throttled
+/// owns the clamp), so it needs no re-clamping here.
 fn backoff_wait(fails: u32, retry_after_secs: Option<u64>) -> u64 {
     let exp = RATE_LIMIT_BACKOFF_BASE_SECS
         .saturating_mul(1 << fails.min(4))
@@ -29,31 +32,33 @@ fn backoff_wait(fails: u32, retry_after_secs: Option<u64>) -> u64 {
     retry_after_secs.map_or(exp, |ra| ra.max(exp))
 }
 
-/// 读取间隔并夹取到合法区间
+/// Read the interval and clamp it into the legal range
 fn clamp_interval(secs: u64) -> u64 {
     secs.clamp(MIN_POLL_SECS, MAX_POLL_SECS)
 }
 
-/// 一次轮询的结果，跨线程传递给主线程。
+/// One poll's result, handed to the main thread across threads.
 pub enum PollOutcome {
     Success(Box<crate::api::UsageSnapshot>),
     Failure(Box<crate::api::FetchError>),
 }
 
-/// 轮询结果的回传信封
+/// Envelope for posting a poll result back
 pub struct PollMessage {
     pub generation: u64,
     pub outcome: PollOutcome,
 }
 
-/// 轮询结果的回传通道：轮询线程入队，UI 线程被唤醒后排空。
+/// Channel for posting poll results back: the polling thread enqueues, the
+/// UI thread drains after being woken.
 pub static POLL_SLOT: crate::platform::post::Slot<PollMessage> = crate::platform::post::Slot::new();
 
 pub type PollTarget = Arc<Mutex<Option<AccountSpec>>>;
 pub type PollInterval = Arc<Mutex<u64>>;
 pub type PollGeneration = Arc<AtomicU64>;
 
-/// 后台轮询线程的所有者：发唤醒/停止信号，drop 时 join 回收。
+/// Owner of the background polling thread: sends the wake/stop signals and
+/// joins to reclaim on drop.
 pub struct Poller {
     wake: HANDLE,
     stop: HANDLE,
@@ -62,7 +67,7 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// 启动轮询线程
+    /// Spawn the polling thread
     pub fn spawn(
         hwnd: windows::Win32::Foundation::HWND,
         target: PollTarget,
@@ -71,26 +76,41 @@ impl Poller {
     ) -> Option<Self> {
         unsafe {
             let wake = CreateEventW(None, false, false, None).ok()?;
-            let stop = CreateEventW(None, true, false, None).ok()?;
+            // Partial-init rollback is symmetric with the thread-spawn arm
+            // below: a failed stop-event creation must close the already
+            // created wake handle, or it leaks with no log on this path.
+            let stop = match CreateEventW(None, true, false, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::platform::log(&format!("[Quotify] 轮询停止事件创建失败: {e}"));
+                    let _ = windows::Win32::Foundation::CloseHandle(wake);
+                    return None;
+                }
+            };
             let refresh_requested = Arc::new(AtomicBool::new(false));
             let flag = refresh_requested.clone();
 
-            // Win32 句柄是内核对象引用、跨线程移动安全，但 HANDLE 未实现 Send。
-            struct SendHandle<T>(T);
-            unsafe impl<T> Send for SendHandle<T> {}
-
-            let (hwnd_s, wake_s, stop_s) = (SendHandle(hwnd), SendHandle(wake), SendHandle(stop));
+            // Kernel handles cross threads through the shared SendCell
+            // wrapper (same invariant as the post side's).
+            let (hwnd_s, wake_s, stop_s) = (
+                crate::platform::post::SendCell(hwnd),
+                crate::platform::post::SendCell(wake),
+                crate::platform::post::SendCell(stop),
+            );
             let thread = match std::thread::Builder::new()
                 .name("quotify-poller".into())
                 .spawn(move || {
-                    // 先把 SendHandle 移入闭包局部，防 2021 精准捕获绕过包装破坏 Send。
+                    // Move the SendHandle into a closure local first, so
+                    // the 2021 precise capture cannot bypass the wrapper
+                    // and break Send.
                     let (h, w, s) = (hwnd_s, wake_s, stop_s);
                     poll_loop(h.0, target, interval, w.0, s.0, flag, generation)
                 }) {
                 Ok(t) => t,
                 Err(e) => {
-                    // 线程未起时 Poller 不会诞生，Drop 不再兜底，
-                    // 须在此关闭两事件句柄防泄漏。
+                    // If the thread fails to start, the Poller is never
+                    // born and Drop provides no fallback, so both event
+                    // handles must be closed here to avoid a leak.
                     crate::platform::log(&format!("[Quotify] 轮询线程创建失败，托盘将无数据: {e}"));
                     let _ = windows::Win32::Foundation::CloseHandle(wake);
                     let _ = windows::Win32::Foundation::CloseHandle(stop);
@@ -106,14 +126,30 @@ impl Poller {
         }
     }
 
-    /// 立即拉取一次的唤醒入口：手动刷新、改间隔/代理/换账号后立即
-    /// 生效，电源唤醒补拉同走此路——只打信号不置标志的话，睡眠跨在
-    /// 途拉取时拉取自身的重锚会把信号吃掉，补拉落空。
+    /// Wake entry for pulling once immediately: takes effect at once on
+    /// manual refresh, interval/proxy changes, or account switches; the
+    /// post-power-resume catch-up pull goes through here too — signaling
+    /// without also setting the flag would let the pull's own re-anchoring
+    /// consume the signal when sleep straddles an in-flight pull, and the
+    /// catch-up would be lost.
     pub fn refresh_now(&self) {
         self.refresh_requested.store(true, Ordering::Release);
         unsafe {
             let _ = SetEvent(self.wake);
         };
+    }
+
+    /// Abandon the polling thread without joining or closing anything:
+    /// session-end exit only — the process dies with the session
+    /// regardless, and Drop's join bound (one in-flight request's agent
+    /// timeout, up to ~15s) would stall the session teardown and risk the
+    /// OS force-killing the process before the tray cleanup runs. Stop is
+    /// signaled first so a thread at the wait point exits promptly.
+    pub fn detach(self) {
+        unsafe {
+            let _ = SetEvent(self.stop);
+        }
+        std::mem::forget(self);
     }
 }
 
@@ -123,6 +159,10 @@ impl Drop for Poller {
             let _ = SetEvent(self.stop);
         };
         if let Some(t) = self.thread.take() {
+            // The join upper bound is one in-flight request's agent-global
+            // timeout (15s for the main endpoint): only after the request
+            // returns does the loop reach the wait point again and see
+            // stop.
             let _ = t.join();
         }
         unsafe {
@@ -132,25 +172,31 @@ impl Drop for Poller {
     }
 }
 
-/// 间隔重排许可：间隔已变且无退避在场——退避期间节奏归退避锚独占，
-/// 重排会提前顶撞。拉取后与未到期唤醒两路同引。
+/// Permission to re-anchor by interval: the interval changed and no
+/// backoff is in effect — during backoff the cadence belongs to the
+/// backoff anchor alone, and re-anchoring would collide with it early.
+/// Shared by the post-fetch path and the not-yet-due wake path.
 fn interval_retunable(fails: u32, interval: u64, last_secs: u64) -> bool {
     interval != last_secs && fails == 0
 }
 
-/// 一轮拉取后的锚定动作
+/// Anchoring action after one fetch round
 enum Schedule {
-    /// 按给定秒数重锚：成功与自动失败
+    /// Re-anchor by the given seconds: success and automatic failure
     Reset(u64),
-    /// 手动失败不补拉：日程只推后不提前至 floor；间隔已变且非退避时
-    /// 按新间隔重排，只重排不补拉
+    /// Manual failure gets no catch-up pull: the schedule only pushes out,
+    /// never earlier than floor; when the interval changed and no backoff
+    /// is active, re-anchor by the new interval — re-anchor only, no
+    /// catch-up pull.
     Defer { reanchor: bool, floor: u64 },
 }
 
-/// 一轮结果的下次日程与连续 429 计数：节奏规则单点。
-/// 手动失败不改写自动状态，计数不动；429 的等待下限取退避档与
-/// Retry-After 的较大者——服务器指令必须生效；非 429 手动失败按
-/// 常规间隔兜底。
+/// Next schedule and consecutive-429 count for one round's result: the
+/// cadence rules in a single place. A manual failure does not rewrite the
+/// automatic state and leaves the count untouched; a 429's wait floor is
+/// the larger of the backoff tier and Retry-After — the server's directive
+/// must take effect; a non-429 manual failure falls back to the regular
+/// interval.
 fn schedule_next(
     err: Option<&crate::api::FetchError>,
     manual: bool,
@@ -168,6 +214,13 @@ fn schedule_next(
             if manual {
                 (
                     Schedule::Defer {
+                        // The queue-jump never fires early: the consumer
+                        // applies push_out(floor) right after any re-anchor,
+                        // so a Retry-After directive still holds. Allowing
+                        // the re-anchor matters for the plain-backoff case
+                        // (no header): a just-selected interval takes over
+                        // from now instead of waiting out the old
+                        // interval's anchor.
                         reanchor: interval_changed,
                         floor: wait,
                     },
@@ -193,7 +246,7 @@ fn schedule_next(
     }
 }
 
-/// 轮询循环
+/// The polling loop
 fn poll_loop(
     hwnd: windows::Win32::Foundation::HWND,
     target: PollTarget,
@@ -205,11 +258,14 @@ fn poll_loop(
 ) {
     let handles = [stop, wake];
     let mut last_secs = 0u64;
-    // 双锚到期点：单调钟为主，墙钟并行——睡眠可能停走单调钟，
-    // 唤醒后由墙锚判定立即补拉。成对更新走同一方法，防新调度点只更其一。
+    // Dual-anchor due point: the monotonic clock leads with the wall clock
+    // running in parallel — sleep can stall the monotonic clock, and after
+    // wake the wall anchor rules it due for an immediate catch-up pull.
+    // Paired updates go through one method so a new schedule point can
+    // never update just one anchor.
     let mut due = Due::now();
 
-    /// 单调锚与墙锚的成对持有
+    /// Paired holder of the monotonic anchor and the wall anchor
     struct Due {
         next: Instant,
         wall: chrono::DateTime<chrono::Utc>,
@@ -223,19 +279,21 @@ fn poll_loop(
             }
         }
 
-        /// 双锚一同后移 secs 秒
+        /// Move both anchors forward together by secs seconds
         fn set(&mut self, secs: u64) {
             self.next = Instant::now() + Duration::from_secs(secs);
             self.wall = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
         }
 
-        /// 双锚任一已过即到期：单调钟睡眠停走的兜底由墙锚承担
+        /// Due once either anchor has passed: the wall anchor covers the
+        /// monotonic clock stalling during sleep
         fn expired(&self) -> bool {
             Instant::now() >= self.next || chrono::Utc::now() >= self.wall
         }
 
-        /// 双锚各自与 now+secs 取大：日程只推后不提前。
-        /// 手动失败的插队语义专用——常规重锚走 set。
+        /// Take each anchor's max with now+secs: the schedule only pushes
+        /// out, never earlier. Reserved for the manual-failure
+        /// queue-jump semantics — regular re-anchoring goes through set.
         fn push_out(&mut self, secs: u64) {
             let n = Instant::now() + Duration::from_secs(secs);
             let w = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
@@ -244,17 +302,22 @@ fn poll_loop(
         }
     }
 
-    // 连续 429 计数：成功、非 429 结果或换源世代即清零，等待节奏归指数
-    // 退避接管。被限流账号的计数不得饿死新切换的健康账号。
+    // Consecutive-429 count: zeroed by success, a non-429 result, or a
+    // source-switch generation, handing the wait cadence back to plain
+    // exponential backoff. A throttled account's count must not starve a
+    // newly switched healthy account.
     let mut backoff_fails: u32 = 0;
     let mut last_gen = u64::MAX;
 
     loop {
         let now = Instant::now();
-        // 等待取单调锚与墙锚的较早者：单调钟睡眠停走，唤醒广播再丢失
-        // 也不至于按旧单调锚睡过头。
-        // 饱和上限取 u32::MAX - 1：u32::MAX 恰是 Win32 的 INFINITE，
-        // 落在它上面会退化成永久等待。
+        // The wait takes the earlier of the monotonic and wall anchors:
+        // the monotonic clock stalls during sleep, so even with the resume
+        // broadcast also lost, we cannot oversleep on a stale monotonic
+        // anchor.
+        // The saturation cap is u32::MAX - 1: u32::MAX happens to be
+        // Win32's INFINITE, and landing on it would degenerate into an
+        // infinite wait.
         let wall_ms = (due.wall - chrono::Utc::now()).num_milliseconds().max(0) as u64;
         let wait_ms = if due.next > now {
             ((due.next - now).as_millis() as u64)
@@ -278,10 +341,15 @@ fn poll_loop(
             continue;
         }
 
-        // 取世代号须早于账号克隆：主线程先写 target 再 bump 世代，反序
-        // 会让旧账号数据带新号混入；先取号则见新号必见新 target。
-        // 世代变化即换源：计数归零，锚清到当前，新账号的日程由换源后的
-        // 拉取结果决定，不继承旧账号的退避等待。
+        // The generation number must be read before cloning the account:
+        // the main thread writes target first and bumps the generation
+        // after; the reverse order would let old-account data slip in
+        // carrying the new number. Reading the number first means seeing
+        // the new number implies seeing the new target.
+        // A generation change is a source switch: zero the count, reset the
+        // anchor to now, and let the new account's schedule be decided by
+        // the fetch after the switch, inheriting no backoff wait from the
+        // old account.
         let gen_at_start = generation.load(Ordering::Acquire);
         if gen_at_start != last_gen {
             backoff_fails = 0;
@@ -293,7 +361,8 @@ fn poll_loop(
             match guard.clone() {
                 Some(v) => v,
                 None => {
-                    // 无账号：挂起等下一次唤醒，不空转。
+                    // No account: suspend until the next wake instead of
+                    // spinning.
                     due.set(60);
                     continue;
                 }
@@ -301,7 +370,8 @@ fn poll_loop(
         };
         let fetched = crate::api::client::fetch_usage(&spec);
         let interval_secs = clamp_interval(*borrow(&interval));
-        // 节奏与计数单点计算：借 fetched 判定，move 交给回传。
+        // Cadence and count computed at this single point: judge by
+        // borrowing fetched, then move it into the post-back.
         let (schedule, fails_now) = schedule_next(
             fetched.as_ref().err(),
             manual,
@@ -325,9 +395,13 @@ fn poll_loop(
 
         match schedule {
             Schedule::Reset(wait) => due.set(wait),
-            // 手动失败是纯插队：不给用户补拉第二次，日程只推后不提前。
-            // 例外是非退避中间隔已变：旧锚按旧间隔排定，沿用会吞掉新间隔
-            // 直到旧锚到期，按新间隔从现在重排，只重排不补拉。
+            // A manual failure is a pure queue jump: the user gets no
+            // second catch-up pull, and the schedule only pushes out, never
+            // earlier. The exception is a changed interval with no backoff
+            // active: the old anchor was set by the old interval, and
+            // keeping it would swallow the new interval until the old
+            // anchor expires — re-anchor to the new interval from now,
+            // re-anchor only, no catch-up pull.
             Schedule::Defer { reanchor, floor } => {
                 if reanchor {
                     due.set(interval_secs);
@@ -335,16 +409,16 @@ fn poll_loop(
                 due.push_out(floor);
             }
         }
-        // last_secs 每轮记当前间隔（含退避轮），只作间隔变化判定。退避
-        // 等待不入此变量，掺入会被当间隔变化重排掉退避锚。
+        // last_secs records the current interval each round (backoff rounds
+        // included) and is used only to detect interval changes. The
+        // backoff wait never enters this variable; mixed in, it would be
+        // mistaken for an interval change and re-anchor away the backoff
+        // anchor.
         last_secs = interval_secs;
     }
 }
 
-/// 毒化锁取回内部数据继续用
-fn borrow<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+use crate::locks::borrow;
 
 #[cfg(test)]
 mod tests {
@@ -358,7 +432,8 @@ mod tests {
         assert_eq!(clamp_interval(u64::MAX), MAX_POLL_SECS);
     }
 
-    /// 退避序列钉位：30→60→120→240→300 封顶；头只作用于本次且只延长不缩短
+    /// Backoff sequence pinned: 30→60→120→240→300 capped; the header
+    /// applies to this round only and only lengthens, never shortens
     #[test]
     fn backoff_sequence_and_retry_after_priority() {
         assert_eq!(backoff_wait(0, None), 30);
@@ -367,42 +442,46 @@ mod tests {
         assert_eq!(backoff_wait(3, None), 240);
         assert_eq!(backoff_wait(4, None), 300);
         assert_eq!(backoff_wait(9, None), 300);
-        // 头长于指数按头，短于指数不缩短档位，0 不构成立即重试
+        // A header longer than the exponential tier wins; a shorter one
+        // does not shorten the tier; 0 does not constitute an immediate
+        // retry
         assert_eq!(backoff_wait(0, Some(45)), 45);
         assert_eq!(backoff_wait(0, Some(0)), 30);
         assert_eq!(backoff_wait(3, Some(45)), 240);
         assert_eq!(backoff_wait(3, Some(0)), 240);
     }
 
-    /// 节奏矩阵钉位：成功清计数按间隔；自动 429 计数递增按退避档；
-    /// 手动失败计数不动只推后，间隔重排须无退避在场
+    /// Cadence matrix pinned: success clears the count and re-anchors to
+    /// the interval; automatic 429 increments the count and waits by the
+    /// backoff tier; manual failure leaves the count and only pushes out;
+    /// interval re-anchoring requires no backoff in effect
     #[test]
     fn schedule_next_matrix() {
-        let throttled = |ra: Option<u64>| crate::api::FetchError::Throttled {
-            info: crate::api::ErrorInfo::local("429"),
-            retry_after_secs: ra,
+        let throttled = |ra: Option<u64>| {
+            crate::api::FetchError::throttled(crate::api::ErrorInfo::local("429"), ra)
         };
         let failure = crate::api::FetchError::Network("offline".into());
         let (interval, last) = (300u64, 300u64);
 
-        // 成功：按间隔重锚，计数清零
+        // Success: re-anchor to the interval, clear the count
         assert!(matches!(
             schedule_next(None, false, 2, interval, last),
             (Schedule::Reset(300), 0)
         ));
 
-        // 自动 429：计数递增，等待按退避档
+        // Automatic 429: increment the count, wait by the backoff tier
         assert!(matches!(
             schedule_next(Some(&throttled(None)), false, 1, interval, last),
             (Schedule::Reset(60), 2)
         ));
-        // 自动非 429：计数清零，按常规间隔
+        // Automatic non-429: clear the count, use the regular interval
         assert!(matches!(
             schedule_next(Some(&failure), false, 1, interval, last),
             (Schedule::Reset(300), 0)
         ));
 
-        // 手动 429：计数不动，推后下限取退避档与头的较大者
+        // Manual 429: count untouched, push-out floor is the larger of the
+        // backoff tier and the header
         assert!(matches!(
             schedule_next(Some(&throttled(Some(45))), true, 0, interval, last),
             (
@@ -413,7 +492,21 @@ mod tests {
                 0
             )
         ));
-        // 手动非 429：推后下限按常规间隔
+        // Manual 429 with a just-selected interval: the re-anchor is safe
+        // (push_out floors it after), so the new interval takes over now —
+        // with no header the plain backoff floor must not hold the old
+        // anchor for a full old interval
+        assert!(matches!(
+            schedule_next(Some(&throttled(None)), true, 0, 60, last),
+            (
+                Schedule::Defer {
+                    reanchor: true,
+                    floor: 30
+                },
+                0
+            )
+        ));
+        // Manual non-429: push-out floor is the regular interval
         assert!(matches!(
             schedule_next(Some(&failure), true, 3, interval, last),
             (
@@ -425,7 +518,8 @@ mod tests {
             )
         ));
 
-        // 手动失败且间隔已变：非退避才允许按新间隔重排
+        // Manual failure with a changed interval: re-anchoring to the new
+        // interval is allowed only without backoff
         assert!(matches!(
             schedule_next(Some(&failure), true, 0, 60, last),
             (

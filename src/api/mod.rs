@@ -1,20 +1,35 @@
-//! GLM Coding Plan 用量数据模型与响应解析
+//! GLM Coding Plan usage data model and response parsing
 
 use chrono::{DateTime, Local, Utc};
 use serde_json::Value;
 
 pub mod client;
 
-/// 错误详情携带的响应文本字符上限
+/// Diagnostic log sink: the data layer does not depend on platform implementations;
+/// main injects it at assembly time. Silently dropped when not injected (unit tests).
+static LOG_HOOK: std::sync::OnceLock<fn(&str)> = std::sync::OnceLock::new();
+
+/// Inject the platform log implementation.
+pub fn set_log_hook(f: fn(&str)) {
+    let _ = LOG_HOOK.set(f);
+}
+
+pub(crate) fn log(msg: &str) {
+    if let Some(f) = LOG_HOOK.get() {
+        f(msg);
+    }
+}
+
+/// Character cap on response text carried in error details.
 pub(crate) const ERR_BODY_CHARS: usize = 160;
 
-/// API 平台
+/// API platform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Platform {
-    /// 国内版 open.bigmodel.cn
+    /// Domestic edition, open.bigmodel.cn.
     Cn,
-    /// 国际版 api.z.ai
+    /// International edition, api.z.ai.
     Intl,
 }
 
@@ -27,29 +42,43 @@ impl Platform {
     }
 }
 
-/// 一次查询的账号参数
-/// 团队版仅国内站，API Key、type=2 与两个选择头缺一不可；缺选择头时
-/// 服务端回 success 加空 limits。
+/// Account parameters for one query.
+/// Team edition exists only on the domestic site; the API key, type=2, and
+/// both selection headers are all mandatory —
+/// with a selection header missing, the server still replies success with empty limits.
 #[derive(Debug, Clone)]
 pub struct AccountSpec {
     pub platform: Platform,
-    /// 团队版：组织 ID（`Bigmodel-Organization`）
+    /// Team-edition flag: the deciding fact for the request shape. It used to be inferred from
+    /// non-empty fields — a personal account with leftover organization/project strings would take
+    /// the team query by mistake and always get empty limits.
+    pub team: bool,
+    /// Team edition: organization ID (`Bigmodel-Organization`).
     pub org_id: String,
-    /// 团队版：项目 ID（`Bigmodel-Project`）
+    /// Team edition: project ID (`Bigmodel-Project`).
     pub project_id: String,
     pub api_key: String,
 }
 
 impl AccountSpec {
-    /// 两个选择头齐全才按团队查询，不全时按个人版。
+    /// A team query needs the flag, the CN site, and both selection headers;
+    /// team edition exists only on the CN site, and the request shaper is
+    /// the last line of defense — upstream normalization and the UI toggle
+    /// arms keep the combination out, but any future writer that bypasses
+    /// them would otherwise send team params and selection headers to the
+    /// international base URL and get empty limits every round. If any
+    /// requirement is missing, treat as personal edition.
     fn team_scope(&self) -> Option<(&str, &str)> {
+        if !self.team || self.platform != Platform::Cn {
+            return None;
+        }
         let org = self.org_id.trim();
         let project = self.project_id.trim();
         (!org.is_empty() && !project.is_empty()).then_some((org, project))
     }
 }
 
-/// 套餐代际
+/// Plan generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanVersion {
     V1,
@@ -69,7 +98,7 @@ impl PlanVersion {
     }
 }
 
-/// 套餐等级
+/// Plan tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PlanTier {
     Lite,
@@ -79,8 +108,10 @@ pub enum PlanTier {
 }
 
 impl PlanTier {
-    /// 解析套餐标签
-    fn from_label(label: &str) -> PlanTier {
+    /// Parse a plan label: the single classification ladder — the render
+    /// side's tier badge colors key off it and must not re-derive
+    /// contains() rules from display text.
+    pub fn from_label(label: &str) -> PlanTier {
         let s = label.trim().to_ascii_lowercase();
         if s.contains("lite") {
             PlanTier::Lite
@@ -103,41 +134,41 @@ impl PlanTier {
     }
 }
 
-/// 单个限额桶
+/// One quota bucket.
 #[derive(Debug, Clone)]
 pub struct QuotaBucket {
-    /// 已用百分比 0–100
+    /// Used percentage, 0–100.
     pub used_percent: f64,
-    /// 重置时刻
+    /// Reset time.
     pub resets_at: Option<DateTime<Utc>>,
-    /// 总量
+    /// Total.
     pub total: Option<f64>,
-    /// 当前用量
+    /// Current usage.
     pub current: Option<f64>,
 }
 
-/// MCP 工具用量按模型明细
+/// MCP tool usage broken down by model.
 #[derive(Debug, Clone)]
 pub struct McpDetail {
     pub model_code: String,
     pub usage: f64,
 }
 
-/// MCP 工具用量，月度
+/// MCP tool usage, monthly.
 #[derive(Debug, Clone)]
 pub struct McpUsage {
     pub used_percent: f64,
-    /// 当前用量
+    /// Current usage.
     pub current_value: f64,
-    /// 总量
+    /// Total.
     pub total: f64,
-    /// 月度重置时刻
+    /// Monthly reset time.
     pub resets_at: Option<DateTime<Utc>>,
-    /// 按模型明细
+    /// Per-model breakdown.
     pub details: Vec<McpDetail>,
 }
 
-/// 一次成功查询得到的用量快照
+/// Usage snapshot from one successful query.
 #[derive(Debug, Clone)]
 pub struct UsageSnapshot {
     pub plan_version: PlanVersion,
@@ -152,14 +183,26 @@ pub struct UsageSnapshot {
 }
 
 impl UsageSnapshot {
-    /// MCP 构成区陈列判定
-    /// 明细非空即陈列，高度侧与渲染侧同引。
+    /// Whether to show the MCP composition section.
+    /// Shown whenever details are non-empty; the height side and the render side share this source.
     pub fn has_mcp_details(&self) -> bool {
         self.mcp.as_ref().is_some_and(|m| !m.details.is_empty())
     }
 
-    /// 在场桶按绘制序枚举：行集构成、倒计时行与渲染推进的唯一来源，
-    /// 高度侧的行数特征同引此序
+    /// Bucket priority for the tray ring progress: the 5h hard gate wins — with the short-window
+    /// quota exhausted, no amount of weekly headroom helps; only when 5h is absent does the
+    /// weekly bucket represent the state (MCP is an independent tool quota and
+    /// takes no part in the ring).
+    pub fn ring_percent(&self) -> f64 {
+        match (self.five_hour.as_ref(), self.weekly.as_ref()) {
+            (Some(fh), _) => fh.used_percent,
+            (None, Some(wk)) => wk.used_percent,
+            (None, None) => 0.0,
+        }
+    }
+
+    /// Enumerates present buckets in draw order: the single source for row-set composition,
+    /// countdown rows, and render progression; the height side's row-count feature shares this order
     pub(crate) fn present_buckets(&self) -> impl Iterator<Item = PresentBucket<'_>> {
         self.five_hour
             .as_ref()
@@ -169,8 +212,8 @@ impl UsageSnapshot {
             .chain(self.mcp.as_ref().map(PresentBucket::Mcp))
     }
 
-    /// 等级显示文案
-    /// tier 标签优先，缺则回退套餐标签。
+    /// Tier display label.
+    /// Prefers the tier label, falling back to the plan label when missing.
     pub fn tier_label(&self) -> &str {
         let t = self.tier.label();
         if t.is_empty() {
@@ -181,7 +224,7 @@ impl UsageSnapshot {
     }
 }
 
-/// 在场指标桶的绘制序变体：五小时 → 周 → MCP
+/// Draw-order variants of present metric buckets: five-hour → weekly → MCP.
 pub(crate) enum PresentBucket<'a> {
     FiveHour(&'a QuotaBucket),
     Weekly(&'a QuotaBucket),
@@ -189,7 +232,7 @@ pub(crate) enum PresentBucket<'a> {
 }
 
 impl PresentBucket<'_> {
-    /// 重置时刻：倒计时行取材
+    /// Reset time: feeds the countdown rows.
     pub(crate) fn resets_at(&self) -> Option<DateTime<Utc>> {
         match self {
             PresentBucket::FiveHour(b) | PresentBucket::Weekly(b) => b.resets_at,
@@ -197,7 +240,7 @@ impl PresentBucket<'_> {
         }
     }
 
-    /// 已用百分比：tooltip 摘要与指标行取材
+    /// Used percentage: feeds the tooltip summary and metric rows.
     pub(crate) fn used_percent(&self) -> f64 {
         match self {
             PresentBucket::FiveHour(b) | PresentBucket::Weekly(b) => b.used_percent,
@@ -206,14 +249,17 @@ impl PresentBucket<'_> {
     }
 }
 
-/// 附加块回填
-/// 余额与 Token 档本轮拉取失败时沿用上一份快照的值，绝不为空；
-/// 从未拉到过的块保持空。余额超过一天仍无新值即不再回填——余额端点
-/// 持久故障时面板主数据照常刷新，冻结的假数字不随行，宁可消失可察觉。
+/// Sidecar backfill.
+/// When balance or Token tiers fail to fetch this round, carry over the previous
+/// snapshot's value — never empty;
+/// blocks never once fetched stay empty. Balance stops being backfilled after
+/// a full day without a new value — when the
+/// balance endpoint is persistently broken, the panel's main data keeps refreshing while
+/// the frozen fake number does not tag along; better a noticeable disappearance.
 pub(crate) fn merge_sidecar(new: &mut UsageSnapshot, prev: Option<&UsageSnapshot>) {
     let Some(prev) = prev else { return };
-    // 年龄非负且一天内才回填：负年龄（时钟回拨）按恒新鲜处理会把冻结
-    // 窗口拉长一个回拨量。
+    // Backfill only when the age is non-negative and within one day: treating a negative age (clock
+    // set back) as always fresh would stretch the frozen window by the rollback amount.
     let fresh = |as_of: DateTime<Utc>| {
         let age = Utc::now() - as_of;
         age >= chrono::Duration::zero() && age <= chrono::Duration::hours(24)
@@ -221,36 +267,63 @@ pub(crate) fn merge_sidecar(new: &mut UsageSnapshot, prev: Option<&UsageSnapshot
     if new.balance.is_none() && prev.balance.as_ref().is_some_and(|b| fresh(b.as_of)) {
         new.balance = prev.balance.clone();
     }
-    // 当日校验只约束今日档（legs[0]）：跨零点后旧值属于昨日窗口，回填
-    // 会让今日档挂着昨日总量；周/月是滚动窗，旧值照常代表。整块缺时
-    // 按块的活跃时刻计龄，部分缺档说明端点活着，回填不限龄。
+    // The same-day check constrains only the today tier (legs[0]): past midnight the old value
+    // belongs to yesterday's window, and backfilling it would pin yesterday's total onto the today
+    // tier; week/month are rolling windows, so old values still represent them. When the whole
+    // block is missing, age by the block's as-of time; partially missing tiers mean the endpoint
+    // is alive, so backfill carries no age limit.
     let same_day = prev.queried_at.date_naive() == new.queried_at.date_naive();
     match (&mut new.token_stats, prev.token_stats) {
         (Some(n), Some(p)) => {
+            // Per-tier age bound: the block's as_of refreshes whenever any
+            // tier lands, so without leg_at a persistently failing tier
+            // would be re-injected forever while a sibling keeps landing.
             for i in 0..n.legs.len() {
-                if n.legs[i].is_none() && (same_day || i > 0) {
+                if n.legs[i].is_none()
+                    && (same_day || i > 0)
+                    && p.legs[i].is_some()
+                    && fresh(p.leg_at[i])
+                {
                     n.legs[i] = p.legs[i];
+                    // The backfilled value carries its own landing time.
+                    n.leg_at[i] = p.leg_at[i];
                 }
             }
         }
         (None, Some(p)) if fresh(p.as_of) => {
             let mut legs = p.legs;
+            let leg_at = p.leg_at;
             if !same_day {
                 legs[0] = None;
             }
-            new.token_stats = Some(TokenStats {
-                legs,
-                as_of: p.as_of,
-            });
+            // The per-tier bound applies here too, not just in the partial
+            // arm: the block gate (as_of) is refreshed by any sibling
+            // landing and can outlive an individual tier by a full day,
+            // which would resurrect it past twice the designed bound.
+            for i in 0..legs.len() {
+                if legs[i].is_some() && !fresh(leg_at[i]) {
+                    legs[i] = None;
+                }
+            }
+            // After the day-crossing clears the today tier, no tier may survive: backfilling an
+            // all-empty stats block would leave the Token card present yet contentless — better absent.
+            if legs.iter().any(Option::is_some) {
+                new.token_stats = Some(TokenStats {
+                    legs,
+                    leg_at,
+                    as_of: p.as_of,
+                });
+            }
         }
         _ => {}
     }
 }
 
-/// 主视图高度特征
-/// 指标行数、构成区、Token 统计、余额四特征的唯一事实源，
-/// sync_main_height 的高度入参由此派生，区块陈列判定须与本处同源，
-/// 漏同步的后果是内容被裁或底部留白。
+/// Main-view height features.
+/// The single source of truth for the four features — metric row count, composition section,
+/// Token stats, balance; sync_derived's height input derives from here, and block display
+/// decisions must share this source — a missed sync means clipped content or
+/// blank space at the bottom.
 pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> (usize, bool, bool, bool) {
     match snap {
         None => (0, false, false, false),
@@ -263,7 +336,7 @@ pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> (usize, bool, bool,
     }
 }
 
-/// Token 统计档位
+/// Token stats tiers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TokenLeg {
     Today,
@@ -271,29 +344,37 @@ pub(crate) enum TokenLeg {
     Month,
 }
 
-/// Token 统计三档
-/// 档位、起点回退天数与日志标签，档序即卡片序。
+/// The three Token stats tiers.
+/// Tier, start-offset days, and log label; tier order is card order.
 pub(crate) const TOKEN_LEGS: [(TokenLeg, u64, &str); 3] = [
     (TokenLeg::Today, 0, "today"),
     (TokenLeg::Week, 6, "week"),
     (TokenLeg::Month, 29, "month"),
 ];
 
-/// Token 消耗合计
-/// 今日本地 0 点起与近 7 / 30 个自然日，legs 档序与 TOKEN_LEGS 一致。
-/// 逐档独立，单档拉取失败为 None，不拖垮其余档。as_of 为块的活跃
-/// 时刻：任一档拉到即刷新，整块缺时回填按它计龄。
+/// Token consumption totals.
+/// Today since local midnight plus the last 7 / 30 calendar days; legs tier order matches
+/// TOKEN_LEGS.
+/// Tiers are independent — one failed tier is None and does not drag down the rest. as_of is the
+/// block's as-of time: refreshed whenever any tier lands. leg_at keeps each tier's own landing
+/// time — the block's as_of cannot age tiers individually, so partial backfill would otherwise
+/// re-inject a frozen tier indefinitely while a sibling tier keeps landing.
 #[derive(Debug, Clone, Copy)]
 pub struct TokenStats {
     pub legs: [Option<f64>; TOKEN_LEGS.len()],
+    /// Last successful landing time per tier; for a None leg the field is
+    /// placeholder — the backfilled value's age comes from the previous
+    /// block's leg_at.
+    pub leg_at: [DateTime<Utc>; TOKEN_LEGS.len()],
     pub as_of: DateTime<Utc>,
 }
 
-/// 账户余额，仅国内版
+/// Account balance, domestic edition only.
 #[derive(Debug, Clone, Default)]
 pub struct Balance {
     pub available: f64,
-    /// 数值的拉取时刻：回填链上保持本体时刻，作陈旧判定
+    /// Fetch time of the value: kept at the block's own time along the backfill chain,
+    /// used for staleness checks.
     pub as_of: DateTime<Utc>,
     #[allow(dead_code)]
     pub recharged: Option<f64>,
@@ -303,22 +384,25 @@ pub struct Balance {
     pub spent: Option<f64>,
 }
 
-/// 官方错误信息三元组
-/// code/message 缺失为 None/空串，显示侧按降级链处理。
-#[derive(Debug, Clone, Hash)]
+/// Official error info triple.
+/// Missing code/message become None/empty string; the display side handles them via the
+/// fallback chain.
+/// PartialEq backs FetchError's cache-key full-value comparison.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorInfo {
-    /// HTTP 状态码；HTTP 200 信封失败路径填 200
+    /// HTTP status code; filled with 200 on the HTTP-200 envelope-failure path.
     pub status: u16,
-    /// 官方业务码：官方样本字符串与数字形态并存，解析侧统一收 i64，
-    /// 码族表与展示同用一份
+    /// Official business code: official samples mix string and number forms, so parsing normalizes
+    /// to i64; the code-family table and the display share this one copy
     pub code: Option<i64>,
-    /// 官方提示；响应形态不符时回退截断的原文，可为空
+    /// Official message; falls back to truncated raw text when
+    /// the response shape mismatches; may be empty.
     pub message: String,
 }
 
 impl ErrorInfo {
-    /// 本地程序错误
-    /// 无 HTTP 状态与业务码，归类走服务端档兜底。
+    /// Local program error.
+    /// No HTTP status or business code; categorization falls through to the server bucket.
     pub(crate) fn local(msg: impl Into<String>) -> Self {
         ErrorInfo {
             status: 0,
@@ -327,48 +411,30 @@ impl ErrorInfo {
         }
     }
 
-    /// 码与提示的组合形态
-    /// 组合形态判定单源，Display 与降级链取材同引。
-    pub(crate) fn shape(&self) -> FieldShape<'_> {
+    /// Material for the fallback chain.
+    /// Both code and message → code only → raw message → error status echo
+    /// → last-resort fallback, decided here in one place. The error card
+    /// body and the footer tail share this; the display side only formats.
+    pub(crate) fn detail(&self) -> ErrorDetail<'_> {
         match (self.code, self.message.is_empty()) {
-            (Some(c), false) => FieldShape::CodeAndMsg {
+            (Some(c), false) => ErrorDetail::CodeAndMsg {
                 code: c,
                 msg: &self.message,
             },
-            (Some(c), true) => FieldShape::CodeOnly { code: c },
-            (None, false) => FieldShape::MsgOnly { msg: &self.message },
-            (None, true) => FieldShape::Empty,
-        }
-    }
-
-    /// 降级链取材
-    /// 码与提示齐全 → 只有码 → 提示原文 → 错误状态回显 → 兜底。
-    /// 错误卡正文与页脚尾段同引此判定，展示侧只管拼格式。
-    pub(crate) fn detail(&self) -> ErrorDetail<'_> {
-        match self.shape() {
-            FieldShape::CodeAndMsg { code, msg } => ErrorDetail::CodeAndMsg { code, msg },
-            FieldShape::CodeOnly { code } => ErrorDetail::CodeOnly { code },
-            FieldShape::MsgOnly { msg } => ErrorDetail::Msg(msg.into()),
-            // 码与提示皆缺：错误状态按状态回显，其余落到调用方兜底
-            FieldShape::Empty if (400..600).contains(&self.status) => {
-                ErrorDetail::Msg(format!("HTTP {}", self.status).into())
+            (Some(c), true) => ErrorDetail::CodeOnly { code: c },
+            (None, false) => ErrorDetail::Msg(std::borrow::Cow::Borrowed(&self.message)),
+            // Neither code nor message: error statuses echo the status; the
+            // rest falls to the caller's fallback
+            (None, true) if (400..600).contains(&self.status) => {
+                ErrorDetail::Msg(std::borrow::Cow::Owned(format!("HTTP {}", self.status)))
             }
-            FieldShape::Empty => ErrorDetail::Fallback,
+            (None, true) => ErrorDetail::Fallback,
         }
     }
 }
 
-/// 降级链的四种组合
-/// 码与提示齐全 → 只有码 → 只有提示 → 全无
-pub(crate) enum FieldShape<'a> {
-    CodeAndMsg { code: i64, msg: &'a str },
-    CodeOnly { code: i64 },
-    MsgOnly { msg: &'a str },
-    Empty,
-}
-
-/// 错误展示的取材档
-/// 提示档含状态回显；文本混编借入与拥有。
+/// Material tiers for error display.
+/// The message tier includes the status echo; text mixes borrowed and owned.
 pub(crate) enum ErrorDetail<'a> {
     CodeAndMsg { code: i64, msg: &'a str },
     CodeOnly { code: i64 },
@@ -376,33 +442,36 @@ pub(crate) enum ErrorDetail<'a> {
     Fallback,
 }
 
-/// 查询失败分类
-/// Hash 为内容指纹，页脚摘要缓存键据此派生，无 Display 中间串分配。
-#[derive(Debug, Clone, Hash)]
+/// Query failure classification.
+/// Hash/PartialEq act as a content fingerprint: footer summaries and error-card cache keys compare
+/// full values against it, with no intermediate Display string allocation.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum FetchError {
-    /// 凭据失效
-    /// HTTP 401/403 或信封鉴权族；换形态重试只限状态来源。
+    /// Credentials invalid.
+    /// HTTP 401/403 or the envelope auth family; shape-switch retry applies only when status-sourced.
     Unauthenticated(ErrorInfo),
-    /// 未失败但无数据
-    /// 2xx 且信封通过但空 limits，或信封 1309 与套餐缺失文案，
-    /// 或 HTTP 429 身体码 1309（与信封路径同判）。
+    /// Not a failure, just no data.
+    /// 2xx with the envelope passing but empty limits, or envelope 1309 with the plan-missing
+    /// wording, or HTTP 429 with body code 1309 (judged the same as the envelope path).
     Empty,
-    /// 响应失败
-    /// 非 2xx 错误状态或信封业务失败；大类按状态或码族分归两档。
+    /// Response failure.
+    /// Non-2xx error status or envelope business failure; the broad category sorts into
+    /// two buckets by status or code family.
     Failure(ErrorInfo),
-    /// 本地网络层失败
-    /// 超时、断连，保留旧数据并允许重试。
+    /// Local network-layer failure.
+    /// Timeout, disconnection; old data is kept and retry stays allowed.
     Network(String),
-    /// HTTP 429
-    /// retry_after_secs 为 Retry-After 头秒数，已钳退避上限，无头为 None。
+    /// HTTP 429.
+    /// retry_after_secs is the Retry-After header in seconds, already clamped to the
+    /// backoff cap; None without the header.
     Throttled {
         info: ErrorInfo,
         retry_after_secs: Option<u64>,
     },
 }
 
-/// 显示大类
-/// 展示层的六个呈现标题档。
+/// Display category.
+/// Six heading tiers presented by the display layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
     Unauthenticated,
@@ -414,8 +483,20 @@ pub enum ErrorCategory {
 }
 
 impl FetchError {
-    /// 大类判定
-    /// 状态路径按状态类，信封路径按码族，坏数据归 Server。
+    /// Clamping constructor for Throttled: retry_after_secs enters the
+    /// enum only through here, so the ≤-backoff-cap invariant has a
+    /// single production owner and consumers (backoff_wait) read the
+    /// value without re-clamping.
+    pub(crate) fn throttled(info: ErrorInfo, retry_after_secs: Option<u64>) -> Self {
+        FetchError::Throttled {
+            info,
+            retry_after_secs: retry_after_secs
+                .map(|s| s.min(crate::api::client::RATE_LIMIT_BACKOFF_MAX_SECS)),
+        }
+    }
+
+    /// Broad-category decision.
+    /// The status path sorts by status class, the envelope path by code family; bad data goes to Server.
     pub fn category(&self) -> ErrorCategory {
         match self {
             FetchError::Unauthenticated(_) => ErrorCategory::Unauthenticated,
@@ -434,17 +515,25 @@ impl FetchError {
     }
 }
 
-/// 账户与订阅状态码：欠费、套餐失效或权限不符，恢复只能靠用户侧
-/// 动作，速率退避等不来；码族表与 HTTP 429 分流同引此单源。
-/// 1309 正常在 inband 与 429 分流处先判空态，落进码族表只是兜底。
+/// Account and subscription state codes: arrears, expired plan, or permission mismatch — recovery
+/// only comes from user-side action, never from rate backoff; the code-family table and the HTTP 429
+/// split share this single source. 1309 is normally caught as the empty state at the inband and 429
+/// splits; landing in the family table is only a backstop.
 pub(crate) fn is_account_state(code: i64) -> bool {
     matches!(code, 1113 | 1309 | 1311 | 1313 | 1314 | 1315)
 }
 
-/// 信封错误码的码族
-/// inband_error 的变体选择与 category 的显示大类同引此表；
-/// 换形态重试只认 401/403 状态，不查此表。429 窗口限额码（会随
-/// 重置恢复）归 Throttled，账户状态码归 Request。
+/// Empty-state business code: plan expired or missing — the envelope path and the HTTP 429 body-code
+/// path share this decision; forking them would give one code different classifications
+/// on the two paths
+pub(crate) fn is_empty_state(code: i64) -> bool {
+    code == 1309
+}
+
+/// Code families of envelope error codes.
+/// inband_error's variant choice and category's display class share this table;
+/// shape-switch retry only recognizes 401/403 statuses and never consults it. 429 window-quota
+/// codes (which recover on reset) go to Throttled; account-state codes go to Request.
 fn family_of(code: i64) -> CodeFamily {
     if is_account_state(code) {
         return CodeFamily::Request;
@@ -457,7 +546,7 @@ fn family_of(code: i64) -> CodeFamily {
     }
 }
 
-/// 码族档位：family_of 的返回值
+/// Code-family tiers: family_of's return values.
 enum CodeFamily {
     Auth,
     Throttled,
@@ -467,31 +556,37 @@ enum CodeFamily {
 
 impl std::fmt::Display for FetchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // 有前缀时空格衔接码、冒号衔接提示；空前缀时码与提示直接开头。
+        // The prefix join reads the fields directly — the log string and the
+        // card material (detail) are two different renderings of the same
+        // code/message pair, with no intermediate enum between them.
         fn with_info(
             prefix: &str,
             info: &ErrorInfo,
             f: &mut std::fmt::Formatter<'_>,
         ) -> std::fmt::Result {
-            match (prefix, info.shape()) {
-                ("", FieldShape::CodeAndMsg { code, msg }) => write!(f, "{code}: {msg}"),
-                ("", FieldShape::CodeOnly { code }) => write!(f, "{code}"),
-                ("", FieldShape::MsgOnly { msg }) => write!(f, "{msg}"),
-                // 信封失败无码无提示：兜变体名，日志与去重游标不落空串。
-                ("", FieldShape::Empty) => write!(f, "failure"),
-                (p, FieldShape::CodeAndMsg { code, msg }) => write!(f, "{p} {code}: {msg}"),
-                (p, FieldShape::CodeOnly { code }) => write!(f, "{p} {code}"),
-                (p, FieldShape::MsgOnly { msg }) => write!(f, "{p}: {msg}"),
-                (p, FieldShape::Empty) => write!(f, "{p}"),
+            let msg = info.message.as_str();
+            let (code, nonempty): (Option<i64>, bool) = (info.code, !msg.is_empty());
+            match (prefix, code, nonempty) {
+                ("", Some(c), true) => write!(f, "{c}: {msg}"),
+                ("", Some(c), false) => write!(f, "{c}"),
+                ("", None, true) => write!(f, "{msg}"),
+                // Envelope failure with neither code nor message:
+                // fall back to the variant name so logs and dedup cursors
+                // never land on an empty string.
+                ("", None, false) => write!(f, "failure"),
+                (p, Some(c), true) => write!(f, "{p} {c}: {msg}"),
+                (p, Some(c), false) => write!(f, "{p} {c}"),
+                (p, None, true) => write!(f, "{p}: {msg}"),
+                (p, None, false) => write!(f, "{p}"),
             }
         }
         match self {
             FetchError::Unauthenticated(info) => with_info("unauthenticated", info, f),
             FetchError::Empty => write!(f, "empty"),
             FetchError::Failure(info) => match info.status {
-                // 本地程序错误无状态码，前缀用 local，不虚构状态。
+                // Local program errors carry no status code; the prefix is "local" — no fabricated status.
                 0 => with_info("local", info, f),
-                // 信封内失败 HTTP 层成功，状态不参与展示。
+                // In-envelope failure with a successful HTTP layer; the status takes no part in display.
                 200 => with_info("", info, f),
                 s => with_info(&format!("HTTP {s}"), info, f),
             },
@@ -501,9 +596,9 @@ impl std::fmt::Display for FetchError {
     }
 }
 
-/// unit 单位代码转分钟乘数
-/// 3=小时、6=周是配额桶仅见取值，其余代码语义不明，
-/// 不作断言，仅保留时长换算兜底。
+/// unit code to minute multiplier.
+/// 3=hour and 6=week are the only values seen on quota buckets; other codes have unclear
+/// semantics — no assertion is made, the duration conversion stays as a fallback.
 fn window_minutes(item: &Value) -> Option<i64> {
     const MULTIPLIERS: &[(i64, i64)] =
         &[(1, 1440), (3, 60), (4, 1440), (5, 30 * 24 * 60), (6, 10080)];
@@ -518,15 +613,15 @@ fn window_minutes(item: &Value) -> Option<i64> {
         .and_then(|(_, m)| number.checked_mul(*m))
 }
 
-/// limits 数组：data 内优先，顶层数组兜底
+/// limits array: prefer inside data, fall back to the top-level array.
 fn limits_of(data: &Value) -> Option<&Vec<Value>> {
     data.get("limits")
         .and_then(Value::as_array)
         .or_else(|| data.as_array())
 }
 
-/// 条目类型标识
-/// type 优先，name 兜底。
+/// Entry kind identifier.
+/// type first, name as fallback.
 fn entry_kind(item: &Value) -> &str {
     item.get("type")
         .or_else(|| item.get("name"))
@@ -534,7 +629,7 @@ fn entry_kind(item: &Value) -> &str {
         .unwrap_or("")
 }
 
-/// 额度桶判定
+/// Quota bucket predicate.
 fn is_quota_entry(item: &Value) -> bool {
     let t = entry_kind(item);
     t.eq_ignore_ascii_case("TOKENS_LIMIT") || t.eq_ignore_ascii_case("CREDIT_LIMIT")
@@ -544,8 +639,8 @@ fn is_credit_entry(item: &Value) -> bool {
     entry_kind(item).eq_ignore_ascii_case("CREDIT_LIMIT")
 }
 
-/// MCP 通道判定
-/// TIME_LIMIT 为主，MCP_LIMIT 为别名。
+/// MCP channel predicate.
+/// TIME_LIMIT is primary; MCP_LIMIT is an alias.
 fn is_mcp_entry(item: &Value) -> bool {
     let t = entry_kind(item);
     t.eq_ignore_ascii_case("TIME_LIMIT") || t.eq_ignore_ascii_case("MCP_LIMIT")
@@ -558,8 +653,9 @@ fn parse_reset_time(item: &Value) -> Option<DateTime<Utc>> {
         .and_then(DateTime::from_timestamp_millis)
 }
 
-/// 解析限额桶
-/// 绝对值优先重算百分比，percentage 仅在绝对值缺失时兜底。
+/// Parse a quota bucket.
+/// Absolute values take priority to recompute the percentage; percentage is only a
+/// fallback when absolutes are missing.
 fn parse_bucket(item: &Value) -> QuotaBucket {
     let total = item
         .get("usage")
@@ -614,7 +710,7 @@ fn parse_mcp_details(item: &Value) -> Vec<McpDetail> {
         .unwrap_or_default()
 }
 
-/// 统一用量快照解析
+/// Unified usage snapshot parsing.
 pub fn parse_usage(data: &Value) -> UsageSnapshot {
     let plan_label = ["planName", "plan", "plan_type", "packageName", "level"]
         .iter()
@@ -662,7 +758,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
     }
 
     if !timed.is_empty() {
-        // 按窗口时长归类：最短归 5h，最长归周。
+        // Classify by window duration: shortest becomes 5h, longest becomes weekly.
         timed.sort_by_key(|&(_, minutes)| minutes);
         if timed.len() == 1 {
             let (bucket, minutes) = timed.remove(0);
@@ -672,12 +768,12 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                 weekly = Some(bucket);
             }
         } else {
-            weekly = Some(timed.pop().map(|(b, _)| b).unwrap());
+            weekly = Some(timed.pop().expect("非单桶即 len ≥ 2").0);
             five_hour = Some(timed.remove(0).0);
         }
     }
 
-    // 无窗口字段的桶按重置时刻排序补缺。
+    // Buckets without window fields backfill empty slots, ordered by reset time.
     unclassified.sort_by_key(|b| (b.resets_at.is_some(), b.resets_at.map(|t| t.timestamp())));
     for bucket in unclassified {
         if five_hour.is_none() {
@@ -687,7 +783,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
         }
     }
 
-    // 代际判定：credit 桶在即 V3，双桶 V2，单桶 V1。
+    // Generation decision: a credit bucket present means V3; two buckets V2; one bucket V1.
     let plan_version = if has_credit {
         PlanVersion::V3
     } else if quota_count >= 2 {
@@ -711,12 +807,12 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
     }
 }
 
-/// 信封内业务失败分类
-/// 鉴权族与鉴权文案归 Unauthenticated，1309 与 coding plan 无套餐归
-/// Empty，受限族归 Throttled，其余归 Failure。仅处理 HTTP 200 信封内
-/// 错误，HTTP 401/403 由 client.rs 按状态码分类。关键词判定须从严：
-/// 凭据词与 invalid/expired/无效 同时出现才判认证，
-/// 避免业务文案误触发换钥引导。
+/// In-envelope business failure classification.
+/// The auth family and auth wording go to Unauthenticated; 1309 and coding-plan-missing go to
+/// Empty; the throttled family to Throttled; everything else to Failure. Handles only in-envelope
+/// errors on HTTP 200 — HTTP 401/403 are classified by client.rs on the status code. Keyword
+/// matching must stay strict: authentication is decided only when a credential word co-occurs with
+/// invalid/expired/无效, so ordinary business copy can't falsely trigger the change-your-key guidance.
 fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
     let m = msg.to_ascii_lowercase();
     let mentions_credential = m.contains("token") || m.contains("api key") || m.contains("apikey");
@@ -731,21 +827,19 @@ fn inband_error(code: Option<i64>, msg: &str) -> FetchError {
         || (mentions_credential && says_invalid)
     {
         FetchError::Unauthenticated(info())
-    } else if code == Some(1309) || m.contains("coding plan") {
+    } else if code.is_some_and(is_empty_state) || m.contains("coding plan") {
         FetchError::Empty
     } else if code.is_some_and(|c| matches!(family_of(c), CodeFamily::Throttled)) {
-        FetchError::Throttled {
-            info: info(),
-            retry_after_secs: None,
-        }
+        FetchError::throttled(info(), None)
     } else {
         FetchError::Failure(info())
     }
 }
 
-/// 官方业务码解析：兼容数字与字符串形态，统一收 i64。
-/// 信封路径与 HTTP 错误体路径同引此函数，防同一码值两条路径归入
-/// 不同码族。官方样本皆为整数字，字符串与浮点是未实证的防御分支。
+/// Official business code parsing: accepts both number and string forms, normalized to i64.
+/// The envelope path and the HTTP error-body path share this function, so one code value can't
+/// land in different families on the two paths. Official samples are all integers; string and
+/// float are defensive branches not yet seen in practice.
 pub(crate) fn code_value(v: &Value) -> Option<i64> {
     match v {
         Value::Number(_) => v.as_i64().or_else(|| {
@@ -759,8 +853,8 @@ pub(crate) fn code_value(v: &Value) -> Option<i64> {
     }
 }
 
-/// 信封校验
-/// success=false 或 code 非 200 归入 FetchError。
+/// Envelope check.
+/// success=false or code other than 200 becomes a FetchError.
 pub(crate) fn envelope_check(v: &Value) -> Result<(), FetchError> {
     if v.get("success").and_then(Value::as_bool) == Some(false) {
         let msg = v
@@ -779,13 +873,13 @@ pub(crate) fn envelope_check(v: &Value) -> Result<(), FetchError> {
     Ok(())
 }
 
-/// 解析完整响应体
+/// Parse the full response body.
 pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| FetchError::Failure(ErrorInfo::local(format!("parse failed: {e}"))))?;
 
     let data = if v.is_array() {
-        // 顶层数组是历史响应形态，直接当 limits 用。
+        // A top-level array is a legacy response shape; use it directly as limits.
         &v
     } else {
         envelope_check(&v)?;
@@ -793,16 +887,17 @@ pub fn parse_response(body: &str) -> Result<UsageSnapshot, FetchError> {
             .ok_or_else(|| FetchError::Failure(ErrorInfo::local("missing data field")))?
     };
 
-    // 空 limits 即 Empty：2xx 且信封通过但无数据。
+    // Empty limits means Empty: 2xx with the envelope passing but no data.
     if limits_of(data).is_none_or(|limits| limits.is_empty()) {
         return Err(FetchError::Empty);
     }
     Ok(parse_usage(data))
 }
 
-/// 解析 model-usage 响应取区间 token 总消耗
-/// 服务端合计 `data.totalUsage.totalTokensUsage` 优先，缺失时回退把
-/// 所有模型所有时间点的 tokensUsage 逐点相加。信封校验与 quota 同源。
+/// Parse a model-usage response into the interval's total token consumption.
+/// The server-side summary `data.totalUsage.totalTokensUsage` wins; when missing, fall back to
+/// summing tokensUsage point by point across all models and time points.
+/// Envelope check shares the quota side's source.
 pub fn parse_token_total(body: &str) -> Result<f64, FetchError> {
     let v: Value = serde_json::from_str(body)
         .map_err(|e| FetchError::Failure(ErrorInfo::local(format!("parse failed: {e}"))))?;
@@ -838,8 +933,25 @@ pub fn parse_token_total(body: &str) -> Result<f64, FetchError> {
 mod tests {
     use super::*;
 
-    /// 测试用最小快照：各特征字段按参填，其余取空态。
-    /// mcp 传 Some(n)：桶在场且 n 条明细；Some(0)：桶在场明细空；None：桶缺
+    /// Pins the CN-only line of defense in the request shaper: a team+Intl
+    /// spec (only constructible by a config writer that bypassed
+    /// normalization and the UI arms) must not take the team query shape.
+    #[test]
+    fn team_scope_rejects_intl() {
+        let spec = |platform| AccountSpec {
+            platform,
+            team: true,
+            org_id: "org".into(),
+            project_id: "proj".into(),
+            api_key: "k".into(),
+        };
+        assert!(spec(Platform::Cn).team_scope().is_some());
+        assert!(spec(Platform::Intl).team_scope().is_none());
+    }
+
+    /// Minimal test snapshot: feature fields filled per argument, the rest left empty.
+    /// mcp Some(n): bucket present with n details; Some(0): bucket present with empty
+    /// details; None: bucket absent
     fn feature_snap(
         five: bool,
         weekly: bool,
@@ -875,6 +987,7 @@ mod tests {
             }),
             token_stats: stats.then_some(TokenStats {
                 legs: [Some(1.0), Some(2.0), Some(3.0)],
+                leg_at: [Utc::now(); TOKEN_LEGS.len()],
                 as_of: Utc::now(),
             }),
             balance: bal.then_some(Balance {
@@ -885,7 +998,7 @@ mod tests {
         }
     }
 
-    /// MCP 构成区陈列判定：明细非空即陈列，与重置时刻无关
+    /// MCP composition section display: shown whenever details are non-empty, regardless of reset time.
     #[test]
     fn mcp_details_presence() {
         let mcp_body = |reset_ms: Option<i64>| {
@@ -896,7 +1009,7 @@ mod tests {
                 r#"{{"success":true,"data":{{"limits":[{{"type":"TIME_LIMIT","percentage":10.0,"usage":100,"currentValue":10{reset},"usageDetails":[{{"modelCode":"m","usage":1}}]}}]}}}}"#
             )
         };
-        // 已过与未来的重置时刻同样陈列
+        // Past and future reset times both display.
         let past = (Utc::now() - chrono::Duration::hours(2)).timestamp_millis();
         let future = (Utc::now() + chrono::Duration::hours(1)).timestamp_millis();
         assert!(
@@ -909,42 +1022,63 @@ mod tests {
                 .unwrap()
                 .has_mcp_details()
         );
-        // 明细空则不陈列
+        // Empty details mean not displayed.
         let empty = r#"{"success":true,"data":{"limits":[{"type":"TIME_LIMIT","percentage":10.0,"usage":100,"currentValue":10}]}}"#;
         assert!(!parse_response(empty).unwrap().has_mcp_details());
     }
 
-    /// 附加块回填：失败块沿用旧值，新值不被覆盖，无旧可兜保持空
+    /// Tray ring priority: a present 5h bucket beats everything, absence falls back to the weekly
+    /// bucket, both absent is zero; MCP usage, however large, takes no part
+    #[test]
+    fn ring_percent_priority() {
+        let mut snap = feature_snap(true, true, Some(3), false, false);
+        snap.five_hour.as_mut().unwrap().used_percent = 40.0;
+        snap.weekly.as_mut().unwrap().used_percent = 80.0;
+        snap.mcp.as_mut().unwrap().used_percent = 95.0;
+        assert_eq!(snap.ring_percent(), 40.0);
+        snap.five_hour = None;
+        assert_eq!(snap.ring_percent(), 80.0);
+        snap.weekly = None;
+        assert_eq!(snap.ring_percent(), 0.0);
+    }
+
+    /// Sidecar backfill: failed blocks carry old values, new values are not overwritten,
+    /// and with nothing old to fall back on they stay empty
     #[test]
     fn sidecar_merge_backfills() {
-        // 余额缺与单档缺：沿用旧值；新拉到的档不被旧值覆盖
+        // Missing balance and a missing tier: carry old values; freshly fetched tiers are
+        // not overwritten by old values
         let mut new = feature_snap(true, true, None, true, false);
         new.token_stats = Some(TokenStats {
             legs: [Some(1.0), None, Some(3.0)],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
             as_of: Utc::now(),
         });
         let mut prev = feature_snap(true, true, None, true, true);
         prev.token_stats = Some(TokenStats {
             legs: [None, Some(2.0), None],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
             as_of: Utc::now(),
         });
         merge_sidecar(&mut new, Some(&prev));
         assert!(new.balance.is_some());
         let legs = new.token_stats.unwrap().legs;
         assert_eq!(legs, [Some(1.0), Some(2.0), Some(3.0)]);
-        // 统计整块缺：沿用旧整块
+        // Whole stats block missing: carry the old block.
         let mut new = feature_snap(true, true, None, false, false);
         merge_sidecar(&mut new, Some(&prev));
         assert!(new.token_stats.is_some());
-        // 无旧可兜：保持空
+        // Nothing old to fall back on: stays empty.
         let mut new = feature_snap(true, true, None, false, false);
         merge_sidecar(&mut new, None);
         assert!(new.balance.is_none() && new.token_stats.is_none());
-        // 跨日只挡今日档：旧档属于昨日窗口，今日档宁可占位；周/月是
-        // 滚动窗照常沿用；余额不是日期窗口量，跨日仍沿用
+        // Crossing a day blocks only the today tier: the old tier belongs to yesterday's window,
+        // so the today tier is better left as a placeholder; week/month are rolling windows and
+        // carry over as usual; balance is not a date-windowed quantity and still carries over across days
         let mut prev = feature_snap(true, true, None, true, true);
         prev.token_stats = Some(TokenStats {
             legs: [Some(1.0), Some(2.0), Some(3.0)],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
             as_of: Utc::now(),
         });
         prev.queried_at = Local::now() - chrono::Duration::days(1);
@@ -952,11 +1086,12 @@ mod tests {
         merge_sidecar(&mut new, Some(&prev));
         assert!(new.balance.is_some());
         assert_eq!(new.token_stats.unwrap().legs, [None, Some(2.0), Some(3.0)]);
-        // 同日的部分缺档：含今日档在内照常回填
+        // Partially missing tiers on the same day: backfilled as usual, today tier included.
         prev.queried_at = Local::now();
         let mut new = feature_snap(true, true, None, true, false);
         new.token_stats = Some(TokenStats {
             legs: [None, None, Some(3.0)],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
             as_of: Utc::now(),
         });
         merge_sidecar(&mut new, Some(&prev));
@@ -964,7 +1099,7 @@ mod tests {
             new.token_stats.unwrap().legs,
             [Some(1.0), Some(2.0), Some(3.0)]
         );
-        // 余额本体超过陈旧界限：不再回填，余额行消失
+        // Balance itself past the staleness bound: no longer backfilled, the balance row disappears.
         let mut prev = feature_snap(true, true, None, true, true);
         if let Some(b) = prev.balance.as_mut() {
             b.as_of = Utc::now() - chrono::Duration::hours(25);
@@ -972,18 +1107,71 @@ mod tests {
         let mut new = feature_snap(true, true, None, false, false);
         merge_sidecar(&mut new, Some(&prev));
         assert!(new.balance.is_none());
-        // 统计块超过陈旧界限：整块不再回填，Token 卡消失
+        // Stats block past the staleness bound: the whole block no longer backfilled,
+        // the Token card disappears.
         let mut prev = feature_snap(true, true, None, true, true);
         prev.token_stats = Some(TokenStats {
             legs: [Some(1.0), Some(2.0), Some(3.0)],
+            leg_at: [Utc::now() - chrono::Duration::hours(25); TOKEN_LEGS.len()],
             as_of: Utc::now() - chrono::Duration::hours(25),
         });
         let mut new = feature_snap(true, true, None, false, false);
         merge_sidecar(&mut new, Some(&prev));
         assert!(new.token_stats.is_none());
+        // Old block has a value only in the today tier and crosses a day:
+        // nothing survives the clearing, backfill absent.
+        let mut prev = feature_snap(true, true, None, true, true);
+        prev.token_stats = Some(TokenStats {
+            legs: [Some(1.0), None, None],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
+            as_of: Utc::now(),
+        });
+        prev.queried_at = Local::now() - chrono::Duration::days(1);
+        let mut new = feature_snap(true, true, None, false, false);
+        merge_sidecar(&mut new, Some(&prev));
+        assert!(new.token_stats.is_none());
+        // Per-tier age bound: the today tier keeps landing (block as_of is
+        // fresh) while the week tier last landed over a day ago — the frozen
+        // week value must not be re-injected as a live number; the month
+        // tier's fresh landing still backfills.
+        let mut prev = feature_snap(true, true, None, true, true);
+        prev.token_stats = Some(TokenStats {
+            legs: [Some(1.0), Some(2.0), Some(3.0)],
+            leg_at: [
+                Utc::now(),
+                Utc::now() - chrono::Duration::hours(25),
+                Utc::now(),
+            ],
+            as_of: Utc::now(),
+        });
+        let mut new = feature_snap(true, true, None, true, false);
+        new.token_stats = Some(TokenStats {
+            legs: [Some(1.0), None, None],
+            leg_at: [Utc::now(); TOKEN_LEGS.len()],
+            as_of: Utc::now(),
+        });
+        merge_sidecar(&mut new, Some(&prev));
+        assert_eq!(new.token_stats.unwrap().legs, [Some(1.0), None, Some(3.0)]);
+        // Whole-block backfill honors the per-tier bound too: a tier whose
+        // own landing is past the bound does not resurrect even while the
+        // block's as_of stays fresh via sibling landings.
+        let mut prev = feature_snap(true, true, None, true, true);
+        prev.token_stats = Some(TokenStats {
+            legs: [Some(1.0), Some(2.0), Some(3.0)],
+            leg_at: [
+                Utc::now(),
+                Utc::now() - chrono::Duration::hours(25),
+                Utc::now(),
+            ],
+            as_of: Utc::now(),
+        });
+        let mut new = feature_snap(true, true, None, false, false);
+        merge_sidecar(&mut new, Some(&prev));
+        assert_eq!(new.token_stats.unwrap().legs, [Some(1.0), None, Some(3.0)]);
     }
 
-    /// 在场桶序钉位：高度行数、缓存行集与绘制推进同引的绘制序
+    /// Pinned present-bucket order: the draw order shared by height row counts,
+    /// cached row sets, and render progression.
     #[test]
     fn present_buckets_order() {
         let tags = |s: &UsageSnapshot| {
@@ -1005,34 +1193,35 @@ mod tests {
             tags(&feature_snap(false, false, Some(0), false, false)),
             ["mcp"]
         );
-        // 行数特征与桶序同源
+        // The row-count feature shares the bucket order's source.
         assert_eq!(
             main_features(Some(&feature_snap(true, false, Some(1), false, false))).0,
             2
         );
     }
 
-    /// 高度特征钉位：桶缺失组合 → 四特征。与 sync_main_height /
-    /// draw_main 的区块陈列判定同源，漂移即面板高度错位
+    /// Pinned height features: bucket-absence combinations → the four features. Shares the block
+    /// display decisions of sync_derived / draw_main; any drift means a misaligned panel height
     #[test]
     fn main_features_matrix() {
         assert_eq!(main_features(None), (0, false, false, false));
-        // 三桶齐 + 明细 1 条 + 统计 + 余额
+        // All three buckets + 1 detail + stats + balance.
         assert_eq!(
             main_features(Some(&feature_snap(true, true, Some(1), true, true))),
             (3, true, true, true)
         );
-        // MCP 桶在场但明细空：行数计它、构成区不陈列
+        // MCP bucket present with empty details: the row count includes it,
+        // the composition section stays hidden.
         assert_eq!(
             main_features(Some(&feature_snap(true, false, Some(0), false, false))),
             (2, false, false, false)
         );
-        // 只剩周桶与余额
+        // Only the weekly bucket and balance remain.
         assert_eq!(
             main_features(Some(&feature_snap(false, true, None, false, true))),
             (1, false, false, true)
         );
-        // 空快照（全缺）：零特征
+        // Empty snapshot (all absent): zero features.
         assert_eq!(
             main_features(Some(&feature_snap(false, false, None, false, false))),
             (0, false, false, false)
@@ -1160,10 +1349,10 @@ mod tests {
             r#"{ "code": 401, "msg": "Unauthorized", "data": null, "success": false }"#,
             r#"{ "success": false, "msg": "token invalid" }"#,
             r#"{ "success": true, "code": 403, "msg": "forbidden" }"#,
-            // 业务码族 1000/1001 也是鉴权失败
+            // Business code family 1000/1001 is also an auth failure.
             r#"{ "success": false, "code": 1001, "msg": "auth required" }"#,
             r#"{ "success": false, "code": 1000, "msg": "" }"#,
-            // 1003/1005/1220 同族：归档与修复提示同表判定
+            // 1003/1005/1220 same family: archival and remediation hints judged by the same table.
             r#"{ "success": false, "code": 1003, "msg": "no auth" }"#,
             r#"{ "success": false, "code": 1005, "msg": "no auth" }"#,
             r#"{ "success": false, "code": 1220, "msg": "no auth" }"#,
@@ -1176,7 +1365,8 @@ mod tests {
         }
     }
 
-    /// 信封受限族归 Throttled，请求族与账户状态族归 Failure
+    /// Envelope throttled family goes to Throttled; the request family and
+    /// account-state family go to Failure.
     #[test]
     fn in_band_throttled_and_request_families() {
         for body in [
@@ -1193,7 +1383,7 @@ mod tests {
         }
         for body in [
             r#"{ "success": false, "code": 1213, "msg": "bad" }"#,
-            // 账户状态族：欠费与套餐失效恢复靠用户动作，不走退避
+            // Account-state family: arrears and expired plans recover through user action, not backoff.
             r#"{ "success": false, "code": 1113, "msg": "欠费" }"#,
             r#"{ "success": false, "code": 1314, "msg": "企业套餐已失效" }"#,
         ] {
@@ -1223,7 +1413,7 @@ mod tests {
         assert_eq!(info.message.chars().count(), ERR_BODY_CHARS);
     }
 
-    /// 大类归属钉位：状态路径按状态类，信封路径按码族
+    /// Pinned broad-category mapping: the status path by status class, the envelope path by code family.
     #[test]
     fn error_category_mapping() {
         let failure = |status: u16, code: Option<i64>| {
@@ -1233,19 +1423,21 @@ mod tests {
                 message: String::new(),
             })
         };
-        // 状态权威：4xx 归请求档，5xx 与本地解析归服务端档，回显码不改归档
+        // Status is authoritative: 4xx to the request tier, 5xx and local parse errors to
+        // the server tier; an echoed code doesn't change the category.
         assert_eq!(failure(400, None).category(), ErrorCategory::Request);
         assert_eq!(failure(404, None).category(), ErrorCategory::Request);
         assert_eq!(failure(503, None).category(), ErrorCategory::Server);
         assert_eq!(failure(0, None).category(), ErrorCategory::Server);
         assert_eq!(failure(400, Some(1003)).category(), ErrorCategory::Request);
-        // 信封路径按码族：请求族归请求档，服务族与未知码归服务端档
+        // Envelope path by code family: the request family to the request tier,
+        // the server family and unknown codes to the server tier.
         assert_eq!(failure(200, Some(1213)).category(), ErrorCategory::Request);
         assert_eq!(failure(200, Some(1301)).category(), ErrorCategory::Request);
         assert_eq!(failure(200, Some(1230)).category(), ErrorCategory::Server);
         assert_eq!(failure(200, Some(9999)).category(), ErrorCategory::Server);
         assert_eq!(failure(200, None).category(), ErrorCategory::Server);
-        // 429 窗口限额码随重置恢复，归受限档走指数退避
+        // 429 window-quota codes recover on reset; they go to the throttled tier with exponential backoff.
         for c in [1302, 1305, 1308, 1310, 1316, 1317, 1318, 1319, 1320, 1321] {
             assert_eq!(
                 parse_response(&format!(
@@ -1257,7 +1449,8 @@ mod tests {
                 "code {c} 应归受限档"
             );
         }
-        // 账户与订阅状态码：恢复靠用户侧动作，退避等不来，归请求档
+        // Account and subscription state codes: recovery needs user-side action that
+        // backoff can't wait into being; they go to the request tier.
         for c in [1113, 1311, 1313, 1314, 1315] {
             assert_eq!(
                 parse_response(&format!(
@@ -1269,7 +1462,7 @@ mod tests {
                 "code {c} 应归请求档"
             );
         }
-        // 变体直达
+        // Direct variant access.
         assert_eq!(
             FetchError::Unauthenticated(ErrorInfo {
                 status: 401,
@@ -1280,14 +1473,14 @@ mod tests {
             ErrorCategory::Unauthenticated
         );
         assert_eq!(
-            FetchError::Throttled {
-                info: ErrorInfo {
+            FetchError::throttled(
+                ErrorInfo {
                     status: 429,
                     code: None,
                     message: String::new()
                 },
-                retry_after_secs: None
-            }
+                None
+            )
             .category(),
             ErrorCategory::Throttled
         );
@@ -1298,8 +1491,8 @@ mod tests {
         assert_eq!(FetchError::Empty.category(), ErrorCategory::Empty);
     }
 
-    /// 1309 = 套餐过期；msg 含 "coding plan" = key 有效但无编码套餐，
-    /// 该形态信封 code 为 500，不能按码判
+    /// 1309 = plan expired; msg containing "coding plan" = key valid but no coding plan —
+    /// in that shape the envelope code is 500, so it must not be judged by code
     #[test]
     fn in_band_plan_state_maps_to_empty() {
         for body in [
@@ -1434,7 +1627,7 @@ mod tests {
         }
     }
 
-    /// 真实响应形态：单 5h 桶 + MCP 明细，level 小写 "max"
+    /// Real response shape: a single 5h bucket + MCP details, level lowercase "max".
     #[test]
     fn real_console_sample_single_bucket_with_mcp_details() {
         let body = r#"{
@@ -1493,7 +1686,7 @@ mod tests {
         assert!((parse_token_total(body).unwrap() - 5100.0).abs() < 1e-9);
     }
 
-    /// 服务端合计字段为权威值，优先于点位求和
+    /// The server-side summary field is authoritative, preferred over summing the points.
     #[test]
     fn token_total_prefers_server_side_summary() {
         let body = r#"{
@@ -1511,12 +1704,12 @@ mod tests {
 
     #[test]
     fn token_total_envelope_and_shape_errors() {
-        // 信封失败
+        // Envelope failure.
         let err = parse_token_total(r#"{ "success": false, "msg": "boom" }"#).unwrap_err();
         assert!(matches!(err, FetchError::Failure(_)));
-        // 缺 modelDataList
+        // Missing modelDataList.
         assert!(parse_token_total(r#"{ "success": true, "data": {} }"#).is_err());
-        // 空模型表合法，总和为 0
+        // An empty model list is valid; the total is 0.
         let body = r#"{ "success": true, "code": 200, "data": { "modelDataList": [] } }"#;
         assert_eq!(parse_token_total(body).unwrap(), 0.0);
     }

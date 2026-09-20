@@ -1,4 +1,4 @@
-//! 检查更新
+//! Update check
 
 use serde::Deserialize;
 
@@ -6,66 +6,84 @@ use crate::api::client::{MAX_BODY_BYTES, agent_long};
 
 pub const REPO: &str = "tengmmvp/Quotify";
 
-/// HTTP 错误消息携带的 body 前缀长度（字符数）上限
-const ERR_BODY_CHARS: usize = 120;
+/// Upper bound (in chars) on the body prefix carried in HTTP error messages
+/// Truncation char cap for GitHub error response bodies
+/// A different value from the api-side envelope error cap; the distinct
+/// name prevents mistaken reuse
+const GITHUB_ERR_CHARS: usize = 120;
 
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
-    html_url: String,
     draft: bool,
     prerelease: bool,
+    /// The officially encoded release page URL: a hand-assembled template
+    /// would lose the tag's percent-encoding
+    html_url: String,
 }
 
-/// 最新稳定 Release
+/// Latest stable release
 #[derive(Debug, Clone)]
 pub struct ReleaseInfo {
     pub tag: String,
     pub url: String,
 }
 
-/// 查询最新 Release
+/// GitHub requires a User-Agent on every request: one owner for the
+/// value, shared by the update check and the news fetch.
+pub(crate) fn github_user_agent() -> String {
+    format!("quotify/{}", env!("CARGO_PKG_VERSION"))
+}
+
+/// Query the latest release
 pub fn check_latest() -> Result<ReleaseInfo, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
     let resp = agent_long()
         .get(&url)
-        // GitHub API 强制要求 User-Agent。
-        .header(
-            "User-Agent",
-            format!("quotify/{}", env!("CARGO_PKG_VERSION")),
-        )
+        .header("User-Agent", github_user_agent())
         .call()
         .map_err(|e| format!("network error: {e}"))?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         if status.as_u16() == 404 {
-            // 仓库存疑或 Release 尚未发布，给可读文案而非裸状态码。
+            // The repo is questionable or the release is not yet published;
+            // give a readable message instead of a bare status code.
             return Err("release not found".into());
         }
-        // 失败原因（如 403 限流的 Retry-After 提示）都在 body 里，带前缀进消息。
-        let body = resp
-            .into_body()
-            .into_with_config()
-            .limit(MAX_BODY_BYTES)
-            .lossy_utf8(true)
-            .read_to_string()
-            .unwrap_or_default();
-        let prefix: String = body.chars().take(ERR_BODY_CHARS).collect();
+        // Failure details (such as a 403 rate-limit Retry-After hint) live
+        // in the body; carry a prefix into the message. Reading shares the
+        // client's prefix reader with the error-tier cap — the success
+        // cap would allocate up to 1 MiB only for chars().take(120) to
+        // discard all but a slice.
+        let body = crate::api::client::read_body_prefix(
+            resp.into_body(),
+            crate::api::client::ERR_BODY_BYTES,
+        );
+        let prefix: String = body.chars().take(GITHUB_ERR_CHARS).collect();
         return Err(if prefix.is_empty() {
             format!("HTTP {status}")
         } else {
             format!("HTTP {status}: {prefix}")
         });
     }
-    let rel: GithubRelease = resp
-        .into_body()
-        .into_with_config()
-        .limit(MAX_BODY_BYTES)
-        .read_json()
+    let rel: GithubRelease = crate::api::client::read_json_capped(resp.into_body(), MAX_BODY_BYTES)
         .map_err(|e| format!("parse failed: {e}"))?;
     if rel.draft || rel.prerelease {
         return Err("no stable release".into());
+    }
+    // The download entry uses the official html_url (correctly encoded when
+    // the tag contains #/non-ASCII); validate the host and path shape
+    // rather than pinning the owner — after a repo rename/transfer GitHub
+    // normalizes html_url to the new address, and pinning would leave
+    // existing installs forever unable to reach new versions (the
+    // self-update chicken-and-egg), while arbitrary redirect targets are
+    // still blocked by the shape check.
+    let u = rel.html_url.as_str();
+    let ok =
+        u.starts_with("https://github.com/") && u.contains("/releases/tag/") && !u.contains("..");
+    if !ok {
+        return Err(format!("unexpected release url: {u}"));
     }
     Ok(ReleaseInfo {
         tag: rel.tag_name,
@@ -73,7 +91,8 @@ pub fn check_latest() -> Result<ReleaseInfo, String> {
     })
 }
 
-/// 比较当前版本与远端 tag；预发布 tag 不自动提示
+/// Compare the current version against the remote tag; prerelease tags
+/// never prompt automatically
 pub fn is_newer(remote_tag: &str, current: &str) -> bool {
     if remote_tag.contains('-') {
         return false;

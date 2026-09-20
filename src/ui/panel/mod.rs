@@ -2,6 +2,8 @@
 
 pub mod anim;
 pub mod caret;
+pub mod geom;
+mod input;
 pub mod layout;
 pub mod model;
 pub mod render;
@@ -10,23 +12,23 @@ pub mod theme;
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::DwmSetWindowAttribute;
-use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromPoint, MonitorFromWindow, ValidateRect,
-};
+use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows::Win32::UI::HiDpi::GetDpiForMonitor;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent, VK_DELETE, VK_END,
-    VK_HOME, VK_LEFT, VK_RIGHT, VK_Y, VK_Z,
+    ReleaseCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::app::{app_from_tray, pump, sync_caret_after_geometry};
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::render::Renderer;
-use crate::ui::panel::text_edit::EditState;
-use crate::ui::panel::theme::PANEL_WIDTH;
 use crate::ui::{x_of, y_of};
+
+pub(crate) use geom::{
+    FALLBACK_DPI, HeightAnim, LogPx, PhysPx, apply_dpi_change, dpi_of, dpi_px, monitor_info,
+    monitor_info_of,
+};
+pub(crate) use input::apply_edit;
 
 const PANEL_WND_CLASS: &str = "QuotifyPanelWnd";
 
@@ -52,19 +54,11 @@ pub(crate) const OUTSIDE_GRACE_MS: u32 = 1200;
 static REPOSITION_PENDING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Fallback value when DPI probing fails
-pub(crate) const FALLBACK_DPI: f32 = 1.5;
-
-/// Logical→physical rounding policy: the one rounding decision every dpi
-/// conversion delegates to — Panel::px/pxf and the floating windows'
-/// pxf alike, so the panel and the popups can never round apart.
-pub(crate) fn dpi_px(dpi: f32, logical: f32) -> i32 {
-    (logical * dpi).round() as i32
-}
-
 /// Byte cap for a single-field input buffer
 const INPUT_MAX_BYTES: usize = 128;
-/// Byte cap for the proxy field: may carry userinfo credentials, longer than ordinary fields
+/// Byte cap for the proxy field: may carry userinfo credentials, longer than ordinary fields.
+/// Same value as api::client::PROXY_MAX_BYTES (the validation-side gate); two layers
+/// hold one copy each — api must not depend on ui
 const PROXY_MAX_BYTES: usize = 512;
 
 /// Manhattan distance between two points: shared artifact paired with DRAG_SLOP
@@ -156,6 +150,38 @@ pub(crate) enum Release {
     Reject,
 }
 
+/// Selected value vs effective value of one layout-affecting toggle: the
+/// click side switches `pending` immediately (instant highlight feedback),
+/// while `effective` drives the row set and height and only catches up
+/// when the height transition ends or is interrupted. Every catch-up goes
+/// through catch_up — no hand-written double assignment at call sites.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DualState<T> {
+    pub(crate) pending: T,
+    pub(crate) effective: T,
+}
+
+impl<T: Copy + PartialEq> DualState<T> {
+    /// Click-side write: the selected value switches immediately; the
+    /// effective value follows via the transition machinery.
+    pub(crate) fn set_pending(&mut self, v: T) {
+        self.pending = v;
+    }
+
+    /// The effective value catches up to the selected one: the shared core
+    /// of every transition-termination site (dismissal, drag start, DPI
+    /// change, relayout, animation wrap-up).
+    pub(crate) fn catch_up(&mut self) {
+        self.effective = self.pending;
+    }
+
+    /// Whether the effective layout already matches the selection — the
+    /// animation wrap-up's mismatch check.
+    pub(crate) fn is_synced(&self) -> bool {
+        self.pending == self.effective
+    }
+}
+
 /// Panel display mode: only two states, pinned and hidden, toggled by left-click
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelMode {
@@ -219,6 +245,16 @@ impl InputField {
         field.map_or(INPUT_MAX_BYTES, Self::max_bytes)
     }
 
+    /// Prefill copy clamped to the byte cap: the config side can hold more
+    /// bytes than typing allows (import bypasses input-side validation), and
+    /// a verbatim prefill would leave a buffer no keystroke can extend.
+    /// Truncates on a char boundary — the truncation policy single-sources
+    /// in platform::truncate_bytes (within-cap input passes through
+    /// unchanged, same semantics as the inlined code this replaced).
+    pub(crate) fn clamp_prefill(self, s: &str) -> String {
+        crate::platform::truncate_bytes(s, self.max_bytes()).to_string()
+    }
+
     /// Slot index into the per-field caret width cache; exhaustive like the
     /// other InputField dispatches so a new variant is a compile error here
     /// (the slot-count pinned test then flags the array size).
@@ -258,31 +294,12 @@ pub(crate) fn mask_key(key: &str, active: bool) -> String {
     }
 }
 
-/// Logical-pixel height: the measure on the layout and render side. Height-
-/// change chain interfaces are side-tagged with this; a bare i32 cannot
-/// enter the chain, and using the wrong side becomes a type error
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LogPx(pub(crate) i32);
-
-/// Physical-pixel height: the measure on the SetWindowPos and GetWindowRect side
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PhysPx(pub(crate) i32);
-
-/// One height transition: start height, target height, timing, and originating view
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct HeightAnim {
-    pub(crate) from: PhysPx,
-    pub(crate) to: PhysPx,
-    pub(crate) tween: anim::Tween,
-    pub(crate) view: PanelView,
-}
-
 /// Self-drawn input buffers; field order same as InputField
 #[derive(Default)]
 pub struct PanelInput {
     pub field: Option<InputField>,
-    pub edit: crate::ui::panel::text_edit::EditState,
-    pub surrogate: Option<u16>,
+    pub(crate) edit: crate::ui::panel::text_edit::EditState,
+    pub(crate) surrogate: Option<u16>,
     pub interval: String,
     pub proxy: String,
     pub peak_start: String,
@@ -328,6 +345,22 @@ impl PanelInput {
             Some(InputField::Org) => &self.org,
             Some(InputField::Project) => &self.project,
             None => &self.interval,
+        }
+    }
+
+    /// Clear one named field's buffer; the edited marks and the edit state
+    /// are the callers' semantics and stay untouched here. Exhaustive like
+    /// the other InputField dispatches: a new variant is a compile error.
+    pub(crate) fn clear_field(&mut self, f: InputField) {
+        match f {
+            InputField::Interval => self.interval.clear(),
+            InputField::Proxy => self.proxy.clear(),
+            InputField::PeakStart => self.peak_start.clear(),
+            InputField::PeakEnd => self.peak_end.clear(),
+            InputField::Name => self.name.clear(),
+            InputField::Key => self.key.clear(),
+            InputField::Org => self.org.clear(),
+            InputField::Project => self.project.clear(),
         }
     }
 }
@@ -393,13 +426,10 @@ pub struct Panel {
     pub(crate) anchor: Option<RECT>,
     pub renderer: Option<Renderer>,
     pub pending_platform: crate::api::Platform,
-    pub pending_team: bool,
-    pub layout_team: bool,
+    pub(crate) team: DualState<bool>,
     pub input: PanelInput,
     pub(crate) key_revealed: bool,
-    pub customizing_interval: bool,
-    pub layout_customizing: bool,
-    pub(crate) caret_ctx: (bool, bool),
+    pub(crate) customizing: DualState<bool>,
     pub(crate) selecting: bool,
     pub(crate) text_clicks: Option<(u32, i32, i32, u8)>,
     vis_start: std::cell::Cell<usize>,
@@ -411,7 +441,12 @@ pub struct Panel {
     pub(crate) drag_offset: Option<(i32, i32)>,
     class_registered: bool,
     pub(crate) main_h: i32,
-    pub(crate) account_error: bool,
+    pub(crate) auth_error: bool,
+    /// Caret-line y chain's account-presence input (the settings row
+    /// chain's has_account tier), written by sync_derived; the
+    /// auth-error input is not mirrored — caret_line_y reads
+    /// self.auth_error directly, one source.
+    pub(crate) caret_has_account: bool,
     pub(crate) anim_period: u32,
     pub(crate) height_anim: Option<HeightAnim>,
     /// Current period of the minute heartbeat: the final countdown minute switches to a
@@ -434,18 +469,16 @@ impl Panel {
             anchor: None,
             renderer: None,
             pending_platform: crate::api::Platform::Cn,
-            pending_team: false,
-            layout_team: false,
+            team: DualState::default(),
             input: PanelInput::default(),
             key_revealed: false,
-            customizing_interval: false,
-            layout_customizing: false,
+            customizing: DualState::default(),
             main_h: layout::EMPTY_VIEW_H as i32,
-            account_error: false,
+            auth_error: false,
+            caret_has_account: false,
             anim_period: 0,
             height_anim: None,
             minute_period: std::cell::Cell::new(0),
-            caret_ctx: (false, false),
             selecting: false,
             text_clicks: None,
             vis_start: std::cell::Cell::new(0),
@@ -460,99 +493,6 @@ impl Panel {
             painted: false,
             caret_cache: std::cell::RefCell::new(std::array::from_fn(|_| None)),
             dpi: FALLBACK_DPI,
-        }
-    }
-
-    /// Logical pixels → physical pixels; delegates the rounding to
-    /// dpi_px — any inline `* dpi` elsewhere drifts silently
-    pub(crate) fn px(&self, logical: i32) -> i32 {
-        dpi_px(self.dpi, logical as f32)
-    }
-
-    /// f32 form of the same rounding policy: float-origin callers (IME
-    /// composition-window positioning) go through here instead of
-    /// inlining the multiply-round
-    pub(crate) fn pxf(&self, logical: f32) -> i32 {
-        dpi_px(self.dpi, logical)
-    }
-
-    /// Placement reference monitor: when not dragged, pick the monitor by
-    /// the anchor center (a first-open window hovers at the primary
-    /// monitor's origin, so picking by window would get the wrong monitor);
-    /// when dragged, pick by the window's current monitor. Monitor selection
-    /// for height and placement uniformly goes through this single source
-    fn place_monitor(&self, hwnd: HWND) -> HMONITOR {
-        let moved = self.dragged || self.drag_offset.is_some();
-        unsafe {
-            if !moved && let Some(a) = self.anchor {
-                MonitorFromPoint(
-                    POINT {
-                        x: (a.left + a.right) / 2,
-                        y: a.top,
-                    },
-                    MONITOR_DEFAULTTONEAREST,
-                )
-            } else {
-                MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
-            }
-        }
-    }
-
-    /// Logical height → physical target height: the dragged state uses the
-    /// full height; anchor-based opening squashes against the work area.
-    /// place, shrink-transition startup, and the animation wrap-up
-    /// comparison — all three share this source; monitor selection uniformly
-    /// goes through place_monitor
-    pub(crate) fn target_h(&self, mi: &MONITORINFO, logical: LogPx, moved: bool) -> PhysPx {
-        if moved {
-            return PhysPx(self.px(logical.0));
-        }
-        let max_h = (mi.rcWork.bottom - mi.rcWork.top - 16).max(self.px(200));
-        PhysPx(self.px(logical.0).min(max_h))
-    }
-
-    /// Logical height of the panel's current view
-    pub(crate) fn view_height(&self, accounts: usize) -> i32 {
-        self.view_height_for(self.layout_team, self.layout_customizing, accounts)
-    }
-
-    /// Catch the effective layout up to the selected values: the shared core
-    /// of every transition-termination site (dismissal, drag start, DPI
-    /// change, relayout, animation wrap-up). Sites clear height_anim and
-    /// reconcile fading focus as their situation requires — register any
-    /// future pending/effective layout pair here, not at the call sites.
-    pub(crate) fn catch_up_layout(&mut self) {
-        self.layout_team = self.pending_team;
-        self.layout_customizing = self.customizing_interval;
-    }
-
-    /// Catch up render-derived fields: main view height, account error flag,
-    /// caret context. The expand and relayout paths share this source;
-    /// convergence at a single point prevents drift.
-    pub(crate) fn sync_derived(
-        &mut self,
-        snap: Option<&crate::api::UsageSnapshot>,
-        last_error: Option<&crate::api::FetchError>,
-        has_accounts: bool,
-    ) {
-        self.main_h = layout::main_height_of(snap);
-        self.account_error =
-            last_error.is_some_and(|e| e.category() == crate::api::ErrorCategory::Unauthenticated);
-        self.caret_ctx = (has_accounts, self.account_error);
-    }
-
-    /// Logical height for a given layout combination: the shrink transition computes its
-    /// endpoint from the target layout at startup
-    pub(crate) fn view_height_for(&self, team: bool, customizing: bool, accounts: usize) -> i32 {
-        match self.view {
-            // Dynamic: stretches with metric row count / balance / subtitle, maintained by sync_derived.
-            PanelView::Main => self.main_h,
-            PanelView::AddForm => layout::add_page_height(team),
-            // Whole-page height is the sum of layout's section-constant chain,
-            // the same source as draw_settings's y-advance chain.
-            PanelView::Settings => {
-                layout::settings_view_height(accounts > 0, self.account_error, customizing)
-            }
         }
     }
 
@@ -588,162 +528,6 @@ impl Panel {
         Some(hwnd)
     }
 
-    /// Compute and apply panel geometry; logical_h uniformly takes logical height
-    pub(crate) fn place(&mut self, hwnd: HWND, logical_h: LogPx, show: bool) {
-        unsafe {
-            let moved = self.dragged || self.drag_offset.is_some();
-            let monitor = self.place_monitor(hwnd);
-            let mi = monitor_info(monitor);
-            self.dpi = dpi_of(monitor).unwrap_or(FALLBACK_DPI);
-
-            // While a height transition is in progress, window geometry is
-            // owned exclusively by the animation frames; external relayouts
-            // yield. Cross-view transitions have already been terminated by
-            // relayout; mid-drag there is no animation, so no check.
-            if !show
-                && self.drag_offset.is_none()
-                && self.height_anim.is_some_and(|a| a.view == self.view)
-            {
-                return;
-            }
-
-            let w = self.px(PANEL_WIDTH);
-            // Fetch the current window rect once: drag positioning, the
-            // animation start, and jump detection share it.
-            let mut wr = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut wr);
-            let cur_h = wr.bottom - wr.top;
-            // Dragged (including mid-drag) keeps the full height and may
-            // cover the taskbar — alternating moves and relayouts changing
-            // the height would flicker-jump; anchor-based opening still
-            // squashes against the work area to stay on screen for short monitors.
-            let target_h = self.target_h(&mi, logical_h, moved).0;
-            // Expansion goes through a transition animation that gradually
-            // uncovers; shrinking collapses the window at the toggle point
-            // and never passes through here. Open, mid-drag, and reduced
-            // motion land directly; dragged still transitions normally, the
-            // frames keep the position.
-            let animate = !show
-                && self.drag_offset.is_none()
-                && cur_h < target_h
-                && IsWindowVisible(hwnd).as_bool()
-                && anim::animations_allowed();
-            if animate {
-                self.height_anim = Some(HeightAnim {
-                    from: PhysPx(cur_h),
-                    to: PhysPx(target_h),
-                    tween: anim::Tween::now(150),
-                    view: self.view,
-                });
-                self.retune_anim(hwnd, 16);
-            } else {
-                self.height_anim = None;
-            }
-            let h = if animate { cur_h } else { target_h };
-            let (x, y) = if moved {
-                (wr.left, wr.top)
-            } else if let Some(anchor) = self.anchor {
-                let ax = (anchor.left + anchor.right) / 2;
-                let mut x = ax - w / 2;
-                let mut y = anchor.top - h - self.px(8);
-                if x < mi.rcWork.left + 8 {
-                    x = mi.rcWork.left + 8;
-                }
-                if x + w > mi.rcWork.right - 8 {
-                    x = mi.rcWork.right - 8 - w;
-                }
-                if y < mi.rcWork.top + 8 {
-                    y = mi.rcWork.top + 8;
-                }
-                (x, y)
-            } else {
-                (0, 0)
-            };
-            // Positioning carries SWP_NOCOPYBITS: CopyBits writes the old
-            // content to screen first and is then overwritten by the repaint;
-            // two misaligned screen writes show as ghost flicker. Drag
-            // translation genuinely needs content to follow and is the
-            // exception without the flag.
-            let flags = if show {
-                SWP_SHOWWINDOW | SWP_NOCOPYBITS
-            } else if moved {
-                SWP_NOACTIVATE
-            } else {
-                SWP_NOACTIVATE | SWP_NOCOPYBITS
-            };
-            // The trailing scroll sync runs before the move: every input
-            // it reads is known pre-pump, and the SetWindowPos can
-            // synchronously dispatch WM_DPICHANGED (mixed-DPI crossing),
-            // whose arm re-derives App — writing self after it crosses
-            // the alias discipline.
-            // Visible height counts the real on-screen viewport; the part
-            // past the screen bottom does not count. The expand animation's
-            // first frame stays at the old position, so the top edge must be
-            // derived backward from the target height to the final state —
-            // otherwise an underestimated value releases fake scroll room.
-            let final_y = if moved {
-                y
-            } else if let Some(anchor) = self.anchor {
-                (anchor.top - target_h - self.px(8)).max(mi.rcWork.top + 8)
-            } else {
-                y
-            };
-            let visible = target_h.min((mi.rcMonitor.bottom - final_y).max(0));
-            self.refresh_scroll(logical_h.0, visible);
-            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
-        }
-    }
-
-    /// Start a shrink transition when the target is shorter and animation
-    /// is available: the layout keeps its originating state, the window
-    /// shrinks first and is gradually clipped; the caller catches up on
-    /// finish or interruption. `logical_h` takes logical height.
-    pub(crate) fn begin_shrink_anim(&mut self, hwnd: HWND, logical_h: LogPx) -> bool {
-        unsafe {
-            // Do not start mid-drag: drag frames land immediately and would
-            // fight the transition frames; dragged (not mid-drag) still
-            // transitions normally, the animation frames keep the current position.
-            if self.drag_offset.is_some() {
-                return false;
-            }
-            // The dragged state uses the full height, same as place's moved
-            // branch; anchor-based opening squashes against the work area to
-            // stay on screen for short monitors. Monitor selection shares the
-            // same source as place.
-            let mi = monitor_info(self.place_monitor(hwnd));
-            let target_h = self.target_h(&mi, logical_h, self.dragged);
-            let mut wr = RECT::default();
-            let _ = GetWindowRect(hwnd, &mut wr);
-            let cur_h = wr.bottom - wr.top;
-            if target_h.0 >= cur_h
-                || !IsWindowVisible(hwnd).as_bool()
-                || !anim::animations_allowed()
-            {
-                return false;
-            }
-            self.height_anim = Some(HeightAnim {
-                from: PhysPx(cur_h),
-                to: target_h,
-                tween: anim::Tween::now(150),
-                view: self.view,
-            });
-            self.retune_anim(hwnd, 16);
-            true
-        }
-    }
-
-    /// Recompute the scroll cap after the viewport's physical height changes, and
-    /// clamp the offset back into range (visible logical height = physical height / dpi)
-    fn refresh_scroll(&mut self, logical_h: i32, physical_h: i32) {
-        let visible = physical_h as f32 / self.dpi;
-        self.scroll_max = (logical_h as f32 - visible).max(0.0);
-        self.scroll_dy = if self.view == PanelView::Main {
-            0.0
-        } else {
-            self.scroll_dy.min(self.scroll_max)
-        };
-    }
-
     /// Single source of truth for TIMER_ANIM tuning: touch the system timer
     /// only when the period changes and record it in sync — bare
     /// SetTimer/KillTimer bypassing the record lets the shadow drift, making
@@ -766,7 +550,7 @@ impl Panel {
     /// Position and show; the fade-in is advanced by TIMER_ANIM. Returns
     /// the window handle (including one created inside this call) so the
     /// caller never reads self after the trailing pump.
-    pub fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) -> Option<HWND> {
+    pub(crate) fn show_at(&mut self, parent: HWND, anchor: RECT, accounts: usize) -> Option<HWND> {
         let hwnd = self.ensure_window(parent)?;
         // Read before place: place's SetWindowPos with SWP_SHOWWINDOW sets the visible bit.
         let fresh = unsafe { !IsWindowVisible(hwnd).as_bool() };
@@ -797,7 +581,7 @@ impl Panel {
         // incompatible with HwndRenderTarget's swap-chain presentation.
         unsafe {
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-            let _ = InvalidateRect(Some(hwnd), None, true);
+            invalidate_panel(hwnd);
         }
         // Setting Pinned comes after the window is shown (an earlier
         // return keeps Hidden on window-creation failure) and before the
@@ -905,14 +689,14 @@ impl Panel {
         self.view = PanelView::Main;
         self.scroll_dy = 0.0;
         self.key_revealed = false;
-        self.input.interval.clear();
-        self.input.proxy.clear();
+        self.input.clear_field(InputField::Interval);
+        self.input.clear_field(InputField::Proxy);
         // The prefill marks reset with their buffers: the next settings
         // session prefills afresh from the config.
         self.input.interval_edited = false;
         self.input.proxy_edited = false;
-        self.input.peak_start.clear();
-        self.input.peak_end.clear();
+        self.input.clear_field(InputField::PeakStart);
+        self.input.clear_field(InputField::PeakEnd);
         if let Some(h) = self.hwnd {
             self.clear_input(h);
         } else {
@@ -936,9 +720,7 @@ impl Panel {
         }
         self.key_revealed = false;
         if active {
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
+            invalidate_panel(hwnd);
         }
     }
 
@@ -971,79 +753,12 @@ impl Panel {
             }
         }
         self.ime_owned = false;
-    }
-}
-
-/// Work-area info of a given monitor
-pub(crate) unsafe fn monitor_info(monitor: HMONITOR) -> MONITORINFO {
-    unsafe {
-        let mut mi = MONITORINFO {
-            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-            ..Default::default()
-        };
-        let _ = GetMonitorInfoW(monitor, &mut mi);
-        mi
-    }
-}
-
-/// Work-area info of the monitor the window is on
-pub(crate) unsafe fn monitor_info_of(hwnd: HWND) -> MONITORINFO {
-    unsafe { monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) }
-}
-
-/// WM_DPICHANGED core shared by the panel and the floating windows:
-/// returns (new dpi, new physical width, new physical height). The
-/// suggested rect in lparam is deliberately never dereferenced — a forged
-/// cross-process message can carry any non-null pointer and reading it is
-/// undefined; the replacement size is derived from the window's own rect
-/// by ratio, keeping the top-left anchor (no cross-monitor drift). The
-/// raw HIWORD scale is clamped: a forged 0 would poison every later
-/// division, and absurd values would mis-map clicks. The internal
-/// SetWindowPos is a pump — callers re-fetch their references after this.
-pub(crate) unsafe fn apply_dpi_change(
-    hwnd: HWND,
-    wparam: WPARAM,
-    old_dpi: f32,
-) -> Option<(f32, i32, i32)> {
-    unsafe {
-        let dpi = ((wparam.0 >> 16) & 0xFFFF) as u32 as f32 / 96.0;
-        if !(1.0..=8.0).contains(&dpi) || !old_dpi.is_finite() || old_dpi < 1.0 {
-            return None;
-        }
-        let mut wr = RECT::default();
-        let _ = GetWindowRect(hwnd, &mut wr);
-        let scale = dpi / old_dpi;
-        let w = (((wr.right - wr.left) as f32) * scale).round().max(1.0) as i32;
-        let h = (((wr.bottom - wr.top) as f32) * scale).round().max(1.0) as i32;
-        let _ = SetWindowPos(
-            hwnd,
-            None,
-            0,
-            0,
-            w,
-            h,
-            // NOCOPYBITS per the repo-wide SetWindowPos rule: the blitted
-            // old content and the following D2D present are two misaligned
-            // screen writes — the ghost-flash frame.
-            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOCOPYBITS,
-        );
-        Some((dpi, w, h))
-    }
-}
-
-/// Get the monitor's effective DPI (percentage / 96)
-pub(crate) unsafe fn dpi_of(monitor: HMONITOR) -> Option<f32> {
-    unsafe {
-        let mut cx = 0u32;
-        let mut cy = 0u32;
-        GetDpiForMonitor(
-            monitor,
-            windows::Win32::UI::HiDpi::MDT_EFFECTIVE_DPI,
-            &mut cx,
-            &mut cy,
-        )
-        .ok()
-        .map(|_| cx as f32 / 96.0)
+        // The width table of a dead buffer is pure retention once the edit
+        // state ends (the Key slot even carries the masked string's length).
+        self.caret_cache
+            .borrow_mut()
+            .iter_mut()
+            .for_each(|s| *s = None);
     }
 }
 
@@ -1235,7 +950,7 @@ pub extern "system" fn panel_wndproc(
                     // since WM_PAINT repaints the whole window anyway,
                     // narrowing the invalidation rect saves no drawing.
                     TIMER_MINUTE_TICK => {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
+                        invalidate_panel(hwnd);
                         if let Some(app) = app_from_tray(hwnd) {
                             retune_minute(app, hwnd);
                         }
@@ -1321,16 +1036,16 @@ pub extern "system" fn panel_wndproc(
                     );
                     let y_min = mi.rcWork.top - (wr.bottom - wr.top) + 64;
                     let y = (cursor.y - oy).clamp(y_min, (mi.rcWork.bottom - 64).max(y_min));
-                    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
                     // Close the popup only when displacement exceeds the
-                    // threshold; below it, just follow. The decision is
-                    // copied before the pumps: SetWindowPos can synchronously
+                    // threshold; below it, just follow. The decision is read
+                    // before the pumps: SetWindowPos can synchronously
                     // dispatch WM_DPICHANGED (cross-monitor), and close's
                     // SW_HIDE re-enters the pump again — both re-derive App,
                     // so the close runs through the re-fetched reference and
                     // nothing here uses this frame's alias afterwards.
                     let close_it =
                         app.popup.is_open() && app.panel.gesture.dragged_far((cursor.x, cursor.y));
+                    let _ = SetWindowPos(hwnd, None, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
                     if close_it && let Some(app) = app_from_tray(hwnd) {
                         app.popup.close();
                     }
@@ -1373,7 +1088,7 @@ pub extern "system" fn panel_wndproc(
                                 } else {
                                     app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
                                 }
-                                let _ = InvalidateRect(Some(hwnd), None, false);
+                                invalidate_panel(hwnd);
                             }
                         }
                         return LRESULT(0);
@@ -1391,7 +1106,7 @@ pub extern "system" fn panel_wndproc(
                         let hit = r.hit_at(x, y);
                         if r.hover != hit {
                             r.hover = hit;
-                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            invalidate_panel(hwnd);
                         }
                     }
                 }
@@ -1415,7 +1130,7 @@ pub extern "system" fn panel_wndproc(
                             && r.hover.is_some()
                         {
                             r.hover = None;
-                            let _ = InvalidateRect(Some(hwnd), None, false);
+                            invalidate_panel(hwnd);
                         }
                     }
                 }
@@ -1441,7 +1156,7 @@ pub extern "system" fn panel_wndproc(
                             let r = app.panel.renderer.as_ref();
                             app.panel.update_caret(hwnd, r);
                         }
-                        let _ = InvalidateRect(Some(hwnd), None, true);
+                        invalidate_panel(hwnd);
                     }
                 }
                 LRESULT(0)
@@ -1498,7 +1213,7 @@ pub extern "system" fn panel_wndproc(
                             let n = app.config.accounts.len();
                             let logical_h = app.panel.view_height(n);
                             app.panel.place(hwnd, LogPx(logical_h), true);
-                            let _ = InvalidateRect(Some(hwnd), None, true);
+                            invalidate_panel(hwnd);
                         } else {
                             // A blank click ends the edit state and plaintext viewing; buffer text is kept.
                             app.panel.end_edit_state(hwnd);
@@ -1548,204 +1263,8 @@ pub extern "system" fn panel_wndproc(
                 }
                 LRESULT(0)
             }
-            WM_KEYDOWN => {
-                // Editing key dispatch: movement, selection, word deletion,
-                // and undo/redo go through EditState;
-                // characters and combinations are handled by WM_CHAR.
-                let vk = (wparam.0 & 0xFF) as u16;
-                let app = app_from_tray(hwnd);
-                if let Some(app) = app
-                    && app.panel.input.field.is_some()
-                    && [VK_DELETE, VK_END, VK_HOME, VK_LEFT, VK_RIGHT, VK_Y, VK_Z]
-                        .iter()
-                        .any(|k| vk == k.0)
-                {
-                    use windows::Win32::UI::Input::KeyboardAndMouse::{
-                        GetKeyState, VK_CONTROL, VK_SHIFT,
-                    };
-                    let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-                    let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                    let input = &mut app.panel.input;
-                    let acted = if vk == VK_LEFT.0 {
-                        let t = input.active_str().to_string();
-                        input.edit.move_left(&t, ctrl, shift);
-                        true
-                    } else if vk == VK_RIGHT.0 {
-                        let t = input.active_str().to_string();
-                        input.edit.move_right(&t, ctrl, shift);
-                        true
-                    } else if vk == VK_HOME.0 {
-                        input.edit.move_home(shift);
-                        true
-                    } else if vk == VK_END.0 {
-                        let t = input.active_str().to_string();
-                        input.edit.move_end(&t, shift);
-                        true
-                    } else if vk == VK_DELETE.0 {
-                        apply_edit(input, |e, t| e.delete(t, ctrl));
-                        true
-                    } else if vk == VK_Z.0 && ctrl {
-                        // Shift+Z is a redo convention, same as Y.
-                        apply_edit(input, |e, t| {
-                            if shift {
-                                e.redo(t);
-                            } else {
-                                e.undo(t);
-                            }
-                        });
-                        true
-                    } else if vk == VK_Y.0 && ctrl {
-                        apply_edit(input, EditState::redo);
-                        true
-                    } else {
-                        false
-                    };
-                    if acted {
-                        app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
-                LRESULT(0)
-            }
-            WM_CHAR => {
-                // Character editing and clipboard combinations;
-                // control characters dispatched by Windows edit-control convention.
-                let app = app_from_tray(hwnd);
-                if let Some(app) = app
-                    && app.panel.input.field.is_some()
-                {
-                    let ch = (wparam.0 & 0xFFFF) as u16;
-                    let mut confirm = false;
-                    let key_masked =
-                        app.panel.input.field == Some(InputField::Key) && !app.panel.key_revealed;
-                    // UTF-16 surrogate pairs arrive as high then low half:
-                    // stash the high half, and when the low half arrives
-                    // assemble the supplementary-plane character; an
-                    // ordinary character clears the stash on arrival,
-                    // preventing a stale high half from mis-pairing with a
-                    // later low half.
-                    let decoded = {
-                        let cp = ch as u32;
-                        if crate::platform::is_utf16_high_surrogate(ch) {
-                            app.panel.input.surrogate = Some(ch);
-                            None
-                        } else if (0xDC00..0xE000).contains(&cp) {
-                            app.panel
-                                .input
-                                .surrogate
-                                .take()
-                                .map(|hi| 0x10000 + (((hi as u32) - 0xD800) << 10) + cp - 0xDC00)
-                                .and_then(char::from_u32)
-                        } else {
-                            app.panel.input.surrogate = None;
-                            char::from_u32(cp)
-                        }
-                    };
-                    {
-                        use windows::Win32::UI::Input::KeyboardAndMouse::{
-                            GetKeyState, VK_CONTROL,
-                        };
-                        let ctrl = GetKeyState(VK_CONTROL.0 as i32) < 0;
-                        // Paste reads the clipboard first: reading is a
-                        // cross-process synchronous pump (delayed-render
-                        // handshake) and must not straddle the input-state
-                        // borrow — an edit re-entering inside the pump
-                        // invalidates the old borrow. The unit budget takes
-                        // the field's byte-budget tier; an oversized
-                        // clipboard is never materialized whole.
-                        let pasted = if decoded == Some('\u{16}') {
-                            // The field's byte budget doubles as the UTF-16
-                            // unit cap: a unit costs up to 3 UTF-8 bytes, so
-                            // this reads at most 3x the byte budget — the
-                            // cap here only bounds materialization; paste
-                            // re-enforces the byte cap downstream.
-                            let budget = InputField::max_bytes_for(app.panel.input.field);
-                            crate::platform::clipboard::read_text(budget)
-                        } else {
-                            None
-                        };
-                        // Clipboard read is a cross-process pump: re-fetch the
-                        // reference before touching input state. A KILLFOCUS
-                        // dispatched inside the pump clears the field; the
-                        // stale reference would paste into active_buf's
-                        // None-fallback (the interval buffer). Clipboard
-                        // writes collect here and run after the borrow ends —
-                        // same pump class.
-                        let mut clip_write: Option<String> = None;
-                        if let Some(app) = app_from_tray(hwnd) {
-                            let input = &mut app.panel.input;
-                            // The byte budget takes its tier by field: IME
-                            // composition results also pass through here.
-                            let max = InputField::max_bytes_for(input.field);
-                            match decoded {
-                                Some('\r') | Some('\n') => confirm = true,
-                                Some('\u{8}') => {
-                                    apply_edit(input, |e, t| e.backspace(t, ctrl));
-                                }
-                                Some('\u{7F}') => {
-                                    // Ctrl+Backspace: delete the previous word.
-                                    apply_edit(input, |e, t| e.backspace(t, true));
-                                }
-                                Some('\u{1}') => {
-                                    let t = input.active_str().to_string();
-                                    input.edit.select_all(&t);
-                                }
-                                Some('\u{3}') if !key_masked => {
-                                    // Single-line convention: with no
-                                    // selection, copy everything.
-                                    let t = input.active_str().to_string();
-                                    clip_write = input
-                                        .edit
-                                        .copy(&t)
-                                        .map(str::to_string)
-                                        .or_else(|| (!t.is_empty()).then_some(t));
-                                }
-                                Some('\u{18}') if !key_masked => {
-                                    // Single-line convention: with no
-                                    // selection, cut everything.
-                                    apply_edit(input, |e, t| {
-                                        if e.selection().is_none() {
-                                            if t.is_empty() {
-                                                return;
-                                            }
-                                            e.select_all(t);
-                                        }
-                                        clip_write = e.cut(t);
-                                    });
-                                }
-                                Some('\u{16}') => {
-                                    // Paste is void when the field was cleared
-                                    // inside the read pump: the buffered text
-                                    // belongs to a field that no longer exists.
-                                    if input.field.is_some()
-                                        && let Some(text) = pasted
-                                    {
-                                        apply_edit(input, |e, t| e.paste(t, &text, max));
-                                    }
-                                }
-                                Some(c) if !c.is_control() => {
-                                    apply_edit(input, |e, t| e.insert(t, c, max));
-                                }
-                                _ => {}
-                            }
-                        }
-                        if let Some(s) = clip_write {
-                            crate::platform::clipboard::write_text(hwnd, &s);
-                        }
-                    }
-                    if confirm && let Some(app) = app_from_tray(hwnd) {
-                        crate::app::confirm_panel_input(app, hwnd);
-                    }
-                    // The confirm path may trigger a system notification
-                    // (WinRT calls can re-enter the message pump); the
-                    // reference is dead after the pump: the shared tail
-                    // re-fetches and re-syncs — a no-op when not confirmed.
-                    if sync_caret_after_geometry(hwnd) {
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                    }
-                }
-                LRESULT(0)
-            }
+            WM_KEYDOWN => input::handle_keydown(hwnd, wparam),
+            WM_CHAR => input::handle_char(hwnd, wparam),
             WM_KILLFOCUS => {
                 let app = app_from_tray(hwnd);
                 if let Some(app) = app
@@ -1763,130 +1282,7 @@ pub extern "system" fn panel_wndproc(
                 }
                 LRESULT(0)
             }
-            WM_LBUTTONDOWN => {
-                // Pressing any blank spot enters manual dragging so a long
-                // settings page can be dragged into view.
-                // No system HTCAPTION modal dragging: on Win11 dragging to
-                // the screen's top edge forces the snap preview.
-                let mut app = app_from_tray(hwnd);
-                let (x, y) = if let Some(app) = app.as_ref() {
-                    (x_of(lparam) / app.panel.dpi, y_of(lparam) / app.panel.dpi)
-                } else {
-                    (0.0, 0.0)
-                };
-                // Compute the hit once: blank detection, press latching, and input-field mapping share it.
-                let down_hit = app
-                    .as_ref()
-                    .and_then(|a| a.panel.renderer.as_ref())
-                    .and_then(|r| r.hit_at(x, y));
-                let hit_none = down_hit.is_none();
-                let mut cursor = POINT::default();
-                let _ = GetCursorPos(&mut cursor);
-                if let Some(app) = app.as_mut() {
-                    app.panel.gesture.record((cursor.x, cursor.y), down_hit);
-                    // Press in an input box's text zone: position the caret
-                    // and enter drag selection, not blank dragging.
-                    // An already-focused box positions directly; an
-                    // unfocused box focuses on press then positions at the
-                    // click, so the second hit of a double click can already
-                    // select a word. Multi-click judged by 500ms/8px: double
-                    // click selects a word, triple click selects all; with
-                    // Shift held, a click extends the selection instead of
-                    // resetting it.
-                    let active_zone = app.panel.hit_text_zone(x, y);
-                    let target = if active_zone {
-                        app.panel.input.field
-                    } else {
-                        down_hit.and_then(input_field_of_hit)
-                    };
-                    if let Some(f) = target {
-                        if !active_zone {
-                            app.panel.focus_input(hwnd, f);
-                        }
-                        let Some(r) = app.panel.renderer.as_ref() else {
-                            return LRESULT(0);
-                        };
-                        let now = windows::Win32::System::SystemInformation::GetTickCount();
-                        let (px, py) = ((x * app.panel.dpi) as i32, (y * app.panel.dpi) as i32);
-                        let count = match app.panel.text_clicks {
-                            Some((t, cx, cy, n))
-                                if now.wrapping_sub(t) <= 500
-                                    && manhattan(px, py, cx, cy) <= DRAG_SLOP =>
-                            {
-                                n.saturating_add(1).min(3)
-                            }
-                            _ => 1,
-                        };
-                        app.panel.text_clicks = Some((now, px, py, count));
-                        // Hit conversion and caret positioning share one width-table layout.
-                        let cl = app.panel.caret_layout(r);
-                        let pos = app.panel.caret_hit_test(cl.as_ref(), f, x);
-                        use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_SHIFT};
-                        let shift = GetKeyState(VK_SHIFT.0 as i32) < 0;
-                        match count {
-                            2 => {
-                                // Double click selects a word; Key masked dots carry no word meaning, degrades to select-all.
-                                let real = app.panel.input.active_str().to_string();
-                                if f == InputField::Key && !app.panel.key_revealed {
-                                    app.panel.input.edit.select_all(&real);
-                                } else {
-                                    let (a, b) = text_edit::word_range_at(&real, pos);
-                                    app.panel.input.edit.place(a, false);
-                                    app.panel.input.edit.place(b, true);
-                                }
-                            }
-                            3 => {
-                                let real = app.panel.input.active_str().to_string();
-                                app.panel.input.edit.select_all(&real);
-                            }
-                            _ => {
-                                app.panel.input.edit.place(pos, shift);
-                            }
-                        }
-                        app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-                        app.panel.selecting = true;
-                        let _ = InvalidateRect(Some(hwnd), None, false);
-                        let _ = SetCapture(hwnd);
-                        return LRESULT(0);
-                    }
-                    if hit_none {
-                        // Dragging takes over position; an in-progress
-                        // transition yields and catches up, and the fading
-                        // focus is reconciled; translation relies on
-                        // CopyBits without repaint, so an explicit
-                        // invalidation is required to avoid stopping in the
-                        // originating layout.
-                        // Catching up means landing: releasing in place
-                        // skips the drag path, and the window would be stuck
-                        // at an intermediate animation height.
-                        app.panel.height_anim = None;
-                        app.panel.catch_up_layout();
-                        crate::app::reconcile_fading_focus(app, hwnd);
-                        let n = app.config.accounts.len();
-                        let logical_h = app.panel.view_height(n);
-                        app.panel.place(hwnd, LogPx(logical_h), false);
-                        // place's SetWindowPos can synchronously dispatch
-                        // WM_DPICHANGED (cross-monitor), whose arm re-derives
-                        // App: the drag latch writes go through the
-                        // re-fetched reference.
-                        if let Some(app) = app_from_tray(hwnd) {
-                            let _ = InvalidateRect(Some(hwnd), None, false);
-                            let mut wr = RECT::default();
-                            let _ = GetWindowRect(hwnd, &mut wr);
-                            app.panel.drag_offset = Some((cursor.x - wr.left, cursor.y - wr.top));
-                            let _ = SetCapture(hwnd);
-                        }
-                    } else {
-                        // A press on a hit target captures too: releasing
-                        // outside after dragging out still routes UP back to
-                        // this window, so the gesture latch is necessarily
-                        // reset with UP — no left-button state heuristics
-                        // needed.
-                        let _ = SetCapture(hwnd);
-                    }
-                }
-                LRESULT(0)
-            }
+            WM_LBUTTONDOWN => input::handle_lbuttondown(hwnd, lparam),
             WM_CAPTURECHANGED => {
                 // lParam is the new window that got the capture (wParam unused); null or
                 // held by someone else means this window's drag is broken off.
@@ -1969,7 +1365,7 @@ pub extern "system" fn panel_wndproc(
                     crate::app::reconcile_fading_focus(app, hwnd);
                     let logical_h = app.panel.view_height(app.config.accounts.len());
                     app.panel.refresh_scroll(logical_h, h_phys);
-                    let _ = InvalidateRect(Some(hwnd), None, true);
+                    invalidate_panel(hwnd);
                     // The helper resized from the old top-left
                     // (SWP_NOMOVE), lifting a tray-anchored panel off
                     // the taskbar: re-place from the anchor. Runs last —
@@ -2050,12 +1446,33 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
         let mut done = true;
         let mut footer_only = false;
         let mut repaint = false;
-        let mut appear_active = false;
         let mut spin_active = false;
         let mut scroll_frame = false;
         let mut scroll_wake: Option<u32> = None;
+        // Band-classification snapshot, read at the tick entry before
+        // any animation state below is rewritten: the completion arms
+        // clear appear/footer and drop height_anim inside this same
+        // tick, so classifying from the post-mutation state would
+        // describe the next frame, not this one — a settle frame banded
+        // to a lone caret strip (footer tween expired + caret flip in
+        // one tick) would freeze the swap animation's last mid-flight
+        // pixels with no later frame left to repaint them. Spin is read
+        // here too: the spin_remaining call below decrements it.
+        let (spin_entry, appear_active, footer_active, footer_final) =
+            match app.panel.renderer.as_ref() {
+                Some(r) => (
+                    r.anim.spin > 0.0,
+                    r.anim.appear.is_some(),
+                    r.anim.footer.as_ref().is_some_and(|f| !f.tween.finished()),
+                    r.anim.footer.as_ref().is_some_and(|f| f.tween.finished()),
+                ),
+                None => (false, false, false, false),
+            };
+        // Height-transition presence at the entry: the block below drops
+        // height_anim on completion, and its wrap-up pumps can re-arm a
+        // different transition — this tick's frame is the entry one.
+        let height_active = app.panel.height_anim.is_some();
         if let Some(r) = app.panel.renderer.as_mut() {
-            appear_active = r.anim.appear.is_some();
             if let Some(t) = &r.anim.appear {
                 if t.finished() {
                     r.anim.appear = None;
@@ -2067,7 +1484,6 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                     repaint = true;
                 }
             }
-            let footer_active = r.anim.footer.as_ref().is_some_and(|f| !f.tween.finished());
             if let Some(f) = &r.anim.footer {
                 if f.tween.finished() {
                     r.anim.footer = None;
@@ -2177,8 +1593,8 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
                 // cross-monitor clamping differences are not a mismatch; the
                 // wrap-up comparison only catches real target changes.
                 let mi = monitor_info(app.panel.place_monitor(hwnd));
-                if app.panel.layout_team != app.panel.pending_team
-                    || app.panel.layout_customizing != app.panel.customizing_interval
+                if !app.panel.team.is_synced()
+                    || !app.panel.customizing.is_synced()
                     || app.panel.target_h(&mi, LogPx(want), moved) != a.to
                 {
                     app.panel.catch_up_layout();
@@ -2200,6 +1616,7 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
         // crossing the flip point triggers a whole-window repaint;
         // double-gated by focus and edit state — no blinking while unfocused.
         let mut caret_wake: Option<u32> = None;
+        let mut caret_flipped = false;
         let caret_active = app.panel.input.field.is_some()
             && windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
         if caret_active {
@@ -2208,10 +1625,42 @@ unsafe fn on_anim_tick(hwnd: HWND) -> LRESULT {
             if on != app.panel.blink_drawn.get() {
                 app.panel.blink_drawn.set(on);
                 repaint = true;
+                caret_flipped = true;
             }
             caret_wake = Some(wake_in);
         }
         if repaint {
+            // Narrow-band selection: marquee / footer-swap frames change
+            // only the footer strip, a lone caret blink only its row;
+            // everything else (and any band-source overlap) repaints the
+            // full window. The band is one-shot — consumed by the next
+            // paint. An animation ending within this tick paints its
+            // final frame unconditionally full: appear/height presence
+            // already forces full for their settle frames; a footer swap
+            // whose tween expired needs the explicit arm — footer_active
+            // is already false and the tick above has torn the animation
+            // down, so a same-tick caret flip must not clip the settle
+            // frame to the caret strip.
+            let full = appear_active || spin_entry || height_active || footer_final;
+            let footer_frame = scroll_frame || footer_only;
+            let band = if full || (footer_frame && caret_active) {
+                None
+            } else if footer_frame {
+                // Footer strip with room for the pacman's falling crumbs.
+                let mut cr = RECT::default();
+                let _ = GetClientRect(hwnd, &mut cr);
+                let lh = (cr.bottom - cr.top) as f32 / app.panel.dpi;
+                Some((lh - layout::FOOTER_BAND_H, lh))
+            } else if caret_flipped && let Some(field) = app.panel.input.field {
+                let top = app.panel.caret_line_y(field) - layout::CARET_Y_OFFSET;
+                Some((top - 6.0, top + layout::INPUT_H + 10.0))
+            } else {
+                None
+            };
+            if let Some(r) = app.panel.renderer.as_mut() {
+                r.band_clip = band;
+            }
+            // Bare invalidation: this frame owns the band, no gate raise.
             let _ = InvalidateRect(Some(hwnd), None, false);
         }
 
@@ -2257,76 +1706,14 @@ fn compose_anim_period(frame: Option<u32>, wake: Option<u32>) -> u32 {
     .max(1)
 }
 
-/// Single entry to get App from any window hwnd of this program: the tray
-/// window's USERDATA is App and hits directly; the panel and floating
-/// windows go through their parent. There were once two lookup functions,
-/// and the tray arm mistakenly using the parent-chain version silently
-/// returned None — the single entry eliminates that wrong-pick possibility.
-pub(crate) fn app_from_tray(hwnd: HWND) -> Option<&'static mut crate::app::App> {
+/// Full-window invalidation for the panel: raises the full-repaint gate
+/// so a pending animation band cannot clip this invalidation away on the
+/// next paint. Every panel invalidation outside the animation tick goes
+/// through here.
+pub(crate) fn invalidate_panel(hwnd: HWND) {
+    crate::ui::panel::render::FULL_REPAINT.store(true, std::sync::atomic::Ordering::Release);
     unsafe {
-        let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-        if p != 0 {
-            return Some(&mut *(p as *mut crate::app::App));
-        }
-        let parent = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
-        if parent == 0 {
-            return None;
-        }
-        let p = GetWindowLongPtrW(HWND(parent as *mut _), GWLP_USERDATA);
-        (p != 0).then(|| &mut *(p as *mut crate::app::App))
-    }
-}
-
-/// Post-pump caret re-sync shared by the geometry-change tails (relayout,
-/// DPI change, key input, drag translation): re-fetch the reference and
-/// move the caret/IME composition window to the row's new position — a
-/// hand-copied tail per site is how the next site forgets. Returns
-/// whether a live App answered (callers gate their repaint on it).
-pub(crate) fn sync_caret_after_geometry(hwnd: HWND) -> bool {
-    match app_from_tray(hwnd) {
-        Some(app) => {
-            app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
-            true
-        }
-        None => false,
-    }
-}
-
-/// Pump wrapper for the App reference: f runs a synchronous re-entrant
-/// message pump (capture release, layout sync, foreground claim, etc.)
-/// and receives the caller's reference as its parameter — the reference
-/// is consumed by the move into the call, and the continuation works on
-/// the re-fetched reference. One form serves both shapes: closures that
-/// need the App inside the pump take it from the parameter, closures
-/// that must not touch it ignore the parameter (passing anything else
-/// captured would alias). A failed re-fetch returns None; the
-/// continuation early-exits on the empty path.
-pub(crate) fn pump(
-    app: &mut crate::app::App,
-    hwnd: HWND,
-    f: impl FnOnce(&mut crate::app::App),
-) -> Option<&'static mut crate::app::App> {
-    f(app);
-    app_from_tray(hwnd)
-}
-
-/// Run a mutating edit on the active buffer: clone out the text → operate
-/// via EditState → write back. EditState and the buffers both live in
-/// PanelInput; borrowing both fields directly is mutually exclusive, and
-/// the clone decouples them. The edited marks latch only on a real change:
-/// no-op edits (all-filtered paste, over-budget insert, empty-stack undo)
-/// must not close the prefill gates while the buffer is untouched.
-fn apply_edit(input: &mut PanelInput, f: impl FnOnce(&mut EditState, &mut String)) {
-    let mut t = input.active_str().to_string();
-    f(&mut input.edit, &mut t);
-    let changed = t != input.active_str();
-    *input.active_buf() = t;
-    if changed {
-        match input.field {
-            Some(InputField::Interval) => input.interval_edited = true,
-            Some(InputField::Proxy) => input.proxy_edited = true,
-            _ => {}
-        }
+        let _ = InvalidateRect(Some(hwnd), None, true);
     }
 }
 
@@ -2343,10 +1730,10 @@ mod tests {
         p.view = PanelView::Settings;
         assert_eq!(p.view_height(0), 796);
         assert_eq!(p.view_height(1), 844);
-        p.layout_customizing = true;
+        p.customizing.effective = true;
         assert_eq!(p.view_height(0), 834);
         assert_eq!(p.view_height(1), 882);
-        p.account_error = true;
+        p.auth_error = true;
         assert_eq!(p.view_height(1), 900);
     }
 
@@ -2476,5 +1863,24 @@ mod tests {
         assert_eq!(since, Some(3100));
         assert!(!outside_step(false, 5100, &mut since));
         assert!(outside_step(false, 5101, &mut since));
+    }
+
+    /// Prefill clamp: within cap verbatim; over cap truncated at the byte
+    /// cap on a char boundary — a multi-byte tail loses at most one char,
+    /// never a split sequence
+    #[test]
+    fn clamp_prefill_char_boundary() {
+        let max = InputField::Proxy.max_bytes();
+        assert_eq!(
+            InputField::Proxy.clamp_prefill(&"a".repeat(max)).len(),
+            max,
+            "贴上限原样保留"
+        );
+        // 2-byte CJK tail one byte short of fitting: the whole char goes
+        let cjk = "a".repeat(max - 1) + "中中";
+        assert_eq!(InputField::Proxy.clamp_prefill(&cjk).len(), max - 1);
+        // 4-byte emoji tail: same whole-char retreat
+        let emoji = "a".repeat(max - 1) + "😀😀";
+        assert_eq!(InputField::Proxy.clamp_prefill(&emoji).len(), max - 1);
     }
 }

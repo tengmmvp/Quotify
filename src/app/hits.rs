@@ -11,6 +11,7 @@ use super::{
     sync_layout_effective,
 };
 use crate::service::poller::{MAX_POLL_SECS, MIN_POLL_SECS};
+use crate::ui::panel::invalidate_panel;
 use crate::ui::panel::layout::INTERVAL_PRESETS;
 /// Shared entry into the settings page: switch the view, sync the layout,
 /// prefill the proxy field, close the popup, relayout. Both the close and
@@ -23,17 +24,18 @@ pub(super) fn enter_settings(app: &mut App, panel_hwnd: HWND) {
     // The proxy field is prefilled with the currently effective value; the
     // user may edit or clear it — clearing and applying means direct
     // connection. A user-edited buffer (cleared or typed) is never
-    // overwritten: the edited mark, not buffer emptiness, decides.
+    // overwritten: the edited mark, not buffer emptiness, decides. The
+    // prefill is clamped to the buffer cap (import can persist longer).
     if !app.panel.input.proxy_edited
         && let Some(p) = app.config.general.proxy.clone()
     {
-        app.panel.input.proxy = p;
+        app.panel.input.proxy = crate::ui::panel::InputField::Proxy.clamp_prefill(&p);
     }
     // The relayout runs first: at close's SW_HIDE pump the view is already
     // Settings, so geometry must already be settings-shaped — a paint
     // dispatched inside that pump would otherwise draw the settings page
     // clipped to the main-view window for one frame.
-    if let Some(app) = crate::ui::panel::pump(app, panel_hwnd, |app| {
+    if let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
         relayout_panel(app, panel_hwnd);
     }) {
         // The close is this reference's last use: its SW_HIDE pump ends
@@ -79,7 +81,7 @@ pub fn handle_panel_hit(
         // ── Navigation ──
         Hit::Back => {
             app.panel.key_revealed = false;
-            app.panel.customizing_interval = false;
+            app.panel.customizing.set_pending(false);
             app.panel.clear_input(origin_hwnd);
             // Back from the form view returns to the settings page; back
             // from the settings page is what returns to the main view.
@@ -111,13 +113,13 @@ pub fn handle_panel_hit(
                 crate::app::config::save(&app.config);
                 app.sync_poll_context();
             }
-            app.panel.customizing_interval = false;
+            app.panel.customizing.set_pending(false);
             app.panel.clear_input(origin_hwnd);
             // The layout sync's SetWindowPos is a pump: the retry goes
             // last and takes the re-fetched reference. A changed value
             // always refetches; an unchanged click retries only in the
             // error state (no dead clicks).
-            if let Some(app) = crate::ui::panel::pump(app, origin_hwnd, |app| {
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                 sync_layout_effective(app, origin_hwnd)
             }) {
                 if changed {
@@ -128,13 +130,13 @@ pub fn handle_panel_hit(
             }
         }
         Hit::CustomizeInterval => {
-            app.panel.customizing_interval = true;
+            app.panel.customizing.set_pending(true);
             if !app.panel.input.interval_edited {
                 prefill_interval(app);
             }
             // The layout sync's SetWindowPos is a pump: the focus handoff
             // takes the re-fetched reference.
-            if let Some(app) = crate::ui::panel::pump(app, origin_hwnd, |app| {
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                 sync_layout_effective(app, origin_hwnd)
             }) {
                 app.panel
@@ -168,7 +170,7 @@ pub fn handle_panel_hit(
             let next = !crate::platform::autostart::is_enabled();
             match crate::platform::autostart::set_enabled(next) {
                 Ok(()) => app.autostart_enabled = next,
-                Err(e) => crate::platform::log(&format!("[Quotify] 开机自启设置失败: {e}")),
+                Err(e) => crate::platform::log(&format!("开机自启设置失败: {e}")),
             }
         }
 
@@ -211,16 +213,20 @@ pub fn handle_panel_hit(
         Hit::AddAccount => {
             app.panel.view = crate::ui::panel::PanelView::AddForm;
             app.panel.pending_platform = crate::api::Platform::Cn;
-            app.panel.pending_team = false;
+            app.panel.team.set_pending(false);
             app.panel.key_revealed = false;
-            app.panel.input.name.clear();
-            app.panel.input.key.clear();
-            app.panel.input.org.clear();
-            app.panel.input.project.clear();
+            for f in [
+                crate::ui::panel::InputField::Name,
+                crate::ui::panel::InputField::Key,
+                crate::ui::panel::InputField::Org,
+                crate::ui::panel::InputField::Project,
+            ] {
+                app.panel.input.clear_field(f);
+            }
             // relayout's SetWindowPos can dispatch WM_DPICHANGED, which
             // re-fetches the App alias: the focus handoff takes the
             // re-fetched reference.
-            if let Some(app) = crate::ui::panel::pump(app, origin_hwnd, |app| {
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                 relayout_panel(app, origin_hwnd);
             }) {
                 app.panel
@@ -260,9 +266,9 @@ pub fn handle_panel_hit(
                 // final re-fetched reference. After picking, the cursor
                 // still sits at the popup's old spot (outside the panel),
                 // so the off-pointer timer restarts.
-                if let Some(app) = crate::ui::panel::pump(app, origin_hwnd, |app| {
+                if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                     select_account(app, i, origin_hwnd);
-                }) && let Some(app) = crate::ui::panel::pump(app, origin_hwnd, |app| {
+                }) && let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                     app.panel.view = crate::ui::panel::PanelView::Main;
                     app.panel.outside_since = None;
                     app.popup.close();
@@ -272,8 +278,10 @@ pub fn handle_panel_hit(
             }
         }
         Hit::AccountType(scope) => {
-            app.panel.pending_team = matches!(scope, ScopeChoice::Team);
-            if app.panel.pending_team {
+            app.panel
+                .team
+                .set_pending(matches!(scope, ScopeChoice::Team));
+            if app.panel.team.pending {
                 // Team edition exists on the CN site only: switching the
                 // type to team also snaps the platform back to CN.
                 app.panel.pending_platform = crate::api::Platform::Cn;
@@ -297,9 +305,7 @@ pub fn handle_panel_hit(
             app.panel.key_revealed = !app.panel.key_revealed;
             if let Some(p) = app.panel.hwnd {
                 app.panel.update_caret(p, app.panel.renderer.as_ref());
-                unsafe {
-                    let _ = InvalidateRect(Some(p), None, false);
-                }
+                invalidate_panel(p);
             }
         }
         Hit::InputOrg => {
@@ -316,7 +322,7 @@ pub fn handle_panel_hit(
             if platform == crate::api::Platform::Intl {
                 // Team edition exists on the CN site only: switching to the
                 // international site also snaps the type back to personal.
-                app.panel.pending_team = false;
+                app.panel.team.set_pending(false);
             }
             reconcile_fading_focus(app, origin_hwnd);
             sync_layout_effective(app, origin_hwnd);
@@ -327,7 +333,7 @@ pub fn handle_panel_hit(
         // to guard against post-pump reference invalidation; reaching this
         // function means a wiring bug.
         Hit::ExportConfig | Hit::ImportConfig => {
-            crate::platform::log("[Quotify] 模态命中误入 handle_panel_hit");
+            crate::platform::log("模态命中误入 handle_panel_hit");
         }
         Hit::CheckUpdate => {
             if !app.update_checking {
@@ -421,9 +427,7 @@ pub fn handle_panel_hit(
             }
         }
     }
-    unsafe {
-        let _ = InvalidateRect(Some(origin_hwnd), None, true);
-    }
+    invalidate_panel(origin_hwnd);
 }
 /// Strips the user-credentials segment from a proxy string so the
 /// diagnostics output carries no userinfo
@@ -445,7 +449,8 @@ fn redact_proxy(p: &str) -> String {
 }
 
 /// Assembles the About window's "copy diagnostics" text
-/// One line each: version, OS, config path, proxy, last error.
+/// One line each: version, OS, config path, proxy, last error, then a
+/// recent-logs tail.
 fn diagnostics_text(app: &App) -> String {
     let os = windows_registry::LOCAL_MACHINE
         .open("SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion")
@@ -461,10 +466,18 @@ fn diagnostics_text(app: &App) -> String {
             }
         })
         .unwrap_or_else(|_| "unknown".into());
-    [
+    let mut text = [
         format!("Quotify v{}", env!("CARGO_PKG_VERSION")),
         format!("OS: Windows {os}"),
-        format!("Config: {}", crate::app::config::config_path().display()),
+        // Mask the profile name: the account name is the one identifying
+        // part of the config path, and the diagnostics text gets pasted
+        // wholesale into public issues.
+        format!(
+            "Config: {}",
+            crate::platform::redact_user_segment(
+                &crate::app::config::config_path().display().to_string()
+            )
+        ),
         match &app.config.general.proxy {
             // Strip the userinfo: proxy strings often carry credentials
             // reused from passwords, and the diagnostics text gets pasted
@@ -477,7 +490,20 @@ fn diagnostics_text(app: &App) -> String {
             None => "Last error: none".into(),
         },
     ]
-    .join("\n")
+    .join("\n");
+    // Recent-logs tail: the section appears only when the ring holds
+    // lines — a bare heading conveys nothing. The heading is the only
+    // localized part, matching the copy-diagnostics UI language.
+    let logs = crate::platform::recent_logs();
+    if !logs.is_empty() {
+        text.push('\n');
+        text.push_str(app.strings.diag_recent_logs);
+        for line in logs {
+            text.push('\n');
+            text.push_str(&line);
+        }
+    }
+    text
 }
 
 /// After an account switch the old snapshot's reset baselines are void;
@@ -574,13 +600,13 @@ pub(crate) fn select_account(app: &mut App, i: usize, panel_hwnd: HWND) {
 /// from both the immediate switch and the transition catch-up
 pub(crate) fn reconcile_fading_focus(app: &mut App, panel_hwnd: HWND) {
     use crate::ui::panel::InputField;
-    let fading_team = !app.panel.pending_team
+    let fading_team = !app.panel.team.pending
         && matches!(
             app.panel.input.field,
             Some(InputField::Org) | Some(InputField::Project)
         );
     let fading_custom =
-        !app.panel.customizing_interval && app.panel.input.field == Some(InputField::Interval);
+        !app.panel.customizing.pending && app.panel.input.field == Some(InputField::Interval);
     if fading_team || fading_custom {
         app.panel.clear_input(panel_hwnd);
     }
@@ -588,12 +614,27 @@ pub(crate) fn reconcile_fading_focus(app: &mut App, panel_hwnd: HWND) {
 
 /// Saves the add-account form
 fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
+    // The add path shares the import cap (MAX_ACCOUNTS): without this gate
+    // accounts could accumulate past the limit in the UI, and the app's own
+    // export would then be rejected at re-import with a misleading
+    // "invalid file" toast.
+    if app.config.accounts.len() >= crate::app::config::MAX_ACCOUNTS {
+        crate::platform::log(&format!(
+            "添加账号放弃：已达上限（{}/{}）",
+            app.config.accounts.len(),
+            crate::app::config::MAX_ACCOUNTS
+        ));
+        // The toast is a pump point: the text is built up front and this
+        // arm ends right after it — the reference is dead past the pump.
+        crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_account_limit);
+        return;
+    }
     let name = app.panel.input.name.trim().to_string();
     let key = app.panel.input.key.trim().to_string();
     if key.is_empty() {
         return;
     }
-    if app.panel.pending_team {
+    if app.panel.team.pending {
         let missing = if app.panel.input.org.trim().is_empty() {
             Some(crate::ui::panel::InputField::Org)
         } else if app.panel.input.project.trim().is_empty() {
@@ -605,7 +646,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
             let tip = app.strings.notify_team_required;
             // The toast is a pump point: the focus handoff takes the
             // re-fetched reference.
-            if let Some(app) = crate::ui::panel::pump(app, panel_hwnd, |_| {
+            if let Some(app) = crate::app::pump(app, panel_hwnd, |_| {
                 crate::platform::notify::show(NOTIFY_TITLE, tip);
             }) {
                 app.panel.focus_input(panel_hwnd, field);
@@ -614,7 +655,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         }
     }
     let name = if name.is_empty() {
-        "Default".to_string()
+        app.strings.default_account_name.to_string()
     } else {
         name
     };
@@ -623,17 +664,17 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         id: app.config.new_account_id(),
         name,
         platform: app.panel.pending_platform,
-        team: app.panel.pending_team,
+        team: app.panel.team.pending,
         // Org/project persist for the team edition only: form residue from
         // switching back to personal must not enter the account, and a
         // personal account carrying team fields would send polling down
         // the team query path by mistake.
-        org_id: if app.panel.pending_team {
+        org_id: if app.panel.team.pending {
             app.panel.input.org.trim().to_string()
         } else {
             String::new()
         },
-        project_id: if app.panel.pending_team {
+        project_id: if app.panel.team.pending {
             app.panel.input.project.trim().to_string()
         } else {
             String::new()
@@ -652,7 +693,9 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     app.panel.key_revealed = false;
     // The key buffer is cleared on save: plain text must not linger in
     // the input buffer until the form is next opened.
-    app.panel.input.key.clear();
+    app.panel
+        .input
+        .clear_field(crate::ui::panel::InputField::Key);
     app.panel.clear_input(panel_hwnd);
     relayout_panel(app, panel_hwnd);
 }
@@ -671,7 +714,16 @@ fn parse_interval_secs(s: &str) -> Option<u64> {
 /// Applies the custom polling interval (minutes)
 fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     let Some(secs) = parse_interval_secs(&app.panel.input.interval) else {
-        crate::platform::log("[Quotify] 自定义间隔无效");
+        // Both the log and the toast carry the rejected value; a silent
+        // rejection is a dead click on screen.
+        let raw = app.panel.input.interval.trim().to_string();
+        crate::platform::log(&format!("自定义间隔无效: {raw}"));
+        // The toast is a pump point: the text is built up front and this
+        // arm ends right after it — the reference is dead past the pump.
+        crate::platform::notify::show(
+            NOTIFY_TITLE,
+            &app.strings.notify_interval_invalid.replace("{v}", &raw),
+        );
         return;
     };
     app.config.general.poll_interval_secs = secs;
@@ -709,7 +761,11 @@ fn apply_peak(app: &mut App, panel_hwnd: HWND) {
         crate::app::config::save(&app.config);
         app.panel.clear_input(panel_hwnd);
     } else {
-        crate::platform::log("[Quotify] 高峰区间格式无效，应为 HH:MM 且两端不相等");
+        // The log carries the rejected pair, same style as the interval
+        // and proxy rejection logs.
+        crate::platform::log(&format!(
+            "高峰区间格式无效，应为 HH:MM 且两端不相等: {start} ~ {end}"
+        ));
     }
     relayout_panel(app, panel_hwnd);
 }
@@ -722,9 +778,7 @@ pub(super) fn invalidate_ui(app: &App) {
         app.about.wnd.hwnd.filter(|_| app.about.is_open()),
     ];
     for h in hwnds.into_iter().flatten() {
-        unsafe {
-            let _ = InvalidateRect(Some(h), None, true);
-        }
+        invalidate_panel(h);
     }
 }
 
@@ -738,6 +792,10 @@ pub(crate) fn refit_about(app: &mut App) {
     };
     let h =
         crate::ui::panel::render::about::about_height(app.news.as_deref(), app.about.news_expanded);
+    // The reposition centers within the window's own monitor (centered_rect
+    // clamps to it), so no WM_DPICHANGED re-derivation is expected; the
+    // alias tripwire pins that assumption in debug builds.
+    let snap = crate::app::alias_probe(app);
     unsafe {
         let monitor = windows::Win32::Graphics::Gdi::MonitorFromWindow(
             a,
@@ -756,6 +814,7 @@ pub(crate) fn refit_about(app: &mut App) {
         );
         let _ = InvalidateRect(Some(a), None, true);
     }
+    crate::app::alias_assert_live(snap, app);
 }
 /// Validates and applies the proxy; returns false on any failure (the
 /// rejection reason is already logged). Shared by the settings-page apply
@@ -765,11 +824,11 @@ pub(super) fn try_apply_proxy(next: Option<String>) -> bool {
     if let Some(p) = next.as_deref()
         && let Err(e) = crate::api::client::proxy_valid(p)
     {
-        crate::platform::log(&format!("[Quotify] 代理地址无效，未应用: {e}"));
+        crate::platform::log(&format!("代理地址无效，未应用: {e}"));
         return false;
     }
     if let Err(e) = crate::api::client::set_proxy(next) {
-        crate::platform::log(&format!("[Quotify] 代理设置失败，未应用: {e}"));
+        crate::platform::log(&format!("代理设置失败，未应用: {e}"));
         return false;
     }
     true
@@ -809,7 +868,7 @@ pub(crate) fn dispatch_hit(hit: crate::ui::panel::render::Hit, owner: HWND) -> b
         dispatch_modal(hit, owner);
         return true;
     }
-    if let Some(app) = crate::ui::panel::app_from_tray(owner) {
+    if let Some(app) = crate::app::app_from_tray(owner) {
         handle_panel_hit(app, hit, owner);
     }
     false
@@ -819,7 +878,7 @@ pub(crate) fn dispatch_hit(hit: crate::ui::panel::render::Hit, owner: HWND) -> b
 pub(super) fn sync_customizing(app: &mut App) {
     let cur = app.config.general.poll_interval_secs;
     let is_preset = INTERVAL_PRESETS.contains(&cur);
-    app.panel.customizing_interval = !is_preset;
+    app.panel.customizing.set_pending(!is_preset);
     // A user-edited buffer keeps its unapplied edit; the edited mark, not
     // buffer emptiness, decides (a cleared buffer is an edit too).
     if !is_preset && !app.panel.input.interval_edited {
@@ -847,7 +906,7 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
         Some(InputField::Key) => {
             // The key is required; the name may be left empty.
             if !app.panel.input.key.trim().is_empty() {
-                if app.panel.pending_team {
+                if app.panel.team.pending {
                     app.panel.focus_input(panel_hwnd, InputField::Org);
                 } else {
                     save_pending_account(app, panel_hwnd);

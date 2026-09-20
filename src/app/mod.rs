@@ -10,12 +10,12 @@ use hits::{enter_settings, invalidate_ui};
 
 use chrono::{DateTime, Utc};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::InvalidateRect;
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetMessageW,
-    MSG, PostMessageW, PostQuitMessage, SetTimer, SetWindowLongPtrW, TranslateMessage,
-    WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY, WM_POWERBROADCAST, WM_TIMER, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_HWNDPARENT,
+    GWLP_USERDATA, GetMessageW, GetWindowLongPtrW, MSG, PostMessageW, PostQuitMessage, SetTimer,
+    SetWindowLongPtrW, TranslateMessage, WINDOW_EX_STYLE, WM_COMMAND, WM_DESTROY,
+    WM_POWERBROADCAST, WM_TIMER, WS_POPUP,
 };
 use windows::core::PCWSTR;
 
@@ -34,6 +34,7 @@ use crate::ui::i18n::{Lang, Strings};
 use crate::ui::icon;
 use crate::ui::panel::LogPx;
 use crate::ui::panel::Panel;
+use crate::ui::panel::invalidate_panel;
 use crate::ui::tray::{self, TrayIcon};
 use notify::{NOTIFY_TITLE, check_reset, check_threshold};
 
@@ -66,19 +67,130 @@ pub struct AccountData {
     pub(crate) last_error: Option<FetchError>,
 }
 
+/// Tray aggregate: the registration carrier, first-registration retry
+/// counter, installed icon handle, submission generation, and the
+/// tooltip/icon content keys — the fields that move together through
+/// every tray writer (update, rearm, retry timer, exit). The repeated
+/// `tray.as_ref().is_some_and(|t| t.registered)` gate lives here once as
+/// registered().
+struct TrayState {
+    tray: Option<TrayIcon>,
+    /// Retry counter of the first-registration retry timer
+    retries: u32,
+    /// The currently installed icon handle; destroyed on replacement/exit
+    icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
+    /// Content fingerprint of the tooltip; text building is skipped when unchanged
+    last_tip: Option<String>,
+    /// Content fingerprint of the icon (pixel size, usage percent, data
+    /// presence, failure); the icon is rebuilt only when it changes
+    last_icon_key: Option<(i32, i64, bool, bool)>,
+    /// Tray state generation: each successful writer (this round's commit,
+    /// a nested refresh, a rearm re-add) advances it once; compared after
+    /// the nested pump, and a change means yield — a single criterion
+    /// replacing the stacked guesswork of handle identity plus content-key
+    /// snapshots
+    generation: u64,
+}
+
+impl TrayState {
+    fn new() -> Self {
+        Self {
+            tray: None,
+            retries: 0,
+            icon: None,
+            last_tip: None,
+            last_icon_key: None,
+            generation: 0,
+        }
+    }
+
+    /// Whether the icon is registered with the shell — the gate ahead of
+    /// every NIM_MODIFY submission: while unregistered, building the
+    /// tooltip or icon would just be discarded along with the failure.
+    fn registered(&self) -> bool {
+        self.tray.as_ref().is_some_and(|t| t.registered)
+    }
+
+    /// Submit a tooltip update through the registered tray icon
+    fn set_tooltip(&self, tip: &str) -> bool {
+        self.tray.as_ref().is_some_and(|t| t.set_tooltip(tip))
+    }
+
+    /// Submit an icon update through the registered tray icon
+    fn update_icon(&self, hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> bool {
+        self.tray.as_ref().is_some_and(|t| t.update_icon(hicon))
+    }
+
+    /// Icon rect as placed by the shell (cross-process query, pump point)
+    fn rect(&self) -> Option<RECT> {
+        self.tray.as_ref().and_then(|t| t.rect())
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Advance the generation once per successful writer
+    fn bump_gen(&mut self) {
+        self.generation += 1;
+    }
+
+    /// Startup installation: the initial icon handle and its TrayIcon
+    /// carrier enter together
+    fn install(&mut self, tray: TrayIcon, icon: windows::Win32::UI::WindowsAndMessaging::HICON) {
+        self.tray = Some(tray);
+        self.icon = Some(icon);
+    }
+
+    /// Commit a just-submitted icon: destroy the retired handle and
+    /// advance the content key — only called after update_icon succeeded
+    fn install_icon(
+        &mut self,
+        new: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
+        key: (i32, i64, bool, bool),
+    ) {
+        if let Some(old) = self.icon.take() {
+            icon::destroy_owned(old);
+        }
+        self.icon = new;
+        self.last_icon_key = Some(key);
+    }
+
+    /// Post-re-add write-back: mark registered, drop both content keys so
+    /// the posted full refresh resubmits them, and advance the generation
+    /// (a re-add is an external overwrite; any in-flight refresh yields)
+    fn rearmed(&mut self) {
+        if let Some(t) = self.tray.as_mut() {
+            t.registered = true;
+        }
+        self.last_tip = None;
+        self.last_icon_key = None;
+        self.bump_gen();
+    }
+
+    /// Exit cleanup: drop the registration (NIM_DELETE) and destroy the
+    /// owned icon handle
+    fn shutdown(&mut self) {
+        if let Some(t) = self.tray.take() {
+            drop(t);
+        }
+        if let Some(ic) = self.icon.take() {
+            icon::destroy_owned(ic);
+        }
+    }
+}
+
 /// Assembly-layer state machine
 pub struct App {
     pub(crate) config: Config,
     pub(crate) lang: Lang,
     pub(crate) strings: &'static Strings,
     pub(crate) data: AccountData,
-    tray: Option<TrayIcon>,
-    tray_retries: u32,
+    tray_state: TrayState,
     poller: Option<Poller>,
     poll_target: PollTarget,
     poll_interval: PollInterval,
     poll_gen: PollGeneration,
-    tray_icon: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
     pub(crate) panel: Panel,
     pub(crate) popup: crate::ui::popup::AccountPopup,
     pub(crate) about: crate::ui::about::AboutWindow,
@@ -92,9 +204,6 @@ pub struct App {
     pub(crate) news: Option<Vec<crate::service::whatsnew::NewsItem>>,
     news_fetched: bool,
     pub(crate) autostart_enabled: bool,
-    last_icon_key: Option<(i32, i64, bool, bool)>,
-    /// Content fingerprint of the tooltip; text building is skipped when unchanged
-    last_tip: Option<String>,
     /// Last applied resolved appearance: apply_appearance's whole effect
     /// is a pure function of the resolved value, so an unchanged value
     /// skips the menu-theme call and every renderer's Theme rebuild —
@@ -102,17 +211,16 @@ pub struct App {
     /// still reads the registry in follow-system mode (the read produces
     /// the compared value)
     applied_appearance: Option<crate::ui::panel::theme::Appearance>,
-    /// Tray state generation: each successful writer (this round's commit,
-    /// a nested refresh, a rearm re-add) advances it once; compared after
-    /// the nested pump, and a change means yield — a single criterion
-    /// replacing the stacked guesswork of handle identity plus content-key
-    /// snapshots
-    tray_gen: u64,
     threshold_armed_5h: bool,
     last_reset_5h: Option<DateTime<Utc>>,
     threshold_armed_weekly: bool,
     last_reset_weekly: Option<DateTime<Utc>>,
     last_logged_error: Option<String>,
+    /// Alias generation: bumped on every app_from_tray re-derive. A
+    /// snapshot compared after a synchronous pump tells whether the
+    /// reference was re-derived inside it (debug alias tripwire — see
+    /// alias_assert_live).
+    alias_gen: std::cell::Cell<u64>,
 }
 
 impl App {
@@ -127,13 +235,11 @@ impl App {
                 snapshot: None,
                 last_error: None,
             },
-            tray: None,
-            tray_retries: 0,
+            tray_state: TrayState::new(),
             poller: None,
             poll_target: std::sync::Arc::new(std::sync::Mutex::new(None)),
             poll_interval: std::sync::Arc::new(std::sync::Mutex::new(DEFAULT_INTERVAL_SECS)),
             poll_gen: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            tray_icon: None,
             panel: Panel::new(),
             popup: crate::ui::popup::AccountPopup::new(),
             about: crate::ui::about::AboutWindow::new(),
@@ -144,15 +250,13 @@ impl App {
             news: None,
             news_fetched: false,
             autostart_enabled: crate::platform::autostart::is_enabled(),
-            last_icon_key: None,
-            last_tip: None,
             applied_appearance: None,
-            tray_gen: 0,
             threshold_armed_5h: false,
             last_reset_5h: None,
             threshold_armed_weekly: false,
             last_reset_weekly: None,
             last_logged_error: None,
+            alias_gen: std::cell::Cell::new(0),
         }
     }
 
@@ -230,25 +334,22 @@ impl App {
         // call, do not advance the key, and let the full resubmit after
         // re-registration self-heal. Checked before building the tooltip —
         // the text build allocates per bucket just to be discarded.
-        let tray_up = self.tray.as_ref().is_some_and(|tray| tray.registered);
+        let tray_up = self.tray_state.registered();
         // Tooltip first: compare against the last submitted text and skip
         // the call when unchanged. Text-level comparison naturally tracks
         // label additions/edits, whereas a fingerprint key missing a
         // segment would freeze the old text.
         if let Some(tip) = tray_up.then(|| tooltip_text(self))
-            && self.last_tip.as_deref() != Some(tip.as_str())
+            && self.tray_state.last_tip.as_deref() != Some(tip.as_str())
         {
-            let gen_before = self.tray_gen;
-            let tip_set = self
-                .tray
-                .as_ref()
-                .is_some_and(|tray| tray.set_tooltip(&tip));
+            let gen_before = self.tray_state.generation();
+            let tip_set = self.tray_state.set_tooltip(&tip);
             // A nested writer winning costs at most one redundant resubmit
             // (harmless); recording an undelivered recomputed value would
             // make the next round mistakenly skip the resubmit (harmful).
             if tip_set {
                 submit_tray_gen(tray_hwnd, gen_before, |app| {
-                    app.last_tip = Some(tip);
+                    app.tray_state.last_tip = Some(tip);
                 });
             }
         }
@@ -261,7 +362,7 @@ impl App {
         // The icon is likewise only submitted to a registered tray: while
         // unregistered, building the icon would just be destroyed along
         // with the failure — pure wasted GDI work.
-        if !app.tray.as_ref().is_some_and(|tray| tray.registered) {
+        if !app.tray_state.registered() {
             return;
         }
         let failed = app.data.last_error.is_some() && app.data.snapshot.is_none();
@@ -278,7 +379,7 @@ impl App {
         // icon is rebuilt at the new size, not reused from the old bitmap.
         let px = icon::tray_px();
         let key = (px, used.round() as i64, app.data.snapshot.is_some(), failed);
-        if app.last_icon_key == Some(key) {
+        if app.tray_state.last_icon_key == Some(key) {
             return;
         }
         let new = match &app.data.snapshot {
@@ -295,21 +396,17 @@ impl App {
         // criterion alone. A nested writer winning means committing would
         // destroy the in-use handle and writing back the key would seal off
         // the full refresh rearm posted.
-        let gen_before = app.tray_gen;
+        let gen_before = app.tray_state.generation();
         // Destroy the old handle and advance the key only on successful
         // submission; failures are retried by the next refresh.
-        let set = app.tray.as_ref().is_some_and(|tray| tray.update_icon(new));
+        let set = app.tray_state.update_icon(new);
         if !set {
             icon::destroy_owned(new);
             return;
         }
         let mut new = Some(new);
         if !submit_tray_gen(tray_hwnd, gen_before, |app| {
-            if let Some(old) = app.tray_icon.take() {
-                icon::destroy_owned(old);
-            }
-            app.tray_icon = new.take();
-            app.last_icon_key = Some(key);
+            app.tray_state.install_icon(new.take(), key);
         }) && let Some(n) = new.take()
         {
             icon::destroy_owned(n);
@@ -411,7 +508,7 @@ impl App {
                     .as_ref()
                     .is_some_and(|prev| *prev == msg);
                 if !repeated {
-                    crate::platform::log(&format!("[Quotify] 轮询失败: {msg}"));
+                    crate::platform::log(&format!("轮询失败: {msg}"));
                 }
                 self.last_logged_error = Some(msg);
                 self.data.last_error = Some(*e);
@@ -516,12 +613,12 @@ use crate::locks::borrow;
 /// icon handle) discard them on false.
 fn submit_tray_gen(tray_hwnd: HWND, gen_before: u64, commit: impl FnOnce(&mut App)) -> bool {
     if let Some(app) = app_from(tray_hwnd)
-        && app.tray_gen == gen_before
+        && app.tray_state.generation() == gen_before
     {
         // Re-borrow for the commit so the generation advance below still
         // has the reference.
         commit(&mut *app);
-        app.tray_gen += 1;
+        app.tray_state.bump_gen();
         true
     } else {
         false
@@ -555,8 +652,8 @@ fn rearm_tray(hwnd: HWND) -> bool {
     // point spans no mutable alias.
     let prepared = app_from(hwnd).map(|app| {
         let tip = tooltip_text(app);
-        let tray: Option<&'static crate::ui::tray::TrayIcon> = app.tray.as_ref();
-        (app.tray_icon, tip, tray)
+        let tray: Option<&'static crate::ui::tray::TrayIcon> = app.tray_state.tray.as_ref();
+        (app.tray_state.icon, tip, tray)
     });
     let Some((icon, tip, tray)) = prepared else {
         return false;
@@ -567,15 +664,11 @@ fn rearm_tray(hwnd: HWND) -> bool {
     };
     // A single re-fetch after the pump: the tray write-back and the App
     // field cleanup share one reference — no second alias stacked on top.
+    // rearmed folds the write-back: registered flag, cleared content keys,
+    // advanced generation (a re-add is an external overwrite; any
+    // in-flight refresh yields).
     if ok && let Some(app) = app_from(hwnd) {
-        if let Some(tray) = app.tray.as_mut() {
-            tray.registered = true;
-        }
-        app.last_tip = None;
-        app.last_icon_key = None;
-        // A re-add is an external overwrite: advance the generation so any
-        // in-flight refresh yields.
-        app.tray_gen += 1;
+        app.tray_state.rearmed();
         queue_tray_refresh(hwnd);
     }
     ok
@@ -677,13 +770,13 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             // on failure, arm the retry timer to take over so the icon is
             // not absent until the next explorer restart.
             if let Some(app) = app_from(hwnd) {
-                if app.tray.as_ref().is_some_and(|t| t.registered) {
+                if app.tray_state.registered() {
                     unsafe {
                         use windows::Win32::UI::WindowsAndMessaging::KillTimer;
                         let _ = KillTimer(Some(hwnd), TIMER_TRAY_RETRY);
                     }
                 } else {
-                    app.tray_retries = 0;
+                    app.tray_state.retries = 0;
                     unsafe {
                         SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
                     }
@@ -724,8 +817,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
             // through to default handling so future callback timers are
             // not swallowed.
             if wparam.0 == TIMER_TRAY_RETRY {
-                let registered =
-                    app_from(hwnd).map(|app| app.tray.as_ref().is_some_and(|t| t.registered));
+                let registered = app_from(hwnd).map(|app| app.tray_state.registered());
                 if let Some(registered) = registered {
                     let mut done = registered;
                     if !registered {
@@ -735,10 +827,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         // arm, and counting before the pump would record
                         // one retry as several and exhaust the cap early.
                         if !done && let Some(app) = app_from(hwnd) {
-                            app.tray_retries += 1;
+                            app.tray_state.retries += 1;
                         }
                     }
-                    if done || app_from(hwnd).is_some_and(|app| app.tray_retries >= TRAY_RETRY_MAX)
+                    if done
+                        || app_from(hwnd)
+                            .is_some_and(|app| app.tray_state.retries >= TRAY_RETRY_MAX)
                     {
                         unsafe {
                             use windows::Win32::UI::WindowsAndMessaging::KillTimer;
@@ -808,14 +902,12 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                 // label, and the diagnostic chain for weak networks /
                 // rate limiting must not be severed here.
                 if let Err(e) = &r {
-                    crate::platform::log(&format!("[Quotify] 检查更新失败: {e}"));
+                    crate::platform::log(&format!("检查更新失败: {e}"));
                 }
                 app.set_update_status(Some(r));
                 if let Some(p) = app.panel.hwnd {
                     relayout_panel(app, p);
-                    unsafe {
-                        let _ = InvalidateRect(Some(p), None, true);
-                    }
+                    invalidate_panel(p);
                 }
             }
             LRESULT(0)
@@ -854,7 +946,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                         refit_about(app);
                     }
                     Err(e) => {
-                        crate::platform::log(&format!("[Quotify] 动态拉取失败: {e}"));
+                        crate::platform::log(&format!("动态拉取失败: {e}"));
                         // Reset the gate so the next About-window open can
                         // retry.
                         app.news_fetched = false;
@@ -990,7 +1082,7 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
 }
 
 fn tray_rect(app: &App) -> Option<RECT> {
-    app.tray.as_ref().and_then(|t| t.rect())
+    app.tray_state.rect()
 }
 
 /// Opening anchor for toggle_panel: the tray icon rect, falling back to the
@@ -1047,13 +1139,112 @@ fn tooltip_text(app: &App) -> String {
     }
 }
 
-/// App is boxed and lives until process exit, so the GWLP_USERDATA
-/// pointer is valid throughout and can be reinterpreted as
-/// `&'static mut`; alias safety relies on the single-threaded message
-/// loop. Lookup goes through panel's app_from_tray single entry (the
-/// tray window hits directly, child windows walk the parent chain), and
-/// the alias import keeps this file's short name.
-use crate::ui::panel::app_from_tray as app_from;
+/// Single entry to get App from any window hwnd of this program: the tray
+/// window's USERDATA is App and hits directly; the panel and floating
+/// windows go through their parent. There were once two lookup functions,
+/// and the tray arm mistakenly using the parent-chain version silently
+/// returned None — the single entry eliminates that wrong-pick possibility.
+/// App is boxed and lives until process exit, so the GWLP_USERDATA pointer
+/// is valid throughout and can be reinterpreted as `&'static mut`; alias
+/// safety relies on the single-threaded message loop.
+///
+/// Pump-point registry — synchronous calls that re-enter the message loop
+/// and thereby invalidate the caller's App alias; after any of these, the
+/// alias must be re-derived here (or the call routed through pump()):
+/// SetWindowPos (cross-monitor dispatches WM_DPICHANGED) · ShowWindow /
+/// SW_HIDE · SetForegroundWindow · SetFocus · SetCapture / ReleaseCapture
+/// · Shell_NotifyIcon (NIM_ADD/MODIFY/DELETE) · Shell_NotifyIconGetRect ·
+/// TrackPopupMenu / MessageBoxW / file dialogs · WinRT toast · clipboard
+/// OpenClipboard / delayed-render reads · ImmAssociateContext /
+/// ImmDestroyContext · EnableWindow. Extend this list when a new pump
+/// call is introduced.
+pub(crate) fn app_from_tray(hwnd: HWND) -> Option<&'static mut App> {
+    unsafe {
+        let p = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+        if p != 0 {
+            let app = &mut *(p as *mut App);
+            bump_alias_gen(app);
+            return Some(app);
+        }
+        let parent = GetWindowLongPtrW(hwnd, GWLP_HWNDPARENT);
+        if parent == 0 {
+            return None;
+        }
+        let p = GetWindowLongPtrW(HWND(parent as *mut _), GWLP_USERDATA);
+        (p != 0).then(|| {
+            let app = &mut *(p as *mut App);
+            bump_alias_gen(app);
+            app
+        })
+    }
+}
+
+/// Advance the alias generation on each re-derive (debug tripwire state).
+fn bump_alias_gen(app: &mut App) {
+    app.alias_gen.set(app.alias_gen.get().wrapping_add(1));
+}
+
+/// Snapshot the alias generation before a synchronous pump; pair with
+/// alias_assert_live after it. Debug-only UB tripwire: a mismatch means
+/// the alias was re-derived inside the pump and the caller is holding a
+/// dead reference — exactly the class the pump discipline guards against,
+/// turned from silent UB into an assertion. The trailing read is itself
+/// through the possibly-dead alias, which is the point: one controlled
+/// read to catch every later one.
+pub(crate) fn alias_probe(app: &App) -> u64 {
+    app.alias_gen.get()
+}
+
+/// Assert the alias survived the pump since the probe snapshot.
+pub(crate) fn alias_assert_live(snapshot: u64, app: &App) {
+    debug_assert_eq!(
+        app.alias_gen.get(),
+        snapshot,
+        "App 引用在同步泵内被重派生——泵后必须重取（app_from_tray/pump）"
+    );
+}
+
+/// Post-pump caret re-sync shared by the geometry-change tails (relayout,
+/// DPI change, key input, drag translation): re-fetch the reference and
+/// move the caret/IME composition window to the row's new position — a
+/// hand-copied tail per site is how the next site forgets. Returns
+/// whether a live App answered (callers gate their repaint on it).
+pub(crate) fn sync_caret_after_geometry(hwnd: HWND) -> bool {
+    match app_from_tray(hwnd) {
+        Some(app) => {
+            app.panel.update_caret(hwnd, app.panel.renderer.as_ref());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Pump wrapper for the App reference: f runs a synchronous re-entrant
+/// message pump (capture release, layout sync, foreground claim, etc.)
+/// and receives the caller's reference as its parameter — the reference
+/// is consumed by the move into the call, and the continuation works on
+/// the re-fetched reference. One form serves both shapes: closures that
+/// need the App inside the pump take it from the parameter, closures
+/// that must not touch it ignore the parameter (passing anything else
+/// captured would alias). A failed re-fetch returns None; the
+/// continuation early-exits on the empty path.
+/// For bare pump points that keep using the old alias afterwards (on the
+/// justified assumption the pump dispatches no re-fetching message),
+/// bracket the call with alias_probe/alias_assert_live instead — the
+/// debug tripwire turns a violated assumption into an assertion. Default
+/// to this wrapper (re-fetch semantics for free); the probe/assert pair
+/// is the fallback for continuations that must stay on the same alias.
+pub(crate) fn pump(
+    app: &mut App,
+    hwnd: HWND,
+    f: impl FnOnce(&mut App),
+) -> Option<&'static mut App> {
+    f(app);
+    app_from_tray(hwnd)
+}
+
+/// Short alias keeping this file's call sites terse
+use self::app_from_tray as app_from;
 
 /// Normalizes config value ranges, shared by the startup load and import;
 /// the threshold is clamped back to 1–100, the interval into the legal
@@ -1143,14 +1334,12 @@ fn sync_panel_derived(app: &mut App) {
 fn sync_layout_effective(app: &mut App, panel_hwnd: HWND) {
     app.panel.height_anim = None;
     let target_h = app.panel.view_height_for(
-        app.panel.pending_team,
-        app.panel.customizing_interval,
+        app.panel.team.pending,
+        app.panel.customizing.pending,
         app.config.accounts.len(),
     );
     if app.panel.begin_shrink_anim(panel_hwnd, LogPx(target_h)) {
-        unsafe {
-            let _ = InvalidateRect(Some(panel_hwnd), None, true);
-        }
+        invalidate_panel(panel_hwnd);
         return;
     }
     relayout_panel(app, panel_hwnd);
@@ -1218,15 +1407,13 @@ pub(crate) fn relayout_panel(app: &mut App, panel_hwnd: HWND) {
         LogPx(app.panel.view_height(app.config.accounts.len())),
         false,
     );
-    unsafe {
-        let _ = InvalidateRect(Some(panel_hwnd), None, true);
-    }
+    invalidate_panel(panel_hwnd);
     // place's SetWindowPos is a pump (a cross-monitor move dispatches
     // WM_DPICHANGED, which re-derives the alias): the shared tail
     // re-fetches and re-syncs the caret — layout shifts move the caret
     // row, and without the re-sync an in-progress IME composition window
     // floats at the old y until the next keystroke.
-    crate::ui::panel::sync_caret_after_geometry(panel_hwnd);
+    sync_caret_after_geometry(panel_hwnd);
 }
 
 /// Application entry point
@@ -1287,7 +1474,7 @@ pub fn run() -> i32 {
         // block forever as an invisible process, and with the mutex held
         // every later launch would silently exit.
         if hwnd.is_invalid() {
-            crate::platform::log("[Quotify] 托盘窗口创建失败，进程退出");
+            crate::platform::log("托盘窗口创建失败，进程退出");
             return 1;
         }
 
@@ -1300,15 +1487,15 @@ pub fn run() -> i32 {
         let px = icon::tray_px();
         let initial = icon::resource_icon(px).or_else(|| icon::logo_icon(px));
         if initial.is_none() {
-            crate::platform::log(&format!("[Quotify] 初始图标加载失败 (px={px})"));
+            crate::platform::log(&format!("初始图标加载失败 (px={px})"));
         }
         let initial = initial.unwrap_or_default();
-        app.tray_icon = Some(initial);
-        app.tray = Some(TrayIcon::new(hwnd, initial));
+        app.tray_state
+            .install(TrayIcon::new(hwnd, initial), initial);
         // Autostart may race an unready taskbar; on failure arm the
         // short-haul retry until the icon is in place.
-        if !app.tray.as_ref().is_some_and(|t| t.registered) {
-            app.tray_retries = 0;
+        if !app.tray_state.registered() {
+            app.tray_state.retries = 0;
             SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
         }
 
@@ -1356,12 +1543,7 @@ pub fn run() -> i32 {
             DispatchMessageW(&msg);
         }
 
-        if let Some(t) = app.tray.take() {
-            drop(t);
-        }
-        if let Some(ic) = app.tray_icon.take() {
-            icon::destroy_owned(ic);
-        }
+        app.tray_state.shutdown();
         drop(app.poller.take());
         if com {
             CoUninitialize();

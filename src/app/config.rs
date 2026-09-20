@@ -78,6 +78,12 @@ pub struct Account {
     pub api_key: String,
 }
 
+/// Account-count cap: an imported file is untrusted, and an oversized list
+/// would inflate every account surface (popup rows, settings cards); over
+/// the cap the import is rejected outright, never truncated — silently
+/// dropped entries would pass an import off as successful.
+pub(crate) const MAX_ACCOUNTS: usize = 100;
+
 /// Full application configuration
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]

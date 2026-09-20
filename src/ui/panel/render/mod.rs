@@ -3,10 +3,18 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod about;
+mod hit;
 mod main;
+mod marquee;
 pub mod popup;
 mod settings;
 mod widgets;
+
+pub use hit::Hit;
+pub(crate) use marquee::{
+    ERROR_SCROLL_BRACKET_WEIGHT, ERROR_SCROLL_FRAME_MS, ERROR_SCROLL_PAUSE, ERROR_SCROLL_SIZE,
+    ErrorScroll, ScrollBlock, ScrollTick, belt_width,
+};
 
 use std::collections::HashMap;
 
@@ -18,9 +26,10 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_DRAW_TEXT_OPTIONS_CLIP, D2D1_DRAW_TEXT_OPTIONS_NO_SNAP,
     D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_NONE, D2D1_RENDER_TARGET_PROPERTIES,
-    D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT, D2D1CreateFactory, ID2D1Factory,
-    ID2D1HwndRenderTarget, ID2D1PathGeometry, ID2D1SolidColorBrush, ID2D1StrokeStyle,
+    D2D1_HWND_RENDER_TARGET_PROPERTIES, D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
+    D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_SOFTWARE, D2D1_ROUNDED_RECT,
+    D2D1CreateFactory, ID2D1Factory, ID2D1HwndRenderTarget, ID2D1PathGeometry,
+    ID2D1SolidColorBrush, ID2D1StrokeStyle,
 };
 use windows::Win32::Graphics::DirectWrite::{
     DWRITE_FACTORY_TYPE_SHARED, DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_PARAGRAPH_ALIGNMENT_NEAR,
@@ -102,195 +111,6 @@ pub enum ScopeChoice {
     Team,
 }
 
-/// Clickable element identifier used for hit testing; grouped by UI scene,
-/// mirroring the match-arm grouping of handle_panel_hit
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Hit {
-    // ── Main view ──
-    Refresh,
-    Settings,
-    AccountSwitch,
-    UsageInfo,
-
-    // ── Navigation ──
-    Back,
-    ClosePanel,
-
-    // ── Settings · Poll interval ──
-    IntervalPreset(u64),
-    CustomizeInterval,
-    ApplyInterval,
-    InputInterval,
-
-    // ── Settings · General ──
-    Language(LanguageChoice),
-    Appearance(AppearanceChoice),
-    ToggleAutostart,
-
-    // ── Settings · Network proxy ──
-    InputProxy,
-    ApplyProxy,
-
-    // ── Settings · Usage notifications ──
-    ToggleThreshold,
-    ToggleReset5h,
-    ToggleResetWeekly,
-
-    // ── Settings · Peak hours ──
-    InputPeakStart,
-    InputPeakEnd,
-    ApplyPeak,
-
-    // ── Settings · Accounts ──
-    AddAccount,
-    RemoveAccount(usize),
-    PickAccount(usize),
-    AccountType(ScopeChoice),
-    InputName,
-    InputKey,
-    RevealKey,
-    InputOrg,
-    InputProject,
-    SaveAccount,
-    Platform(crate::api::Platform),
-
-    // ── Settings · Config management & about ──
-    ExportConfig,
-    ImportConfig,
-    CheckUpdate,
-    OpenDownload,
-
-    // ── About window ──
-    LinkRepo,
-    LinkIssues,
-    CopyDiagnostics,
-    NewsItem(usize),
-    AboutLogo,
-}
-
-/// Exhaustive registry of non-slot hits that keep the input state after
-/// a click (apply buttons keep the field for editing when validation
-/// fails, same semantics as the Enter path): every Hit variant is listed,
-/// so a new variant that must keep the input state fails to compile here
-/// instead of silently clearing it (caret gone, in-flight IME
-/// composition dropped).
-pub(crate) const fn keeps_input_state_hit(h: Hit) -> bool {
-    match h {
-        Hit::CustomizeInterval
-        | Hit::AddAccount
-        | Hit::RevealKey
-        | Hit::ApplyProxy
-        | Hit::ApplyInterval
-        | Hit::ApplyPeak
-        | Hit::SaveAccount => true,
-        Hit::Refresh
-        | Hit::Settings
-        | Hit::AccountSwitch
-        | Hit::UsageInfo
-        | Hit::Back
-        | Hit::ClosePanel
-        | Hit::IntervalPreset(_)
-        | Hit::InputInterval
-        | Hit::Language(_)
-        | Hit::Appearance(_)
-        | Hit::ToggleAutostart
-        | Hit::InputProxy
-        | Hit::ToggleThreshold
-        | Hit::ToggleReset5h
-        | Hit::ToggleResetWeekly
-        | Hit::InputPeakStart
-        | Hit::InputPeakEnd
-        | Hit::RemoveAccount(_)
-        | Hit::PickAccount(_)
-        | Hit::AccountType(_)
-        | Hit::InputName
-        | Hit::InputKey
-        | Hit::InputOrg
-        | Hit::InputProject
-        | Hit::Platform(_)
-        | Hit::ExportConfig
-        | Hit::ImportConfig
-        | Hit::CheckUpdate
-        | Hit::OpenDownload
-        | Hit::LinkRepo
-        | Hit::LinkIssues
-        | Hit::CopyDiagnostics
-        | Hit::NewsItem(_)
-        | Hit::AboutLogo => false,
-    }
-}
-
-/// Exhaustive modal registry: every Hit variant is listed, so a new
-/// modal variant fails to compile here until registered — and this
-/// match's true arm and crate::app::dispatch_modal's dispatch arm must
-/// be extended in the same change (a dispatch arm missed after
-/// registration is still caught by dispatch_modal's fallback log).
-pub(crate) const fn is_modal_hit(h: Hit) -> bool {
-    match h {
-        Hit::ExportConfig | Hit::ImportConfig => true,
-        Hit::Refresh
-        | Hit::Settings
-        | Hit::AccountSwitch
-        | Hit::UsageInfo
-        | Hit::Back
-        | Hit::ClosePanel
-        | Hit::IntervalPreset(_)
-        | Hit::CustomizeInterval
-        | Hit::ApplyInterval
-        | Hit::InputInterval
-        | Hit::Language(_)
-        | Hit::Appearance(_)
-        | Hit::ToggleAutostart
-        | Hit::InputProxy
-        | Hit::ApplyProxy
-        | Hit::ToggleThreshold
-        | Hit::ToggleReset5h
-        | Hit::ToggleResetWeekly
-        | Hit::InputPeakStart
-        | Hit::InputPeakEnd
-        | Hit::ApplyPeak
-        | Hit::AddAccount
-        | Hit::RemoveAccount(_)
-        | Hit::PickAccount(_)
-        | Hit::AccountType(_)
-        | Hit::InputName
-        | Hit::InputKey
-        | Hit::RevealKey
-        | Hit::InputOrg
-        | Hit::InputProject
-        | Hit::SaveAccount
-        | Hit::Platform(_)
-        | Hit::CheckUpdate
-        | Hit::OpenDownload
-        | Hit::LinkRepo
-        | Hit::LinkIssues
-        | Hit::CopyDiagnostics
-        | Hit::NewsItem(_)
-        | Hit::AboutLogo => false,
-    }
-}
-
-/// Hit predicates are kept next to the enum; new input-field variants must be registered
-/// here in sync
-impl Hit {
-    /// Hits that enter/keep the input state or the key plain-text view state after a click;
-    /// WM_LBUTTONUP uses this to decide whether to end the input state after the click.
-    /// Input-field slots are decided exhaustively via input_field_of_hit;
-    /// the non-slot additions come from the exhaustive keeps_input_state_hit.
-    pub(crate) fn is_input_hit(&self) -> bool {
-        crate::ui::panel::input_field_of_hit(*self).is_some() || keeps_input_state_hit(*self)
-    }
-
-    /// Modal hits: dispatch must go through the window-procedure-layer interception into
-    /// the direct two-stage call;
-    /// reaching handle_panel_hit is a wiring error. The registry is the
-    /// exhaustive is_modal_hit; when adding a modal variant, register it in
-    /// crate::app::dispatch_modal in sync.
-    pub(crate) fn is_modal(&self) -> bool {
-        is_modal_hit(*self)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Align {
     Left,
@@ -311,50 +131,6 @@ pub struct FooterAnim {
     pub tween: Tween,
     pub old: TextBlock,
     pub new: TextBlock,
-}
-
-/// Full-value form of the marquee rebuild-decision key: the snapshot time leads —
-/// being equal across frames short-circuits the
-/// remaining field comparisons. The visible width is stored by bits (f32 semantic
-/// equality is bitwise equality).
-pub(super) type ScrollKey = (
-    chrono::DateTime<chrono::Local>,
-    crate::api::FetchError,
-    u32,
-    crate::ui::i18n::Lang,
-    bool,
-);
-
-/// Scroll state of the footer error summary: when the summary exceeds the panel width it
-/// loops conveyor-belt style, pausing a few seconds at the
-/// start and after each lap returns to the beginning. Layouts and widths are computed at
-/// creation; scroll frames do zero measuring, zero allocation,
-/// and zero COM object rebuilds
-pub struct ErrorScroll {
-    /// Content key: a full-value tuple of error payload, snapshot time, visible width,
-    /// language, and the animation toggle;
-    /// any change triggers a rebuild; full-value comparison has no hash-collision missed updates
-    key: ScrollKey,
-    /// Three content blocks (prefix / category / tail): layout and width are held as
-    /// a pair, consumers do no re-layout;
-    /// under reduced motion the over-wide case stores the truncated string's layout
-    blocks: [ScrollBlock; 3],
-    /// Left and right brackets delimiting the blocks: bold weight, shared by the three blocks
-    bracket: ScrollBlock,
-    bracket_end: ScrollBlock,
-    /// Whether the summary is over-wide and scrolls: the non-scrolling state is
-    /// cache-only, tick does not keep it alive
-    scrolling: bool,
-    /// Frozen while unfocused: the timer is already removed and reactivation wakes it;
-    /// both the re-mount decision and advancement bypass it
-    frozen: bool,
-    /// Current offset, 0..total_w
-    offset: f32,
-    /// Pause deadline; a past instant while scrolling
-    resume_at: std::time::Instant,
-    /// Last frame's time; the frame rate varies with animation priority,
-    /// advance by the actual elapsed time
-    last: std::time::Instant,
 }
 
 /// Text block with a prebuilt layout: layout and width/height are held as one,
@@ -392,6 +168,16 @@ impl TextBlock {
     }
 }
 
+/// Full-repaint gate: every invalidation outside the animation tick
+/// raises it, and the next paint drops its narrow band (see
+/// Renderer::band_clip) — otherwise an interleaved hover/edit/data
+/// invalidation would be clipped away by the band. Process-global by
+/// contract: bands are panel-exclusive (floating windows never carry
+/// one), so the gate serves one surface; a second banded surface must
+/// migrate to per-window damage slots instead of sharing this gate.
+pub(crate) static FULL_REPAINT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Drawn-text tier of an input field: the placeholder (12/400 non-mono)
 /// and the body (INPUT_FONT mono) are distinct cache tiers — keying by
 /// string alone would hand one tier's font to the other when both draw
@@ -407,53 +193,6 @@ pub(super) struct InputBlockEntry {
     style: InputStyle,
     text: String,
     block: TextBlock,
-}
-
-/// Marquee content blocks reuse the TextBlock structure
-type ScrollBlock = TextBlock;
-
-impl ErrorScroll {
-    /// Scroll period: total width of the on-screen blocks plus the inter-segment gap of the loop
-    pub(crate) fn total_w(&self) -> f32 {
-        belt_width(
-            &self.blocks.each_ref().map(|b| b.w),
-            self.bracket.w + self.bracket_end.w,
-        ) + ERROR_SCROLL_GAP
-    }
-}
-
-/// Total width of the on-screen blocks (content width + bracket pair):
-/// empty blocks contribute zero, the period carries no trailing blank.
-/// Overflow detection and the scroll period share this source; block-structure changes
-/// only touch this one place
-pub(crate) fn belt_width(blocks: &[f32], pair: f32) -> f32 {
-    blocks.iter().filter(|w| **w > 0.0).map(|w| *w + pair).sum()
-}
-
-/// Marquee frame interval
-/// At 30px/s, 33ms advances about 1px per frame, halving full-window redraw cost to the
-/// same tier as the footer swap.
-pub(crate) const ERROR_SCROLL_FRAME_MS: u32 = 33;
-/// Marquee scroll speed (logical px/second)
-pub(crate) const ERROR_SCROLL_SPEED: f32 = 30.0;
-/// Pause duration after a lap completes
-pub(crate) const ERROR_SCROLL_PAUSE: std::time::Duration = std::time::Duration::from_secs(3);
-/// Inter-segment gap in the looping tiling (logical px)
-pub(crate) const ERROR_SCROLL_GAP: f32 = 48.0;
-/// Marquee text font size: the three content blocks and the brackets share one size
-pub(crate) const ERROR_SCROLL_SIZE: f32 = 12.0;
-/// Block-delimiting bracket weight (bold): content uses regular weight 400
-pub(crate) const ERROR_SCROLL_BRACKET_WEIGHT: u16 = 700;
-
-/// Single-tick result of the marquee
-pub(crate) enum ScrollTick {
-    /// Scroll frame, frame interval ERROR_SCROLL_FRAME_MS
-    Frame,
-    /// Paused, milliseconds until resumption
-    Pause(u32),
-    /// Frozen by the foreground gate, no advancing or redrawing; not kept alive,
-    /// refocus restarts the timer via the activation message
-    Idle,
 }
 
 impl AnimState {
@@ -515,62 +254,6 @@ impl Renderer {
         TextBlock::new(self.make_layout(s, 12.0, 400, false))
     }
 
-    /// Advance the marquee by one frame
-    /// Focus loss is checked before the pause decision: freezing takes effect
-    /// immediately, no extra keep-alive tick just to wait for the resume point;
-    /// during a pause the timer is set once to the resume point with zero idle spinning;
-    /// the non-scrolling and reduced-motion states are not kept alive;
-    /// refocus restarts the timer via the activation message, resuming without a jump.
-    pub fn error_scroll_tick(&mut self, active: bool) -> Option<ScrollTick> {
-        let sc = self.anim.error_scroll.as_mut()?;
-        if !sc.scrolling || !self.anim_allowed {
-            return None;
-        }
-        let now = std::time::Instant::now();
-        if !active {
-            sc.frozen = true;
-            // While inside the end-of-lap pause, last stays aligned to the
-            // resume point (a past instant) so the remaining pause is not
-            // paid out as displacement on the first post-resume frame; the
-            // reset only applies mid-scroll, where the frozen stretch must
-            // not count toward the next frame either.
-            if now >= sc.resume_at {
-                sc.last = now;
-            }
-            return Some(ScrollTick::Idle);
-        }
-        // During a pause last is not advanced: when a lap completes,
-        // last is already aligned to the resume point, so the first frame after
-        // resumption counts only one frame interval of displacement.
-        if now < sc.resume_at {
-            return Some(ScrollTick::Pause((sc.resume_at - now).as_millis() as u32));
-        }
-        sc.frozen = false;
-        let dt = now.saturating_duration_since(sc.last).as_secs_f32();
-        sc.last = now;
-        sc.offset += ERROR_SCROLL_SPEED * dt;
-        if sc.offset >= sc.total_w() {
-            // A full lap scrolled: the text start returns to the left and
-            // scrolling pauses before resuming; last is synced to the resume point,
-            // so the pause duration is excluded from the first frame's displacement.
-            sc.offset = 0.0;
-            sc.resume_at = now + ERROR_SCROLL_PAUSE;
-            sc.last = sc.resume_at;
-        }
-        Some(ScrollTick::Frame)
-    }
-
-    /// The marquee is scrolling and not frozen: the predicate for whether the timer
-    /// should be present, shared by the re-mount points.
-    /// The frozen state does not re-mount — a mounted timer would just idle one tick and
-    /// be removed again.
-    pub fn error_scrolling(&self) -> bool {
-        self.anim
-            .error_scroll
-            .as_ref()
-            .is_some_and(|sc| sc.scrolling && !sc.frozen)
-    }
-
     /// The footer's current frozen string (the frame-cache value): byte-identical to the
     /// swap animation's on-screen
     /// start point, no jump across minute boundaries
@@ -583,26 +266,6 @@ impl Renderer {
     pub(crate) fn reset_hits(&mut self) {
         self.hits.clear();
         self.hover = None;
-    }
-
-    /// Revive the frozen marquee on refocus: last is re-stamped to now,
-    /// preventing the first frame from advancing the entire
-    /// stalled duration in one jump — except while the end-of-lap pause is
-    /// still running, where last keeps its alignment to the resume point;
-    /// returns whether the timer needs re-mounting.
-    pub fn resume_error_scroll(&mut self) -> bool {
-        if let Some(sc) = self.anim.error_scroll.as_mut()
-            && sc.scrolling
-            && sc.frozen
-        {
-            sc.frozen = false;
-            let now = std::time::Instant::now();
-            if now >= sc.resume_at {
-                sc.last = now;
-            }
-            return true;
-        }
-        false
     }
 
     /// The clickable element hit by the mouse position (logical pixels);
@@ -649,6 +312,12 @@ pub struct Renderer {
     pub hover: Option<Hit>,
     pub anim: AnimState,
     pending_tip: Option<(f32, f32, f32)>,
+    /// Narrow repaint band for this frame (logical y range): marquee,
+    /// footer-swap, and caret-blink frames change pixels in one strip, so
+    /// the frame is clipped to it and the rest of the back buffer carries
+    /// over. Set by the animation tick, consumed (and cleared) by the next
+    /// paint; any other invalidation site raises FULL_REPAINT and drops it.
+    pub(crate) band_clip: Option<(f32, f32)>,
     /// Peak-hours tip copy, keyed (language, range): hover frames rebuild
     /// no strings; the Rc clone follows cached_error_body's borrow escape
     peak_tip: Option<(
@@ -741,6 +410,7 @@ impl Renderer {
                 hover: None,
                 anim: AnimState::new(),
                 pending_tip: None,
+                band_clip: None,
                 peak_tip: None,
                 input_blocks: std::cell::RefCell::new(std::array::from_fn(|_| None)),
                 font_fallback: false,
@@ -1045,12 +715,21 @@ impl Renderer {
         if units >= w16_len {
             return (s.to_string(), w);
         }
-        // The staging buffer has not been overwritten since the layout was created —
-        // the calls that would overwrite it all sit on failure paths
-        // that return early, so reading the slice back is safe.
-        let mut out: Vec<u16> = self.u16_buf.borrow()[..units].to_vec();
-        out.push(0x2026);
-        let disp = String::from_utf16_lossy(&out);
+        // The cut lands on a cluster edge, and a cluster never splits a
+        // char — so `units` UTF-16 units is a char boundary of `s`, and the
+        // truncated head rebuilds straight from the original string with no
+        // u16 round trip.
+        let mut disp = String::with_capacity(units + 3);
+        let mut left = units;
+        for ch in s.chars() {
+            let l = ch.len_utf16();
+            if l > left {
+                break;
+            }
+            disp.push(ch);
+            left -= l;
+        }
+        disp.push('…');
         (disp, w + ell_w)
     }
 
@@ -1310,7 +989,7 @@ impl Renderer {
         draw: impl FnOnce(&mut Self, &ID2D1HwndRenderTarget, f32, f32),
     ) -> bool {
         unsafe {
-            let Some(target) = self.ensure_target(hwnd, rect_phys, dpi) else {
+            let Some((target, buffer_reset)) = self.ensure_target(hwnd, rect_phys, dpi) else {
                 return true;
             };
             let w = (rect_phys.right - rect_phys.left) as f32 / dpi;
@@ -1318,11 +997,44 @@ impl Renderer {
             self.hits.clear();
             self.frame_measures.clear();
             target.BeginDraw();
-            draw(self, &target, w, h);
+            // A non-animation invalidation landed after the band was set:
+            // repaint the full window instead of honoring the band. The
+            // gate is only consumed when a band is pending — floating
+            // windows share this skeleton and must not eat the panel's
+            // gate (they never carry a band). A Resize/rebuild this call
+            // also drops the band: the back buffer's contents are
+            // undefined afterwards, and the band mechanism's carry-over
+            // assumption (see band_clip) no longer holds for this frame.
+            let band = self.band_clip.take();
+            let band = if buffer_reset
+                || (band.is_some() && FULL_REPAINT.swap(false, std::sync::atomic::Ordering::AcqRel))
+            {
+                None
+            } else {
+                band
+            };
+            // Banded frames still run the whole scene through the clip:
+            // geometry and cache hits are cheap, only rasterization is
+            // bounded, and the hit table stays identical to a full frame.
+            if let Some((top, bottom)) = band {
+                target.PushAxisAlignedClip(
+                    &D2D_RECT_F {
+                        left: 0.0,
+                        top,
+                        right: w,
+                        bottom,
+                    },
+                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE,
+                );
+                draw(self, &target, w, h);
+                target.PopAxisAlignedClip();
+            } else {
+                draw(self, &target, w, h);
+            }
             match target.EndDraw(None, None) {
                 Ok(()) => true,
                 Err(e) => {
-                    crate::platform::log(&format!("[Quotify] {log_tag} EndDraw 失败: {e}"));
+                    crate::platform::log(&format!("{log_tag} EndDraw 失败: {e}"));
                     false
                 }
             }
@@ -1643,13 +1355,16 @@ impl Renderer {
         self.brushes.clear();
     }
 
-    /// Create or reuse the HwndRenderTarget; returns None on failure
+    /// Create or reuse the HwndRenderTarget; returns None on failure.
+    /// The bool reports whether this call Resized or fully rebuilt the
+    /// target — either path leaves the back buffer's contents undefined,
+    /// so the caller must drop any pending narrow band for this frame.
     unsafe fn ensure_target(
         &mut self,
         hwnd: HWND,
         rect_phys: &RECT,
         dpi: f32,
-    ) -> Option<ID2D1HwndRenderTarget> {
+    ) -> Option<(ID2D1HwndRenderTarget, bool)> {
         let dpi = sane_dpi(dpi);
         let w_px = (rect_phys.right - rect_phys.left).max(1) as u32;
         let h_px = (rect_phys.bottom - rect_phys.top).max(1) as u32;
@@ -1687,7 +1402,7 @@ impl Renderer {
                 }
             }
         }
-        Some(self.target.clone())
+        Some((self.target.clone(), need_rebuild))
     }
 }
 
@@ -1711,7 +1426,7 @@ pub(crate) unsafe fn paint_common(
     dpi: f32,
     paint: impl FnOnce(&mut Renderer, &RECT) -> bool,
 ) -> (Option<Renderer>, bool, bool) {
-    use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
+    use windows::Win32::Graphics::Gdi::ValidateRect;
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
     let _ = ValidateRect(Some(hwnd), None);
     let mut rect = RECT::default();
@@ -1743,7 +1458,7 @@ pub(crate) unsafe fn paint_common(
     if !keep {
         // Without the request, a static panel would wait for the minute heartbeat for its
         // next frame, staying blank with hit testing dead in the meantime.
-        let _ = InvalidateRect(Some(hwnd), None, false);
+        super::invalidate_panel(hwnd);
     }
     (renderer, keep, need_anim)
 }
@@ -1818,18 +1533,22 @@ unsafe fn create_hwnd_target(
         dpiY: dpi * 96.0,
         ..Default::default()
     };
+    // RETAIN_CONTENTS: the narrow-band repaint (see band_clip) assumes
+    // out-of-band back-buffer pixels carry over across presents; the
+    // NONE option licenses the present to discard frame content, which
+    // would leave the carried-over strips undefined.
     let hwnd_props = D2D1_HWND_RENDER_TARGET_PROPERTIES {
         hwnd,
         pixelSize: D2D_SIZE_U {
             width: w_px,
             height: h_px,
         },
-        presentOptions: D2D1_PRESENT_OPTIONS_NONE,
+        presentOptions: D2D1_PRESENT_OPTIONS_RETAIN_CONTENTS,
     };
     let target = match factory.CreateHwndRenderTarget(&props, &hwnd_props) {
         Ok(t) => t,
         Err(e) => {
-            crate::platform::log(&format!("[Quotify] CreateHwndRenderTarget 失败: {e}"));
+            crate::platform::log(&format!("CreateHwndRenderTarget 失败: {e}"));
             return None;
         }
     };
@@ -1844,7 +1563,7 @@ unsafe fn create_hwnd_target(
     ) {
         Ok(b) => b,
         Err(e) => {
-            crate::platform::log(&format!("[Quotify] black 刷子创建失败: {e}"));
+            crate::platform::log(&format!("black 刷子创建失败: {e}"));
             return None;
         }
     };
@@ -1854,69 +1573,5 @@ unsafe fn create_hwnd_target(
 impl Default for AnimState {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Pins the manual allowlist of is_input_hit: a new input-adjacent Hit
-    /// variant that must keep focus (an apply-button pattern) compiles
-    /// silently unregistered otherwise — no exhaustiveness check covers this
-    /// list. When adding a variant, extend both the enum and this table.
-    #[test]
-    fn is_input_hit_allowlist_pinned() {
-        let yes: &[Hit] = &[
-            Hit::InputInterval,
-            Hit::InputProxy,
-            Hit::InputPeakStart,
-            Hit::InputPeakEnd,
-            Hit::InputName,
-            Hit::InputKey,
-            Hit::InputOrg,
-            Hit::InputProject,
-            Hit::CustomizeInterval,
-            Hit::AddAccount,
-            Hit::RevealKey,
-            Hit::ApplyProxy,
-            Hit::ApplyInterval,
-            Hit::ApplyPeak,
-            Hit::SaveAccount,
-        ];
-        let no: &[Hit] = &[
-            Hit::Refresh,
-            Hit::Settings,
-            Hit::AccountSwitch,
-            Hit::UsageInfo,
-            Hit::Back,
-            Hit::ClosePanel,
-            Hit::IntervalPreset(300),
-            Hit::Language(LanguageChoice::System),
-            Hit::Appearance(AppearanceChoice::System),
-            Hit::ToggleAutostart,
-            Hit::ToggleThreshold,
-            Hit::ToggleReset5h,
-            Hit::ToggleResetWeekly,
-            Hit::RemoveAccount(0),
-            Hit::PickAccount(0),
-            Hit::AccountType(ScopeChoice::Personal),
-            Hit::Platform(crate::api::Platform::Cn),
-            Hit::ExportConfig,
-            Hit::ImportConfig,
-            Hit::CheckUpdate,
-            Hit::OpenDownload,
-            Hit::LinkRepo,
-            Hit::LinkIssues,
-            Hit::CopyDiagnostics,
-            Hit::NewsItem(0),
-            Hit::AboutLogo,
-        ];
-        for h in yes {
-            assert!(h.is_input_hit(), "should keep input state: {h:?}");
-        }
-        for h in no {
-            assert!(!h.is_input_hit(), "should drop input state: {h:?}");
-        }
     }
 }

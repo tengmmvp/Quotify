@@ -2,7 +2,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Gdi::InvalidateRect;
 
 use super::InputField;
 use super::Panel;
@@ -137,9 +136,7 @@ impl Panel {
             // Switching triggers whole-window invalidation: clears the old
             // field's active border and selection pixels; the caret on first
             // focus also appears via this repaint.
-            unsafe {
-                let _ = InvalidateRect(Some(hwnd), None, false);
-            }
+            super::invalidate_panel(hwnd);
             self.input.edit.reset();
             // A stale high surrogate left over across fields would mis-pair
             // with a later low surrogate into a wrong supplementary-plane char.
@@ -415,21 +412,23 @@ impl Panel {
 
     /// Anchor y of the caret line (logical pixels, including the in-box
     /// vertical offset and scroll translation);
-    /// shared by IME composition window positioning and text-zone hit testing.
-    fn caret_line_y(&self, field: InputField) -> f32 {
+    /// shared by IME composition window positioning, text-zone hit
+    /// testing, and the blink frame's narrow repaint band.
+    pub(crate) fn caret_line_y(&self, field: InputField) -> f32 {
         let y = match field {
             InputField::Interval => {
-                let (has_account, auth_error) = self.caret_ctx;
-                layout::interval_input_y(has_account, auth_error)
+                layout::interval_input_y(self.caret_has_account, self.auth_error)
             }
-            InputField::Proxy => {
-                let (has_account, auth_error) = self.caret_ctx;
-                layout::proxy_input_y(has_account, auth_error, self.layout_customizing)
-            }
-            InputField::PeakStart | InputField::PeakEnd => {
-                let (has_account, auth_error) = self.caret_ctx;
-                layout::peak_input_y(has_account, auth_error, self.layout_customizing)
-            }
+            InputField::Proxy => layout::proxy_input_y(
+                self.caret_has_account,
+                self.auth_error,
+                self.customizing.effective,
+            ),
+            InputField::PeakStart | InputField::PeakEnd => layout::peak_input_y(
+                self.caret_has_account,
+                self.auth_error,
+                self.customizing.effective,
+            ),
             InputField::Name => layout::ADD_NAME_Y,
             InputField::Key => layout::ADD_KEY_Y,
             InputField::Org => layout::ADD_ORG_Y,
@@ -580,6 +579,56 @@ mod tests {
         // Visible-window start offset: returns the absolute index, not the window-relative one
         let vs = cl(&[0.0, 5.0, 10.0, 15.0, 20.0], 1);
         assert_eq!(p.caret_hit_test(&vs, field, base + 5.0), 2);
+    }
+
+    /// Pins window_of: full fit forces start 0, overflow keeps a sticky that still fits the caret, a mismatched sticky re-aims by binary search.
+    #[test]
+    fn window_of_visible_window() {
+        let p = Panel::new();
+        let field = InputField::Name;
+        // Name tier: CONTENT_W(340 - 2*20) - FIELD_TEXT_INSET(6) - tail(4) = 290
+        assert_eq!(layout::field_avail(field), 290.0);
+        let art = |n: usize, cw: f32| {
+            std::rc::Rc::new(WidthArtifacts {
+                chars: vec!['a'; n],
+                widths: (0..=n).map(|i| i as f32 * cw).collect(),
+            })
+        };
+
+        // (a) 5*10=50 fits: start forced to 0 despite sticky 2, cx is the
+        // absolute prefix width; a caret past the end clamps to n
+        p.vis_start.set(2);
+        let a5 = art(5, 10.0);
+        let cl = p.window_of(field, &a5, 3, 2);
+        assert_eq!((cl.vis_start, cl.cx), (0, 30.0));
+        assert_eq!(p.vis_start.get(), 0);
+        assert!(std::rc::Rc::ptr_eq(&cl.widths, &a5));
+        let cl = p.window_of(field, &a5, 99, 0);
+        assert_eq!((cl.vis_start, cl.cx), (0, 50.0));
+
+        // (b) 40*10=400 overflows, but the sticky 20..caret 25 segment (50px)
+        // fits: kept as-is
+        let a40 = art(40, 10.0);
+        let cl = p.window_of(field, &a40, 25, 20);
+        assert_eq!((cl.vis_start, cl.cx), (20, 50.0));
+        assert_eq!(p.vis_start.get(), 20);
+        // sticky past the caret clamps down to the caret itself
+        let cl = p.window_of(field, &a40, 5, 9);
+        assert_eq!((cl.vis_start, cl.cx), (5, 0.0));
+
+        // (c) caret 39 from sticky 0 (390px) overflows the window too: the
+        // smallest fitting start is 10 — 390-100=290 fills avail exactly
+        let cl = p.window_of(field, &a40, 39, 0);
+        assert_eq!((cl.vis_start, cl.cx), (10, 290.0));
+        assert_eq!(p.vis_start.get(), 10);
+
+        // (c') unequal widths: total 340 needs widths[start] >= 50 → start 4
+        let unequal = std::rc::Rc::new(WidthArtifacts {
+            chars: vec!['a'; 8],
+            widths: vec![0.0, 5.0, 15.0, 30.0, 200.0, 310.0, 320.0, 330.0, 340.0],
+        });
+        let cl = p.window_of(field, &unequal, 8, 0);
+        assert_eq!((cl.vis_start, cl.cx), (4, 140.0));
     }
 
     /// Caret blink phase: interaction zeroing shows immediately, on/off each

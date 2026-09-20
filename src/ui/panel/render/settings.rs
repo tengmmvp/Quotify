@@ -302,9 +302,9 @@ impl Renderer {
                 alpha,
             );
             y += layout::ACCOUNT_CARD_H;
-            // The predicate and the y chain share panel.account_error: height and
+            // The predicate and the y chain share panel.auth_error: height and
             // the drawn row set come from the same source.
-            if panel.account_error {
+            if panel.auth_error {
                 let r = D2D_RECT_F {
                     left: pad + 2.0,
                     top: y - 4.0,
@@ -357,9 +357,12 @@ impl Renderer {
             cw,
             alpha,
         );
-        if panel.layout_customizing {
+        if panel.customizing.effective {
             // y is pinned to layout::interval_input_y, sharing the source with the caret and the height formula.
-            let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.account_error);
+            let iy = dy + layout::interval_input_y(model.accounts_count > 0, panel.auth_error);
+            // Stitch the accumulation chain to the formula chain: a drift
+            // here paints the input off its caret/height source (debug only).
+            debug_assert!((iy - y).abs() < 0.5, "interval 输入框 y 双链漂移");
             let input = &panel.input;
             self.input_field(
                 panel,
@@ -448,9 +451,15 @@ impl Renderer {
         let pky = dy
             + layout::peak_input_y(
                 model.accounts_count > 0,
-                panel.account_error,
-                panel.layout_customizing,
+                panel.auth_error,
+                panel.customizing.effective,
             );
+        // Stitch the accumulation chain to the formula chain: the dropped
+        // section_label return must equal the formula's rule term (debug only).
+        debug_assert!(
+            (pky - y - layout::SECTION_RULE_H).abs() < 0.5,
+            "peak 输入框 y 双链漂移"
+        );
         // The current config value serves as a faint placeholder hint;
         // typing overwrites it, no deletion needed.
         let start_buf = panel.input.peak_start.as_str();
@@ -605,9 +614,15 @@ impl Renderer {
         let py = dy
             + layout::proxy_input_y(
                 model.accounts_count > 0,
-                panel.account_error,
-                panel.layout_customizing,
+                panel.auth_error,
+                panel.customizing.effective,
             );
+        // Stitch the accumulation chain to the formula chain: the dropped
+        // sub_label return must equal the formula's label term (debug only).
+        debug_assert!(
+            (py - y - layout::SECTION_LABEL_H).abs() < 0.5,
+            "proxy 输入框 y 双链漂移"
+        );
         self.input_field(
             panel,
             target,
@@ -735,8 +750,8 @@ impl Renderer {
         );
         y = self.sub_label(target, &labels.sub_type, pad, y, cw, alpha);
         // The row set and y chain follow the effective layout.
-        let team = panel.layout_team;
-        let team_sel = panel.pending_team;
+        let team = panel.team.effective;
+        let team_sel = panel.team.pending;
         let types: [(Hit, &super::TextBlock); 2] = [
             (
                 Hit::AccountType(ScopeChoice::Personal),
@@ -828,9 +843,9 @@ impl Renderer {
                 input.field == Some(InputField::Project),
                 alpha,
             );
-            y = project_y + layout::INPUT_H + 12.0;
+            y = project_y + layout::INPUT_H + layout::ADD_TEAM_TAIL;
         } else {
-            y += 6.0;
+            y += layout::ADD_PERSONAL_TAIL;
         }
         let pair_w = 88.0 * 2.0 + 12.0;
         let bx = pad + (cw - pair_w) / 2.0;
@@ -1355,7 +1370,10 @@ impl Renderer {
                 left: x - 4.0,
                 top: y - 4.0,
                 right: x + w + 4.0,
-                bottom: y + 30.0,
+                // The field hit zone spans the drawn box plus the shared
+                // 4px margin, derived from INPUT_H — not a hand-computed
+                // constant that drifts when the box height changes.
+                bottom: y + layout::INPUT_H + 4.0,
             },
         ));
     }
@@ -1545,7 +1563,7 @@ impl Renderer {
         w: f32,
         alpha: f32,
     ) {
-        let h = 40.0;
+        let h = layout::CARD_BODY_H;
         let rect = D2D1_ROUNDED_RECT {
             rect: D2D_RECT_F {
                 left: x,
@@ -1695,12 +1713,78 @@ impl Renderer {
 /// updating the label slots alarms here.
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::ui::i18n::Lang;
     use crate::ui::panel::layout::INTERVAL_PRESETS;
     use crate::ui::panel::mask_key;
+    use crate::ui::panel::model::AccountView;
 
     #[test]
     fn interval_presets_pinned() {
         assert_eq!(INTERVAL_PRESETS, [60, 300, 900, 1800]);
+    }
+
+    /// Cache-key equivalence pins: identical inputs hit; a change in
+    /// language, width, or account presence misses and forces a rebuild
+    #[test]
+    fn settings_key_equivalence() {
+        let base = || PanelModel {
+            strings: Lang::Zh.strings(),
+            lang: Lang::Zh,
+            snapshot: None,
+            error: None,
+            account: Some(AccountView {
+                index: 0,
+                name: "acc",
+                platform: Platform::Cn,
+                team: false,
+            }),
+            accounts_count: 1,
+            popup_open: false,
+            accounts: &[],
+            poll_interval_secs: 300,
+            language: None,
+            appearance: None,
+            autostart: false,
+            threshold_enabled: true,
+            threshold_percent: 80,
+            reset_5h_enabled: true,
+            reset_weekly_enabled: false,
+            update_available: false,
+            peak_range: (0, 0),
+            peak_start_raw: "",
+            peak_end_raw: "",
+            update: None,
+            news: None,
+            last_news_read: None,
+        };
+        let key = SettingsKey {
+            lang: Lang::Zh,
+            threshold: 80,
+            cw: 200.0f32.to_bits(),
+            update: UpdateKey::Idle,
+            account: Some(AccountKey {
+                name: "acc".to_string(),
+                platform: Platform::Cn,
+                team: false,
+                version: None,
+                tier: None,
+            }),
+        };
+        // Identical inputs → cache hit
+        assert!(key.matches(&base(), 200.0));
+        // Language switch → miss
+        let mut m = base();
+        m.lang = Lang::En;
+        assert!(!key.matches(&m, 200.0));
+        // Width change → miss
+        assert!(!key.matches(&base(), 240.0));
+        // Account removed (count 1 → 0) → miss; the reverse direction is
+        // symmetric via the (Some, None) arm
+        let mut m = base();
+        m.account = None;
+        m.accounts_count = 0;
+        assert!(!key.matches(&m, 200.0));
     }
 
     /// Preset count equals the render-side label slot count: adding a preset must sync

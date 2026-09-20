@@ -5,17 +5,17 @@ use windows::Win32::Graphics::Gdi::{InvalidateRect, ValidateRect};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetCursorPos, GetForegroundWindow, GetWindowRect, HTCLIENT, IDC_ARROW,
-    IDC_HAND, IsWindowVisible, KillTimer, LoadCursorW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE,
-    SWP_NOCOPYBITS, SWP_NOZORDER, SetCursor, SetForegroundWindow, SetTimer, SetWindowPos,
-    ShowWindow, WM_CAPTURECHANGED, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_PAINT, WM_SETCURSOR, WM_TIMER, WNDPROC,
+    DefWindowProcW, GetCursorPos, GetWindowRect, HTCLIENT, IDC_ARROW, IDC_HAND, IsWindowVisible,
+    KillTimer, LoadCursorW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
+    SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, WM_CAPTURECHANGED,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER,
+    WNDPROC,
 };
 
-use crate::ui::panel::app_from_tray;
+use crate::app::{app_from_tray, pump};
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::render::Renderer;
-use crate::ui::panel::{PanelMode, PanelView, Release, pump, track_leave};
+use crate::ui::panel::{PanelMode, PanelView, Release, track_leave};
 use crate::ui::{x_of, y_of};
 
 /// Close patrol
@@ -331,7 +331,11 @@ pub(crate) fn float_wndproc(
                     if let Some(app) = app_from_tray(hwnd) {
                         let pressing = float_of(app, kind).gesture.at.is_some();
                         let stale = match kind {
-                            FloatKind::About => GetForegroundWindow() != hwnd,
+                            // The About window also survives while any window of
+                            // this program holds the foreground — the tray menu
+                            // takes it when opened over an About window, and a
+                            // same-process handoff is not a user departure.
+                            FloatKind::About => !pressing && !crate::platform::foreground_is_self(),
                             // The foreground check is waived while pressing:
                             // foreground ownership is unsettled at the click instant,
                             // and a false verdict would swallow the click into a flicker.

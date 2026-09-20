@@ -142,6 +142,22 @@ pub(crate) const MAIN_CONTENT_BOTTOM_GAP: f32 = 2.0;
 pub(crate) const MAIN_FOOTER_H: f32 = 36.0;
 /// Full main-view tail height: content bottom gap + footer
 pub(crate) const MAIN_TAIL_H: f32 = MAIN_CONTENT_BOTTOM_GAP + MAIN_FOOTER_H;
+/// Pacman footer-swap animation's vertical overshoot headroom: the
+/// glyph body (radius PACMAN_R, centered mid-strip) and the falling
+/// crumbs push drawn pixels past the footer's text row toward both
+/// strip edges; this headroom on top of MAIN_FOOTER_H keeps the repaint
+/// band from ever clipping the animation itself.
+pub(crate) const FOOTER_BAND_OVERSHOOT: f32 = 24.0;
+/// Footer narrow-band height (anchored to the panel bottom): the footer
+/// strip plus the swap animation's overshoot headroom. The animation
+/// tick's footer band derives here, so band geometry follows section
+/// heights at their single source instead of a hard-coded depth.
+pub(crate) const FOOTER_BAND_H: f32 = MAIN_FOOTER_H + FOOTER_BAND_OVERSHOOT;
+
+/// Compile-time band invariant: the band always covers the full footer
+/// strip plus the overshoot headroom — a composition change that breaks
+/// coverage is a build error, not a clipped animation at runtime.
+const _: () = assert!(FOOTER_BAND_H >= MAIN_FOOTER_H + FOOTER_BAND_OVERSHOOT);
 
 // ── Settings page section heights: shared by draw_settings's y advance, the *_input_y functions below, and settings_view_height ──
 
@@ -153,8 +169,11 @@ pub const SECTION_RULE_GAP: f32 = 12.0;
 /// Full section height of a rule-bearing section head [shared by the
 /// poll/notification/peak/general/network/config-management sections]
 pub const SECTION_RULE_H: f32 = SECTION_RULE_GAP + SECTION_LABEL_H;
-/// Full account card row height: card 40 + post-card gap 8
-pub const ACCOUNT_CARD_H: f32 = 48.0;
+/// Account card body height: the drawn card box, shared by the card
+/// drawing and the row height below
+pub const CARD_BODY_H: f32 = 40.0;
+/// Full account card row height: card body + post-card gap 8
+pub const ACCOUNT_CARD_H: f32 = CARD_BODY_H + 8.0;
 /// Auth-failure hint row height
 pub const AUTH_ERROR_H: f32 = 18.0;
 /// Always-visible add-account button height
@@ -270,6 +289,12 @@ pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bo
         + SETTINGS_EDGE_PAD) as i32 // bottom allowance
 }
 
+/// Add-page tail gaps after the last input row: team (ends at the
+/// project field) vs personal (ends at the key field); shared by the
+/// form's y advance and add_page_height
+pub const ADD_TEAM_TAIL: f32 = 12.0;
+pub const ADD_PERSONAL_TAIL: f32 = 6.0;
+
 /// Add page total height (logical pixels).
 ///
 /// Tail chain = last input row + save button + bottom allowance; for the team edition the
@@ -277,9 +302,9 @@ pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bo
 /// ID field, otherwise the KEY field.
 pub fn add_page_height(team: bool) -> i32 {
     let y = if team {
-        ADD_PROJECT_Y + INPUT_H + 12.0
+        ADD_PROJECT_Y + INPUT_H + ADD_TEAM_TAIL
     } else {
-        ADD_KEY_Y + INPUT_H + INPUT_GAP + 6.0
+        ADD_KEY_Y + INPUT_H + INPUT_GAP + ADD_PERSONAL_TAIL
     };
     (y + SAVE_BTN_H + 10.0) as i32
 }
@@ -362,6 +387,17 @@ mod tests {
         assert_eq!(TOKEN_CARD_W, 92.0);
         assert_eq!(TOKEN_CARD_H, 60.0);
         assert_eq!(TOKEN_CARD_LABEL_Y, 36.0);
+    }
+
+    #[test]
+    fn footer_band_covers_footer_strip() {
+        // The composition is pinned end to end: a section-height tweak
+        // that leaves the band behind changes the total and fails here —
+        // update in sync (the ≥ coverage rule itself is the const
+        // assert beside the definition).
+        assert_eq!(MAIN_FOOTER_H, 36.0);
+        assert_eq!(FOOTER_BAND_OVERSHOOT, 24.0);
+        assert_eq!(FOOTER_BAND_H, 60.0);
     }
 
     #[test]

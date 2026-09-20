@@ -1,9 +1,7 @@
 //! Account switcher popup
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    HMONITOR, InvalidateRect, MONITOR_DEFAULTTONEAREST, MonitorFromWindow,
-};
+use windows::Win32::Graphics::Gdi::{HMONITOR, MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
 use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
 
 use crate::ui::float_wnd::{FloatKind, FloatWnd, float_wndproc};
@@ -107,9 +105,7 @@ impl AccountPopup {
     /// Panel repaint linked to open/close: the chevron flips with the popup's visibility.
     fn repaint_panel(&self) {
         if let Some(p) = self.panel {
-            unsafe {
-                let _ = InvalidateRect(Some(p), None, false);
-            }
+            crate::ui::panel::invalidate_panel(p);
         }
     }
 

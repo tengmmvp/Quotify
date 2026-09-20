@@ -86,7 +86,7 @@ impl Drop for ModalGuard {
                     // grace before entry, or the panel was reopened midway,
                     // the grace only delays the first tick and can never
                     // trigger a mistaken collapse.
-                    if let Some(app) = crate::ui::panel::app_from_tray(panel)
+                    if let Some(app) = crate::app::app_from_tray(panel)
                         && app.panel.mode == crate::ui::panel::PanelMode::Pinned
                     {
                         let _ = SetTimer(
@@ -180,7 +180,7 @@ pub fn dispatch_modal(hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
     match hit {
         crate::ui::panel::render::Hit::ExportConfig => export_config(panel_hwnd),
         crate::ui::panel::render::Hit::ImportConfig => import_config(panel_hwnd),
-        _ => crate::platform::log("[Quotify] 非模态命中误入 dispatch_modal"),
+        _ => crate::platform::log("非模态命中误入 dispatch_modal"),
     }
 }
 /// Exports the config as plain-text JSON. Two-phase reference handling:
@@ -190,7 +190,7 @@ pub fn dispatch_modal(hit: crate::ui::panel::render::Hit, panel_hwnd: HWND) {
 /// reference after it to persist.
 pub fn export_config(panel_hwnd: HWND) {
     let (title, body) = {
-        let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+        let Some(app) = crate::app::app_from_tray(panel_hwnd) else {
             return;
         };
         (
@@ -213,7 +213,7 @@ pub fn export_config(panel_hwnd: HWND) {
     let Some(path) = picked else {
         return;
     };
-    let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+    let Some(app) = crate::app::app_from_tray(panel_hwnd) else {
         return;
     };
     let body = match serde_json::to_string_pretty(&app.config)
@@ -225,11 +225,22 @@ pub fn export_config(panel_hwnd: HWND) {
         }) {
         Ok(()) => app.strings.export_done.to_string(),
         Err(e) => {
-            crate::platform::log(&format!("[Quotify] 导出失败: {e}"));
+            crate::platform::log(&format!("导出失败: {e}"));
             app.strings.export_failed.to_string()
         }
     };
     crate::platform::notify::show(NOTIFY_TITLE, &body);
+}
+
+/// Shared rejection tail of the import path: the cause-specific log line
+/// stays at each call site, then this re-fetches the reference (any
+/// pre-dialog alias is dead after the nested pump) to resolve the picked
+/// message and toast it. Both rejection arms return right after.
+fn reject_import(panel_hwnd: HWND, pick: fn(&'static Strings) -> &'static str) {
+    let Some(app) = crate::app::app_from_tray(panel_hwnd) else {
+        return;
+    };
+    crate::platform::notify::show(NOTIFY_TITLE, pick(app.strings));
 }
 
 /// Imports a config JSON; two-phase like export_config: the modal phase
@@ -258,7 +269,7 @@ pub fn import_config(panel_hwnd: HWND) {
         match read {
             Ok(n) if n as u64 > IMPORT_MAX_BYTES => {
                 crate::platform::log(&format!(
-                    "[Quotify] 配置导入放弃：文件超上限（>{IMPORT_MAX_BYTES} 字节）"
+                    "配置导入放弃：文件超上限（>{IMPORT_MAX_BYTES} 字节）"
                 ));
                 None
             }
@@ -269,23 +280,33 @@ pub fn import_config(panel_hwnd: HWND) {
                 .map_err(|e| e.to_string())
                 .and_then(|text| serde_json::from_str::<Config>(&text).map_err(|e| e.to_string()))
                 .map_err(|e| {
-                    crate::platform::log(&format!("[Quotify] 配置导入解析失败: {e}"));
+                    crate::platform::log(&format!("配置导入解析失败: {e}"));
                 })
                 .ok(),
             Err(e) => {
-                crate::platform::log(&format!("[Quotify] 配置导入读取失败: {e}"));
+                crate::platform::log(&format!("配置导入读取失败: {e}"));
                 None
             }
         }
     };
     let Some(cfg) = parsed else {
-        crate::platform::log("[Quotify] 配置导入失败：文件不可读或格式无效");
-        let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
-            return;
-        };
-        crate::platform::notify::show(NOTIFY_TITLE, app.strings.import_failed);
+        crate::platform::log("配置导入失败：文件不可读或格式无效");
+        reject_import(panel_hwnd, |s| s.import_failed);
         return;
     };
+    // The account cap rejects rather than truncates: dropped entries would
+    // pass the import off as successful. The toast carries its own wording
+    // — a cap rejection is not a broken file, and the generic import-failed
+    // text would send the user debugging a file that is perfectly valid.
+    if cfg.accounts.len() > super::config::MAX_ACCOUNTS {
+        crate::platform::log(&format!(
+            "配置导入放弃：账号数超上限（{} > {}）",
+            cfg.accounts.len(),
+            super::config::MAX_ACCOUNTS
+        ));
+        reject_import(panel_hwnd, |s| s.import_failed_too_many);
+        return;
+    }
     // Import is a full overwrite: existing accounts get replaced and a
     // differing proxy gets switched too — confirm if either will happen,
     // since silently switching the proxy would hand usage queries to an
@@ -293,7 +314,7 @@ pub fn import_config(panel_hwnd: HWND) {
     // The current-state check and the labels are copied out in one take;
     // re-fetch after the confirmation box's modal pump returns.
     let confirm = {
-        let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+        let Some(app) = crate::app::app_from_tray(panel_hwnd) else {
             return;
         };
         let replacing = !app.config.accounts.is_empty();
@@ -309,7 +330,7 @@ pub fn import_config(panel_hwnd: HWND) {
             return;
         }
     }
-    let Some(app) = crate::ui::panel::app_from_tray(panel_hwnd) else {
+    let Some(app) = crate::app::app_from_tray(panel_hwnd) else {
         return;
     };
     // Keep the previous proxy on record to roll back when the imported
@@ -323,7 +344,8 @@ pub fn import_config(panel_hwnd: HWND) {
     // there would let one Apply click silently revert the import on the
     // most security-sensitive field.
     app.panel.input.proxy_edited = false;
-    app.panel.input.proxy = app.config.general.proxy.clone().unwrap_or_default();
+    app.panel.input.proxy = crate::ui::panel::InputField::Proxy
+        .clamp_prefill(&app.config.general.proxy.clone().unwrap_or_default());
     app.panel.input.interval_edited = false;
     // The external file's value ranges are untrusted; normalize the same
     // way as the startup load (the selected backfill is included here).
@@ -342,7 +364,8 @@ pub fn import_config(panel_hwnd: HWND) {
         // The buffer rolls back with the config: the settings page may be
         // live on screen, and a buffer still holding the rejected address
         // would let one Apply click silently reinstate it.
-        app.panel.input.proxy = prev_proxy.unwrap_or_default();
+        app.panel.input.proxy =
+            crate::ui::panel::InputField::Proxy.clamp_prefill(&prev_proxy.unwrap_or_default());
     }
     // Memory for keys unique to the old set dies with those accounts: the
     // contract that re-adding the same key starts from a clean slate also

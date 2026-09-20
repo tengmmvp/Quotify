@@ -1,9 +1,9 @@
-//! 渲染视图模型
+//! Render view model
 
 use crate::api::Platform;
 use crate::ui::i18n::{Lang, Strings};
 
-/// 选中账号的展示摘要
+/// Display summary of the selected account
 #[derive(Debug, Clone, Copy)]
 pub struct AccountView<'a> {
     pub index: usize,
@@ -12,7 +12,7 @@ pub struct AccountView<'a> {
     pub team: bool,
 }
 
-/// 一帧渲染所需的全部 app 层数据，引用快照零拷贝。
+/// All app-layer data needed for one frame of rendering; a zero-copy snapshot of references.
 pub struct PanelModel<'a> {
     pub strings: &'static Strings,
     pub lang: Lang,
@@ -42,19 +42,14 @@ pub struct PanelModel<'a> {
 impl<'a> PanelModel<'a> {
     pub fn from_app(app: &'a crate::app::App) -> Self {
         let g = &app.config.general;
-        let account = app
-            .config
-            .accounts
-            .iter()
-            .enumerate()
-            .find(|(_, a)| Some(a.id.as_str()) == app.config.selected.as_deref())
-            .or_else(|| app.config.accounts.first().map(|a| (0, a)))
-            .map(|(index, a)| AccountView {
-                index,
-                name: &a.name,
-                platform: a.platform,
-                team: a.team,
-            });
+        // Selection fallback semantics share the same source as Config::selected_account,
+        // so display and poll target cannot diverge.
+        let account = app.config.selected_account().map(|(index, a)| AccountView {
+            index,
+            name: &a.name,
+            platform: a.platform,
+            team: a.team,
+        });
         Self {
             strings: app.strings,
             lang: app.lang,
@@ -72,9 +67,7 @@ impl<'a> PanelModel<'a> {
             threshold_percent: g.notify_threshold_percent,
             reset_5h_enabled: g.notify_reset_5h_enabled,
             reset_weekly_enabled: g.notify_reset_weekly_enabled,
-            update_available: app.update_status.as_ref().is_some_and(|r| {
-                matches!(r, Ok(info) if crate::service::update::is_newer(&info.tag, env!("CARGO_PKG_VERSION")))
-            }),
+            update_available: app.update_available,
             peak_range: crate::ui::peak::peak_range(
                 &app.config.general.peak_start,
                 &app.config.general.peak_end,

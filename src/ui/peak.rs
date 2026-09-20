@@ -1,8 +1,8 @@
-//! 峰谷时段判定
+//! Peak-hours determination
 
 use chrono::{DateTime, Datelike, FixedOffset, Timelike};
 
-/// 一天内的分钟区间 [start, end)，默认官方口径 14:00–18:00
+/// Minute range within a day, [start, end); the default is the official 14:00–18:00
 pub type PeakRange = (u32, u32);
 
 pub const DEFAULT_PEAK: PeakRange = (14 * 60, 18 * 60);
@@ -11,8 +11,8 @@ fn beijing() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("固定偏移恒合法")
 }
 
-/// 高峰时段：周一至周五的给定区间（半开）。
-/// start > end 表示跨午夜，如 22:00–09:00
+/// Peak hours: the given half-open range on Monday through Friday.
+/// start > end means the range crosses midnight, e.g. 22:00–09:00
 pub fn is_peak(now: DateTime<FixedOffset>, range: PeakRange) -> bool {
     let weekday = now.weekday().number_from_monday();
     let minute = now.hour() * 60 + now.minute();
@@ -27,12 +27,12 @@ pub fn is_peak(now: DateTime<FixedOffset>, range: PeakRange) -> bool {
     }
 }
 
-/// 当前北京时间是否处于高峰
+/// Whether the current Beijing time is in peak hours
 pub fn is_peak_now(range: PeakRange) -> bool {
     is_peak(chrono::Local::now().with_timezone(&beijing()), range)
 }
 
-/// 解析 HH:MM 为当日分钟数
+/// Parses HH:MM into minutes within the day
 pub fn parse_hhmm(s: &str) -> Option<u32> {
     let (h, m) = s.trim().split_once(':')?;
     let h: u32 = h.parse().ok()?;
@@ -40,8 +40,9 @@ pub fn parse_hhmm(s: &str) -> Option<u32> {
     (h < 24 && m < 60).then_some(h * 60 + m)
 }
 
-/// 解析高峰区间配置；格式无效或两端相等回退官方默认，
-/// start > end 视为跨午夜原样保留。
+/// Parses the peak-range config; invalid formats or equal endpoints fall back to the
+/// official default,
+/// and start > end is kept as-is as a midnight-crossing range.
 pub fn peak_range(start: &str, end: &str) -> PeakRange {
     match (parse_hhmm(start), parse_hhmm(end)) {
         (Some(s), Some(e)) if s != e => (s, e),
@@ -49,7 +50,7 @@ pub fn peak_range(start: &str, end: &str) -> PeakRange {
     }
 }
 
-/// 区间显示为 HH:MM–HH:MM
+/// Formats the range as HH:MM–HH:MM
 pub fn fmt_range(range: PeakRange) -> String {
     let hhmm = |t: u32| format!("{:02}:{:02}", t / 60, t % 60);
     format!("{}–{}", hhmm(range.0), hhmm(range.1))
@@ -61,7 +62,7 @@ mod tests {
     use chrono::TimeZone;
 
     fn at(hour: u32, min: u32, weekday_offset: i64) -> DateTime<FixedOffset> {
-        // 2026-08-24 为周一，offset 0..6 覆盖一周
+        // 2026-08-24 is a Monday; offset 0..6 covers a full week
         beijing()
             .with_ymd_and_hms(2026, 8, (24 + weekday_offset) as u32, hour, min, 0)
             .unwrap()
@@ -93,7 +94,7 @@ mod tests {
 
     #[test]
     fn overnight_range() {
-        // 14:00–次日 09:00
+        // 14:00–09:00 next day
         let r = (14 * 60, 9 * 60);
         assert!(is_peak(at(14, 0, 0), r));
         assert!(is_peak(at(23, 59, 0), r));
@@ -115,14 +116,14 @@ mod tests {
 
     #[test]
     fn peak_range_config_fallbacks() {
-        // 两端相等回退官方默认
+        // Equal endpoints fall back to the official default
         assert_eq!(peak_range("09:00", "09:00"), DEFAULT_PEAK);
-        // 格式非法同样回退
+        // Invalid formats fall back as well
         assert_eq!(peak_range("9am", "18:00"), DEFAULT_PEAK);
         assert_eq!(peak_range("09:00", "6pm"), DEFAULT_PEAK);
-        // 合法窗口
+        // A valid window
         assert_eq!(peak_range("09:00", "18:00"), (9 * 60, 18 * 60));
-        // start > end 表示跨午夜，原样保留不交换
+        // start > end means midnight-crossing; kept as-is, not swapped
         assert_eq!(peak_range("22:00", "06:00"), (22 * 60, 6 * 60));
     }
 }

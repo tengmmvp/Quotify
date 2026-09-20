@@ -1,18 +1,18 @@
-//! 动画系统
+//! Animation system
 
-/// 三次缓出：展开方向用，快起慢收。
+/// Cubic ease-out: for the expanding direction — fast start, slow settle.
 pub fn ease_out_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     1.0 - (1.0 - t).powi(3)
 }
 
-/// 三次缓入：收缩方向用，慢起快收。
+/// Cubic ease-in: for the collapsing direction — slow start, fast finish.
 pub fn ease_in_cubic(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t.powi(3)
 }
 
-/// 单条动画的时间状态
+/// Time state of a single animation
 #[derive(Debug, Clone, Copy)]
 pub struct Tween {
     pub start: std::time::Instant,
@@ -37,7 +37,7 @@ impl Tween {
     }
 }
 
-/// 是否尊重系统「减少动态效果」
+/// Whether the system's "reduced motion" setting is respected
 pub fn animations_allowed() -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{
         SYSTEM_PARAMETERS_INFO_ACTION, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW,

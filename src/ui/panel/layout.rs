@@ -1,78 +1,125 @@
-//! 面板布局的单一事实源。
-//! 间距取 2/4/6/8/12/16/20 的 4px 网格档位，高度一律偶数保证 DPI
-//! 缩放落整像素；同类语义同档（行后 8、输入后 6、段头 12、边距
-//! 20），≤2px 光学修正豁免。
+//! Single source of truth for panel layout.
+//! Spacing takes the 4px-grid tiers 2/4/6/8/12/16/20, and heights are always even so DPI
+//! scaling lands on whole pixels; same-kind semantics share a tier (8 after rows, 6 after
+//! inputs, 12 for section heads, 20
+//! for margins), with ≤2px optical corrections exempt.
 
 use crate::api::TOKEN_LEGS;
 use crate::ui::panel::theme::PANEL_WIDTH;
 
-/// 轮询间隔预设档（秒）
+/// Poll-interval preset tiers (seconds)
 pub const INTERVAL_PRESETS: [u64; 4] = [60, 300, 900, 1800];
 
-/// 顶部导航栏高度
+/// Top navigation bar height
 pub const NAV_H: f32 = 30.0;
-/// section_label 返回值内含的段高
+/// Section height included in section_label's return value
 pub const SECTION_LABEL_H: f32 = 22.0;
-/// segmented_raw 段体高度
+/// segmented_raw body height
 pub const SEGMENTED_H: f32 = 30.0;
-/// segmented_raw 返回值内含的段后间距
+/// Post-section gap included in segmented_raw's return value
 pub const SEGMENTED_GAP: f32 = 8.0;
-/// 自绘输入框高度
+/// Self-drawn input field height
 pub const INPUT_H: f32 = 26.0;
-/// 设置/主视图内容区左右留白
+/// Left/right padding of the settings/main-view content area
 pub const CONTENT_PAD: f32 = 20.0;
-/// 内容区宽：面板宽去左右留白
+/// Content width: panel width minus the left/right padding
 pub const CONTENT_W: f32 = PANEL_WIDTH as f32 - 2.0 * CONTENT_PAD;
-/// 输入框左侧 x，与内容区 pad 一致
+/// Input field's left x, same as the content-area pad
 pub const INPUT_X: f32 = CONTENT_PAD;
-/// 输入框后到下一 sub_label 的间距
+/// Gap after an input field to the next sub_label
 pub const INPUT_GAP: f32 = 6.0;
-/// 代理行应用按钮宽与其左侧间隙：输入框右界按两者之和让位，
-/// 按钮绘制与 field_geo 两方同引
+/// Text inset inside an input field: the caret x, the IME composition
+/// window position, the selection highlight, and every usable-width
+/// derivation share this — companion to field_geo, the single source for
+/// field text geometry.
+pub const FIELD_TEXT_INSET: f32 = 6.0;
+/// Input-field text typography (size, weight, mono) shared by the caret
+/// width table and the field's text drawing: measured widths and drawn
+/// glyphs must come from the same triple or the caret drifts off the text.
+pub const INPUT_FONT: (f32, u16, bool) = (12.0, 400, true);
+/// Proxy-row apply button width and its left gap: the input field's right edge yields by
+/// the sum of the two,
+/// shared by both the button drawing and field_geo
 pub const APPLY_BTN_W: f32 = 48.0;
 pub const APPLY_BTN_GAP: f32 = 12.0;
 
-// ── 主视图段高：draw_main 的 y 推进链与 main_view_height 两方同引一组常量 ──
+/// Input-field geometry of the active field (x, width, right-edge yield);
+/// shares its source with each input_field
+/// call site in settings.rs — 26 for the reveal toggle, the proxy row yielding to the
+/// apply button (APPLY_BTN_W plus
+/// the gap), and the rest inset 4 at the edge. Arms are exhaustive with no fallback:
+/// a new InputField variant is a compile error
+pub(crate) fn field_geo(field: super::InputField) -> (f32, f32, f32) {
+    let cw = CONTENT_W;
+    match field {
+        super::InputField::Interval => (INPUT_X, 96.0, 4.0),
+        super::InputField::Proxy => (INPUT_X, cw - APPLY_BTN_W - APPLY_BTN_GAP, 4.0),
+        super::InputField::PeakStart => (PEAK_START_X, 64.0, 4.0),
+        super::InputField::PeakEnd => (PEAK_END_X, 64.0, 4.0),
+        super::InputField::Name => (INPUT_X, cw, 4.0),
+        super::InputField::Key => (INPUT_X, cw, 26.0),
+        super::InputField::Org => (INPUT_X, cw, 4.0),
+        super::InputField::Project => (INPUT_X, cw, 4.0),
+    }
+}
 
-/// 主视图顶部留白
+/// Usable text width of a field: the caret's visible window, drag
+/// clamping, and the draw-side visible slices all derive here — the
+/// single source for "what fits", so the width table and the drawn slice
+/// can never disagree.
+pub(crate) fn field_avail(field: super::InputField) -> f32 {
+    let (_x, w, tail) = field_geo(field);
+    (w - FIELD_TEXT_INSET - tail).max(1.0)
+}
+
+// ── Main-view section heights: draw_main's y-advance chain and main_view_height share the same set of constants ──
+
+/// Main-view top padding
 pub(crate) const MAIN_TOP_PAD: f32 = 16.0;
-/// 顶栏行高（账号刊头与右侧双钮所在行）
+/// Fixed view height of the no-data empty state: shared by the first-open placeholder and
+/// the recalculation formula
+pub(crate) const EMPTY_VIEW_H: f32 = 300.0;
+/// Top bar row height (the row holding the account masthead and the two right-side buttons)
 pub(crate) const MAIN_TOPBAR_H: f32 = 52.0;
-/// 刊头：段起点到标题的上隙[实线分隔线低 2px 挂在段起点]
+/// Masthead: top gap from section start to the title [the solid divider hangs 2px below
+/// the section start]
 pub(crate) const MAIN_MASTHEAD_RULE_GAP: f32 = 12.0;
-/// 刊头：标题行占高
+/// Masthead: height occupied by the title row
 pub(crate) const MAIN_MASTHEAD_ROW_H: f32 = 26.0;
-/// 刊头段整高：段起点到首个指标行
+/// Full masthead section height: from section start to the first metric row
 pub(crate) const MAIN_MASTHEAD_H: f32 = MAIN_MASTHEAD_RULE_GAP + MAIN_MASTHEAD_ROW_H;
-/// 指标行高
+/// Metric row height
 pub(crate) const MAIN_METRIC_ROW_H: f32 = 52.0;
-/// MCP 构成区：框顶到 MCP 指标行底的下隙
+/// MCP composition area: bottom gap from the MCP metric row's bottom to the box top
 pub(crate) const MAIN_MCP_COMP_TOP_GAP: f32 = 8.0;
-/// MCP 构成框内边距（左右 8 上下 6）
+/// MCP composition box padding (8 left/right, 6 top/bottom)
 pub(crate) const MAIN_MCP_COMP_PAD_X: f32 = 8.0;
 pub(crate) const MAIN_MCP_COMP_PAD_Y: f32 = 6.0;
-/// 能量格高（格宽 12、圆角 2、缝 2 在渲染侧）
+/// Energy cell height (cell width 12, corner radius 2, and gap 2 live on the render side)
 pub(crate) const MAIN_MCP_CELL_H: f32 = 10.0;
-/// 能量条行到图例行的推进
+/// Advance from the energy-bar row to the legend row
 pub(crate) const MAIN_MCP_LEGEND_ADV: f32 = 4.0;
-/// 图例行高（11px 徽标文本所在行）
+/// Legend row height (the row holding the 11px badge text)
 pub(crate) const MAIN_MCP_LEGEND_H: f32 = 16.0;
-/// MCP 构成区整高：下隙 + 框线 2 + 上下边距 + 条 + 推进 + 图例行
+/// Full MCP composition area height: bottom gap + box border 2 + top/bottom padding + bar
+/// + advance + legend row
 pub(crate) const MAIN_MCP_COMP_H: f32 = MAIN_MCP_COMP_TOP_GAP
     + 2.0
     + 2.0 * MAIN_MCP_COMP_PAD_Y
     + MAIN_MCP_CELL_H
     + MAIN_MCP_LEGEND_ADV
     + MAIN_MCP_LEGEND_H;
-/// 数据段（Token/余额）段前隙：到虚线分隔线
+/// Data section (Token/balance) leading gap: up to the dashed divider
 pub(crate) const MAIN_SECTION_GAP: f32 = 6.0;
-/// 数据段：虚线分隔线到段标题的推进
+/// Data section: advance from the dashed divider to the section title
 pub(crate) const MAIN_SECTION_HEAD: f32 = 12.0;
-/// Token 块：段头文字底到卡片顶的推进
+/// Token block: advance from the section head's text bottom to the card top
 pub(crate) const MAIN_TOKEN_CARD_ADV: f32 = 20.0;
-/// Token 卡片几何：卡宽由面板宽推导，与卡距让三卡缘均为 4 的倍数，
-/// x/y 缘在所有 DPI 缩放下描边皆整像素。卡高由数值带、标签带、
-/// 上下留白推导。
+/// Token card geometry: card width derives from the panel width, and with the card gap it
+/// keeps all three cards' edges multiples of 4,
+/// so the x/y edges stroke whole pixels at every DPI scale. Card height derives from the
+/// number band, the label band,
+/// and top/bottom padding.
 pub(crate) const TOKEN_CARD_NUM_Y: f32 = 8.0;
 pub(crate) const TOKEN_CARD_NUM_H: f32 = 24.0;
 pub(crate) const TOKEN_CARD_LABEL_Y: f32 = TOKEN_CARD_NUM_Y + TOKEN_CARD_NUM_H + 4.0;
@@ -80,140 +127,154 @@ pub(crate) const TOKEN_CARD_LABEL_H: f32 = 16.0;
 pub(crate) const TOKEN_CARD_H: f32 = TOKEN_CARD_LABEL_Y + TOKEN_CARD_LABEL_H + 8.0;
 pub(crate) const TOKEN_CARD_GAP: f32 = 12.0;
 pub(crate) const TOKEN_CARD_W: f32 = (CONTENT_W - 2.0 * TOKEN_CARD_GAP) / TOKEN_LEGS.len() as f32;
-/// Token 消耗块整高：段前隙 + 段头 + 卡片推进 + 卡高
+/// Full Token usage block height: leading gap + section head + card advance + card height
 pub(crate) const MAIN_TOKEN_BLOCK_H: f32 =
     MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_TOKEN_CARD_ADV + TOKEN_CARD_H;
-/// 余额行文本占高
+/// Height occupied by the balance row text
 pub(crate) const MAIN_BALANCE_ROW_H: f32 = 18.0;
-/// 余额块整高：可视为段前隙 + 段头 + 文本行，另含 2px 底部呼吸隙入高
+/// Full balance block height: effectively leading gap + section head + text row,
+/// with an extra 2px breathing gap at the bottom folded into the height
 pub(crate) const MAIN_BALANCE_BLOCK_H: f32 =
     MAIN_SECTION_GAP + MAIN_SECTION_HEAD + MAIN_BALANCE_ROW_H + 2.0;
-/// 主视图内容底隙：最后一个数据块底到页脚顶
+/// Main-view content bottom gap: from the last data block's bottom to the footer top
 pub(crate) const MAIN_CONTENT_BOTTOM_GAP: f32 = 2.0;
-/// 页脚区高（钉底）
+/// Footer area height (pinned to the bottom)
 pub(crate) const MAIN_FOOTER_H: f32 = 36.0;
-/// 主视图尾段整高：内容底隙 + 页脚
+/// Full main-view tail height: content bottom gap + footer
 pub(crate) const MAIN_TAIL_H: f32 = MAIN_CONTENT_BOTTOM_GAP + MAIN_FOOTER_H;
 
-// ── 设置页区块段高：draw_settings 的 y 推进、下方 *_input_y 与 settings_view_height 三方共用 ──
+// ── Settings page section heights: shared by draw_settings's y advance, the *_input_y functions below, and settings_view_height ──
 
-/// 设置页上下边距：nav 前顶部留白与版本行后底部余量
+/// Settings page top/bottom margins: top padding before the nav and
+/// bottom allowance after the version row
 pub const SETTINGS_EDGE_PAD: f32 = 12.0;
-/// section_label 带 rule 时分隔线到标题的上隙
+/// With section_label's rule: top gap from the divider to the title
 pub const SECTION_RULE_GAP: f32 = 12.0;
-/// 带 rule 的区块标题整段高[轮询/通知/高峰/通用/网络/配置管理区共用]
+/// Full section height of a rule-bearing section head [shared by the
+/// poll/notification/peak/general/network/config-management sections]
 pub const SECTION_RULE_H: f32 = SECTION_RULE_GAP + SECTION_LABEL_H;
-/// 账号卡片整行高：卡片 40 + 卡后隙 8
+/// Full account card row height: card 40 + post-card gap 8
 pub const ACCOUNT_CARD_H: f32 = 48.0;
-/// 鉴权失败提示行高
+/// Auth-failure hint row height
 pub const AUTH_ERROR_H: f32 = 18.0;
-/// 常驻添加账号按钮高
+/// Always-visible add-account button height
 pub const ADD_BTN_H: f32 = 28.0;
-/// 常驻添加账号按钮行高：按钮含上下余量
+/// Add-account button row height: the button plus allowance above and below
 pub const ADD_BTN_ROW_H: f32 = ADD_BTN_H + 6.0;
-/// 自定义间隔展开增量：输入框 26 + 框后尾隙 12[值同 rule 上隙，语义各自独立]
+/// Custom-interval expansion delta: input field 26 + trailing gap 12 [same value as
+/// the rule's top gap, but semantically independent]
 pub const CUSTOMIZE_EXTRA_H: f32 = INPUT_H + 12.0;
-/// 设置页常驻按钮高（应用/导出/导入/检查更新）
+/// Settings page persistent button height (apply/export/import/check for updates)
 pub const BTN_H: f32 = 28.0;
-/// 添加页保存/取消按钮高
+/// Add-page save/cancel button height
 pub const SAVE_BTN_H: f32 = 30.0;
-/// 开关行内部三段：标题、描述、行后隙；行高由求和推导
+/// Toggle row's three inner segments: title, description, trailing gap;
+/// row height derives from the sum
 pub const TOGGLE_TITLE_H: f32 = 20.0;
-/// 开关行标题绘制盒高：比推进量内收 2px，与推进量成对存放
+/// Toggle row title drawing-box height: inset 2px from the advance; stored paired with the advance
 pub const TOGGLE_TITLE_DRAW_H: f32 = TOGGLE_TITLE_H - 2.0;
 pub const TOGGLE_DESC_H: f32 = 12.0;
-/// 开关行描述绘制盒高：12px 字的下伸部需高出推进量 2px，与推进量成对存放。
+/// Toggle row description drawing-box height: a 12px font's descender needs 2px more than
+/// the advance; stored paired with the advance.
 pub const TOGGLE_DESC_DRAW_H: f32 = TOGGLE_DESC_H + 2.0;
 pub const TOGGLE_TAIL: f32 = 8.0;
 pub const TOGGLE_ROW_H: f32 = TOGGLE_TITLE_H + TOGGLE_DESC_H + TOGGLE_TAIL;
 pub const TOGGLE_ROW_PLAIN_H: f32 = TOGGLE_TITLE_H + TOGGLE_TAIL;
-/// 高峰输入行后的下隙
+/// Bottom gap after the peak input row
 pub const PEAK_TAIL_GAP: f32 = 8.0;
-/// 选择行（语言/外观）行后余隙
+/// Choice rows (language/appearance) trailing allowance
 pub const CHOICE_ROW_TAIL: f32 = 2.0;
-/// 选择行整段高（语言/外观）：子标签 + 分段控件 + 行后余隙
+/// Full choice row height (language/appearance): sub-label + segmented control + trailing allowance
 pub const CHOICE_ROW_H: f32 = SECTION_LABEL_H + SEGMENTED_H + SEGMENTED_GAP + CHOICE_ROW_TAIL;
-/// 代理输入框后的下隙[提示文字为框内占位，不另占行]
+/// Bottom gap after the proxy input field [the hint text is an in-field placeholder and
+/// takes no extra row]
 pub const PROXY_TAIL_GAP: f32 = 6.0;
-/// 配置管理按钮行高：按钮 28 + 行后 8
+/// Config-management button row height: button 28 + 8 after the row
 pub const BACKUP_ROW_H: f32 = BTN_H + 8.0;
-/// 关于区纯分隔（空标题）：rule 上隙 + 尾隙 6
+/// About section's bare divider (empty title): rule top gap + trailing gap 6
 pub const ABOUT_DIVIDER_H: f32 = SECTION_RULE_GAP + 6.0;
-/// 版本行高：按钮顶偏移 1 + 按钮 28 + 底部余量 1
+/// Version row height: button top offset 1 + button 28 + bottom allowance 1
 pub const VERSION_ROW_H: f32 = 1.0 + BTN_H + 1.0;
 
-/// 添加页输入行步进：标签 + 输入框 + 框后隙
+/// Add-page input row step: label + input field + post-field gap
 const ADD_ROW_STEP: f32 = SECTION_LABEL_H + INPUT_H + INPUT_GAP;
-/// 添加页：名称输入框顶部 y，「账号信息」标题 + 平台/类型两枚分段
-/// 控件 + 名称子标签的推导链和
+/// Add page: top y of the name input field — the sum of the derivation chain of the
+/// "Account details" title + the platform/type segmented
+/// controls + the name sub-label
 pub const ADD_NAME_Y: f32 =
     SETTINGS_EDGE_PAD + NAV_H + 4.0 * SECTION_LABEL_H + 2.0 * (SEGMENTED_H + SEGMENTED_GAP);
-/// 添加页：API Key 输入框顶部 y
+/// Add page: top y of the API Key input field
 pub const ADD_KEY_Y: f32 = ADD_NAME_Y + ADD_ROW_STEP;
-/// 添加页团队版：组织 ID 输入框顶部 y
+/// Add page, team edition: top y of the Organization ID input field
 pub const ADD_ORG_Y: f32 = ADD_KEY_Y + ADD_ROW_STEP;
-/// 添加页团队版：项目 ID 输入框顶部 y
+/// Add page, team edition: top y of the Project ID input field
 pub const ADD_PROJECT_Y: f32 = ADD_ORG_Y + ADD_ROW_STEP;
 
-/// caret 在输入框内垂直居中的偏移
+/// Vertical centering offset of the caret within the input field
 pub const CARET_Y_OFFSET: f32 = 5.0;
 
-/// 高峰起/止输入框 x，跟随各自文本标签右侧。
+/// Peak start/end input field x, following the right side of their own text labels.
 pub const PEAK_START_X: f32 = 48.0;
 pub const PEAK_END_X: f32 = 148.0;
 
-/// 设置页自定义间隔输入框顶 y，随账号块与错误行伸缩
+/// Settings page top y of the custom-interval input field; stretches with the account
+/// block and the error row
 pub fn interval_input_y(has_account: bool, auth_error: bool) -> f32 {
     let mut y = SETTINGS_EDGE_PAD + NAV_H + SECTION_LABEL_H;
-    // 有账号：卡片 + 可选错误行；随后常驻的添加按钮行。
+    // With an account: card + optional error row; then the always-visible add-account button row.
     y += if has_account {
         ACCOUNT_CARD_H + if auth_error { AUTH_ERROR_H } else { 0.0 } + ADD_BTN_ROW_H
     } else {
         ADD_BTN_ROW_H
     };
-    // 尾段：轮询区标题 + 分段体 + 段后隙。
+    // Tail: poll section title + segmented body + post-section gap.
     y + SECTION_RULE_H + SEGMENTED_H + SEGMENTED_GAP
 }
 
-/// 设置页高峰区间输入行顶 y，位于通知区之后
+/// Settings page top y of the peak-hours input row, after the notification section
 pub fn peak_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
-    // 展开自定义间隔时渲染链从 interval_input_y + CUSTOMIZE_EXTRA_H 续走；
-    // 未展开时分段控件返回值即 interval_input_y 本身，两态 y 流同点。
+    // With the custom interval expanded, the render chain continues from interval_input_y
+    // + CUSTOMIZE_EXTRA_H;
+    // when collapsed, the segmented control's return value is interval_input_y itself —
+    // the two states' y flows share the same point.
     let after_interval = if customizing { CUSTOMIZE_EXTRA_H } else { 0.0 };
     interval_input_y(has_account, auth_error)
         + after_interval
-        + SECTION_RULE_H // 通知区标题
-        + 3.0 * TOGGLE_ROW_H // 三个通知开关行
-        + SECTION_RULE_H // 高峰区间区标题
+        + SECTION_RULE_H // notification section title
+        + 3.0 * TOGGLE_ROW_H // three notification toggle rows
+        + SECTION_RULE_H // peak-hours section title
 }
 
-/// 设置页代理输入框顶 y：高峰区之后接通用区、网络区，续 peak_input_y 的链
+/// Settings page top y of the proxy input field: after the peak section come the general
+/// and network sections, continuing peak_input_y's chain
 pub fn proxy_input_y(has_account: bool, auth_error: bool, customizing: bool) -> f32 {
     peak_input_y(has_account, auth_error, customizing)
-        + INPUT_H + PEAK_TAIL_GAP // 高峰输入行
-        + SECTION_RULE_H // 通用区标题
-        + CHOICE_ROW_H // 语言行
-        + CHOICE_ROW_H // 外观行
-        + TOGGLE_ROW_PLAIN_H // 开机自启行
-        + SECTION_RULE_H // 网络代理区标题
-        + SECTION_LABEL_H // 代理子标签
+        + INPUT_H + PEAK_TAIL_GAP // peak input row
+        + SECTION_RULE_H // general section title
+        + CHOICE_ROW_H // language row
+        + CHOICE_ROW_H // appearance row
+        + TOGGLE_ROW_PLAIN_H // autostart row
+        + SECTION_RULE_H // network proxy section title
+        + SECTION_LABEL_H // proxy sub-label
 }
 
-/// 设置页总高（逻辑像素）：从代理输入框续走配置管理、关于、版本行收尾，
-/// 消除 view_height 里独立的整页求和。
+/// Settings page total height (logical pixels): continues from the proxy input field
+/// through the config-management, About, and version rows to finish,
+/// eliminating a separate whole-page sum inside view_height.
 pub fn settings_view_height(has_account: bool, auth_error: bool, customizing: bool) -> i32 {
     (proxy_input_y(has_account, auth_error, customizing)
-        + INPUT_H + PROXY_TAIL_GAP // 代理输入框
-        + SECTION_RULE_H + BACKUP_ROW_H // 配置管理区
-        + ABOUT_DIVIDER_H // 关于区纯分隔
-        + VERSION_ROW_H // 版本行
-        + SETTINGS_EDGE_PAD) as i32 // 底部余量
+        + INPUT_H + PROXY_TAIL_GAP // proxy input field
+        + SECTION_RULE_H + BACKUP_ROW_H // config management section
+        + ABOUT_DIVIDER_H // About section bare divider
+        + VERSION_ROW_H // version row
+        + SETTINGS_EDGE_PAD) as i32 // bottom allowance
 }
 
-/// 添加页总高（逻辑像素）
+/// Add page total height (logical pixels).
 ///
-/// 底链 = 末行输入框 + 保存按钮 + 底部余量；团队版末行是项目
-/// ID 框，非团队是 KEY 框。
+/// Tail chain = last input row + save button + bottom allowance; for the team edition the
+/// last row is the Project
+/// ID field, otherwise the KEY field.
 pub fn add_page_height(team: bool) -> i32 {
     let y = if team {
         ADD_PROJECT_Y + INPUT_H + 12.0
@@ -223,9 +284,11 @@ pub fn add_page_height(team: bool) -> i32 {
     (y + SAVE_BTN_H + 10.0) as i32
 }
 
-/// 主视图总高（逻辑像素）：加载/失败态固定高；数据态由上方主视图段
-/// 常量链求和，与 draw_main 的 y 推进同源——两侧同引一组常量，几何改动
-/// 不再可能出现绘制侧与高度公式各改一半的漂移。
+/// Main view total height (logical pixels): fixed height for the loading/failure states;
+/// the data state sums the main-view
+/// section-constant chain above, sharing its source with draw_main's y advance —
+/// both sides reference the same set of constants, so geometry changes
+/// can no longer drift by updating only one half of the drawing side and the height formula.
 pub fn main_view_height(
     has_data: bool,
     rows: usize,
@@ -234,7 +297,7 @@ pub fn main_view_height(
     has_balance: bool,
 ) -> i32 {
     if !has_data {
-        return 300;
+        return EMPTY_VIEW_H as i32;
     }
     (MAIN_TOP_PAD
         + MAIN_TOPBAR_H
@@ -246,7 +309,16 @@ pub fn main_view_height(
         + MAIN_TAIL_H) as i32
 }
 
-/// 钉位回归：期望值由渲染 y 链推导而来，布局改动须同步更新
+/// Single derivation source for the main-view height from a snapshot:
+/// Panel::sync_derived's height computation shares it, composed here beside
+/// main_view_height so the height chain lives in one layer.
+pub fn main_height_of(snap: Option<&crate::api::UsageSnapshot>) -> i32 {
+    let (rows, comp, stats, bal) = crate::api::main_features(snap);
+    main_view_height(snap.is_some(), rows, comp, stats, bal)
+}
+
+/// Pinned regressions: expected values derive from the render y chain;
+/// layout changes must update them in sync
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,7 +357,8 @@ mod tests {
 
     #[test]
     fn token_card_geometry_pinned() {
-        // 期望值由面板宽 340 与渲染带推导，几何改动须同步更新
+        // Expected values derive from the 340 panel width and the render bands;
+        // geometry changes must update them in sync
         assert_eq!(TOKEN_CARD_W, 92.0);
         assert_eq!(TOKEN_CARD_H, 60.0);
         assert_eq!(TOKEN_CARD_LABEL_Y, 36.0);
@@ -299,7 +372,7 @@ mod tests {
         assert_eq!(main_view_height(true, 3, false, false, true), 338);
         assert_eq!(main_view_height(true, 3, false, true, true), 436);
         assert_eq!(main_view_height(true, 2, false, true, false), 346);
-        // MCP 构成区：无数据明细时零增量，有则 +52
+        // MCP composition area: zero delta without data details, +52 with them
         assert_eq!(main_view_height(true, 3, true, false, false), 352);
         assert_eq!(main_view_height(true, 1, true, false, false), 248);
     }

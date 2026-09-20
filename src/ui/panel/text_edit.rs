@@ -1,19 +1,21 @@
-//! 单行文本编辑状态机
-//! 词边界与移动规则移植自 egui 的 text_selection（MIT OR Apache-2.0,
-//! Copyright egui contributors），按单行与 Windows 键位裁剪。
+//! Single-line text edit state machine
+//! Word boundary and movement rules ported from egui's text_selection
+//! (MIT OR Apache-2.0, Copyright egui contributors), trimmed for single
+//! line and Windows key bindings.
 
-/// 光标与选区状态；`caret` 与 `anchor` 相等即无选区
+/// Caret and selection state; `caret` equal to `anchor` means no selection
 #[derive(Debug, Clone, Default)]
 pub struct EditState {
-    /// 光标位置（char 位次）
+    /// Caret position (char index)
     pub caret: usize,
-    /// 选区锚点（Shift 移动时不动的端点，char 位次）
+    /// Selection anchor (the endpoint that stays put during Shift moves, char index)
     pub anchor: usize,
-    /// 撤销栈：(文本, caret, anchor)；栈顶为最近一次可撤销快照
+    /// Undo stack: (text, caret, anchor); the top is the most recent undoable snapshot
     history: Vec<(String, usize, usize)>,
-    /// 重做栈：撤销后可前进的快照
+    /// Redo stack: snapshots to move forward through after an undo
     future: Vec<(String, usize, usize)>,
-    /// 快照是否来自连续键入；连续键入合并为一次撤销步
+    /// Whether the last snapshot came from continuous typing; consecutive typing merges
+    /// into one undo step
     last_typing: bool,
 }
 
@@ -22,13 +24,13 @@ impl EditState {
         *self = Self::default();
     }
 
-    /// 光标落文本末尾（聚焦新字段时的落点）
+    /// Place the caret at the end of the text (the landing spot when focusing a new field)
     pub fn caret_to_end(&mut self, text: &str) {
         self.caret = text.chars().count();
         self.anchor = self.caret;
     }
 
-    /// 非空选区（排序后起止）；无选区返回 None
+    /// Non-empty selection (sorted start/end); returns None when there is no selection
     pub fn selection(&self) -> Option<(usize, usize)> {
         if self.caret == self.anchor {
             None
@@ -39,7 +41,8 @@ impl EditState {
         }
     }
 
-    /// 左移：词/字符；extend=true 扩展选区；无 extend 且有选区时先折叠到选区头
+    /// Move left: by word/char; extend=true extends the selection; without extend and
+    /// with a selection, first collapse to the selection head
     pub fn move_left(&mut self, text: &str, word: bool, extend: bool) {
         if !extend && self.selection().is_some() {
             self.place(
@@ -56,7 +59,8 @@ impl EditState {
         self.place(to, extend);
     }
 
-    /// 右移：词/字符；extend 语义同 move_left，折叠时落到选区尾
+    /// Move right: by word/char; extend semantics as in move_left,
+    /// collapsing lands on the selection tail
     pub fn move_right(&mut self, text: &str, word: bool, extend: bool) {
         if !extend && self.selection().is_some() {
             self.place(
@@ -73,23 +77,23 @@ impl EditState {
         self.place(to, extend);
     }
 
-    /// 行首（单行即全部文本首）
+    /// Line start (for a single line, the start of all text)
     pub fn move_home(&mut self, extend: bool) {
         self.place(0, extend);
     }
 
-    /// 行尾（单行即全部文本尾）
+    /// Line end (for a single line, the end of all text)
     pub fn move_end(&mut self, text: &str, extend: bool) {
         self.place(text.chars().count(), extend);
     }
 
-    /// 全选：锚点归零、光标归尾
+    /// Select all: anchor to zero, caret to the end
     pub fn select_all(&mut self, text: &str) {
         self.anchor = 0;
         self.caret = text.chars().count();
     }
 
-    /// 移动到指定位次（鼠标点击定位用）；extend=true 扩展选区
+    /// Move to a given index (for mouse click positioning); extend=true extends the selection
     pub fn place(&mut self, pos: usize, extend: bool) {
         self.caret = pos;
         if !extend {
@@ -98,8 +102,10 @@ impl EditState {
         self.last_typing = false;
     }
 
-    /// 键入字符：有选区先删选区再插入；连续键入合并为一步撤销。
-    /// 字节预算先验——删选区后仍放不下则整体放弃，选区保持原状
+    /// Type a character: delete the selection first if any, then insert;
+    /// consecutive typing merges into one undo step.
+    /// Byte budget checked up front — if it still does not fit after
+    /// deleting the selection, abandon entirely and keep the selection as-is
     pub fn insert(&mut self, text: &mut String, ch: char, max_bytes: usize) {
         let after_del = match self.selection() {
             Some((a, b)) => text.len() - (byte_at(text, b) - byte_at(text, a)),
@@ -116,9 +122,11 @@ impl EditState {
         self.anchor = self.caret;
     }
 
-    /// 粘贴：过滤控制字符，替换选区，整段为一步撤销。
-    /// 与 insert 同做字节预算先验——删选区后一个字符都放不下则
-    /// 整体放弃，不产生空转的撤销步
+    /// Paste: filter control characters, replace the selection, the whole
+    /// rung is one undo step.
+    /// Byte budget checked up front as in insert — if not even one character
+    /// fits after deleting the selection, abandon entirely rather than
+    /// producing a no-op undo step
     pub fn paste(&mut self, text: &mut String, s: &str, max_bytes: usize) {
         let clean: String = s.chars().filter(|c| !c.is_control()).collect();
         if clean.is_empty() {
@@ -150,7 +158,7 @@ impl EditState {
         self.anchor = self.caret;
     }
 
-    /// 退格：有选区删选区；word=true 删前一个词
+    /// Backspace: with a selection, delete it; word=true deletes the previous word
     pub fn backspace(&mut self, text: &mut String, word: bool) {
         if self.selection().is_none() {
             let from = if word {
@@ -171,7 +179,7 @@ impl EditState {
         }
     }
 
-    /// 前向删除：word=true 删后一个词
+    /// Forward delete: word=true deletes the next word
     pub fn delete(&mut self, text: &mut String, word: bool) {
         if self.selection().is_none() {
             let n = text.chars().count();
@@ -192,7 +200,7 @@ impl EditState {
         }
     }
 
-    /// 剪切：删选区并返回其内容
+    /// Cut: delete the selection and return its content
     pub fn cut(&mut self, text: &mut String) -> Option<String> {
         let (a, b) = self.selection()?;
         let out = slice_chars(text, a, b).to_string();
@@ -203,13 +211,14 @@ impl EditState {
         Some(out)
     }
 
-    /// 复制选区内容
+    /// Copy the selection content
     pub fn copy<'a>(&self, text: &'a str) -> Option<&'a str> {
         let (a, b) = self.selection()?;
         Some(slice_chars(text, a, b))
     }
 
-    /// 撤销：恢复最近一步快照，当前状态入重做栈；无快照不动
+    /// Undo: restore the most recent snapshot, push the current state onto the redo
+    /// stack; no-op without a snapshot
     pub fn undo(&mut self, text: &mut String) {
         let Some(snap) = self.history.pop() else {
             return;
@@ -222,7 +231,8 @@ impl EditState {
         self.last_typing = false;
     }
 
-    /// 重做：恢复最近一步重做快照，当前状态入撤销栈；无快照不动
+    /// Redo: restore the most recent redo snapshot, push the current state onto the undo
+    /// stack; no-op without a snapshot
     pub fn redo(&mut self, text: &mut String) {
         let Some(snap) = self.future.pop() else {
             return;
@@ -235,7 +245,7 @@ impl EditState {
         self.last_typing = false;
     }
 
-    /// 删除选区（若有）；返回是否发生了删除
+    /// Delete the selection (if any); returns whether a deletion happened
     fn delete_selection(&mut self, text: &mut String) -> bool {
         if let Some((a, b)) = self.selection() {
             delete_range(text, a, b);
@@ -247,8 +257,10 @@ impl EditState {
         }
     }
 
-    /// 修改前压「操作前快照」；连续键入只保留最早一步。栈深上限 64，
-    /// 溢出淘汰最旧——truncate 会丢刚压入的最新步，溢出后首次 undo 跨两步
+    /// Push a "pre-operation snapshot" before modification; consecutive
+    /// typing keeps only the earliest step. Stack depth caps at 64, overflow
+    /// evicts the oldest — truncate would drop the just-pushed newest step,
+    /// making the first undo after overflow span two steps
     fn begin_edit(&mut self, text: &str, typing: bool) {
         if typing && self.last_typing {
             self.future.clear();
@@ -264,15 +276,15 @@ impl EditState {
     }
 }
 
-// ── 词边界 ─────────────────────────────────────────────
+// ── Word boundaries ─────────────────────────────────────────────
 
-/// 下一个词边界（char 位次）
+/// Next word boundary (char index)
 pub fn next_word_boundary(text: &str, caret: usize) -> usize {
     let mut current = 0usize;
     for word in split_word_bounds(text) {
         let word_ci = current;
         let mut n = 0usize;
-        // `.` 视作词边界，与编辑器/浏览器的行为一致
+        // `.` counts as a word boundary, consistent with editors/browsers
         for chr in word.chars() {
             let dot_ci = word_ci + n;
             if chr == '.' && caret < dot_ci {
@@ -280,8 +292,10 @@ pub fn next_word_boundary(text: &str, caret: usize) -> usize {
             }
             n += 1;
         }
-        // 光标在前、下一个分段是空白/标点时停在该段段首（即前一词词尾）；
-        // 分段全为词字符则越过继续，' abc' 从 0 一路落到 abc 之后
+        // When the caret is before a whitespace/punctuation segment, stop at
+        // that segment's head (i.e. the previous word's tail); when the
+        // segment is all word characters, skip past it — ' abc' goes from 0
+        // all the way to after abc
         if caret < word_ci && !word.chars().all(is_word_char) {
             return word_ci;
         }
@@ -290,7 +304,7 @@ pub fn next_word_boundary(text: &str, caret: usize) -> usize {
     current
 }
 
-/// 上一个词边界（char 位次）
+/// Previous word boundary (char index)
 pub fn prev_word_boundary(text: &str, caret: usize) -> usize {
     let num_chars = text.chars().count();
     let reversed: String = text.chars().rev().collect();
@@ -303,8 +317,9 @@ fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
 
-/// `pos` 所在词段的位次区间（UAX#29 分段，双击选词用）；
-/// pos 越过末尾返回零宽，落在分段间则取该段自身
+/// Index range of the word segment containing `pos` (UAX#29 segmentation,
+/// used by double-click word selection); pos past the end returns a
+/// zero-width range, landing between segments takes that segment itself
 pub fn word_range_at(text: &str, pos: usize) -> (usize, usize) {
     let mut cur = 0usize;
     for word in split_word_bounds(text) {
@@ -322,7 +337,7 @@ fn split_word_bounds(text: &str) -> impl Iterator<Item = &str> {
     text.split_word_bounds()
 }
 
-// ── char/byte 互转与按位次切片 ────────────────────────────────────
+// ── char/byte conversion and slicing by index ────────────────────────────────────
 
 fn byte_at(text: &str, char_index: usize) -> usize {
     for (ci, (bi, _)) in text.char_indices().enumerate() {
@@ -360,7 +375,8 @@ mod tests {
     #[test]
     fn word_bounds_ascii() {
         let t = "hello world";
-        // 空格归入后词，从词内跳到词尾；再跳越过空格落词尾
+        // The space belongs to the following word: from inside a word,
+        // jump to the word tail; jumping again skips the space and lands on the next word tail
         assert_eq!(next_word_boundary(t, 0), 5);
         assert_eq!(next_word_boundary(t, 5), 11);
         assert_eq!(prev_word_boundary(t, 11), 6);
@@ -371,7 +387,8 @@ mod tests {
     #[test]
     fn word_bounds_dot_is_boundary() {
         let t = "www.example.com";
-        // `.` 视作词边界：词尾即停，点前点后各成一步
+        // `.` counts as a word boundary: stops right at the word tail; before and after
+        // the dot are separate steps
         assert_eq!(next_word_boundary(t, 0), 3);
         assert_eq!(next_word_boundary(t, 3), 11);
         assert_eq!(prev_word_boundary(t, 15), 12);
@@ -391,14 +408,14 @@ mod tests {
         assert_eq!(word_range_at(t, 2), (0, 3));
         assert_eq!(word_range_at(t, 4), (4, 8)); // two3
         assert_eq!(word_range_at(t, 9), (9, 13)); // four
-        assert_eq!(word_range_at(t, 3), (3, 4)); // 空格分段
+        assert_eq!(word_range_at(t, 3), (3, 4)); // space segment
     }
 
     #[test]
     fn insert_replaces_selection() {
         let mut t = "abc".to_string();
         let mut e = es(3);
-        e.anchor = 1; // 选 [1,3) = "bc"
+        e.anchor = 1; // selection [1,3) = "bc"
         e.insert(&mut t, 'X', 128);
         assert_eq!(t, "aX");
         assert_eq!(e.caret, 2);
@@ -430,13 +447,13 @@ mod tests {
     #[test]
     fn move_with_selection_collapses() {
         let mut e = es(3);
-        e.anchor = 0; // 选 [0,3)
+        e.anchor = 0; // selection [0,3)
         e.move_left("abc", false, false);
-        assert_eq!(e.caret, 0); // 折到选区头
+        assert_eq!(e.caret, 0); // collapses to the selection head
         e.anchor = 3;
         e.caret = 0;
         e.move_right("abc", false, false);
-        assert_eq!(e.caret, 3); // 折到选区尾
+        assert_eq!(e.caret, 3); // collapses to the selection tail
     }
 
     #[test]

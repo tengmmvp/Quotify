@@ -1,51 +1,53 @@
-//! 面板主题
+//! Panel theme
 
-/// 外观模式
+/// Appearance mode
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
     Light,
     Dark,
 }
 
-/// 深浅色自适应的主题 token 集合
+/// Theme token set adaptive to light/dark
 pub struct Theme {
-    /// 面板背景
+    /// Panel background
     pub bg: [f32; 4],
-    /// 主文本
+    /// Primary text
     pub text_primary: [f32; 4],
-    /// 次要文本
+    /// Secondary text
     pub text_secondary: [f32; 4],
-    /// 弱文本 / 标签
+    /// Weak text / labels
     pub text_tertiary: [f32; 4],
-    /// hairline 边框与分隔线
+    /// Hairline borders and dividers
     pub border: [f32; 4],
-    /// 进度轨道 / 次级按钮填充
+    /// Progress track / secondary button fill
     pub track: [f32; 4],
-    /// 文字强调色 Ember
+    /// Ember accent color for text
     pub accent: [f32; 4],
-    /// 主按钮填充
+    /// Primary button fill
     pub action: [f32; 4],
-    /// 主按钮文字
+    /// Primary button text
     pub action_text: [f32; 4],
-    /// 档位色：正常 Forest / 危险 Crimson
+    /// Tier colors: Forest for normal / Crimson for danger
     pub ok: [f32; 4],
     pub danger: [f32; 4],
-    /// 峰谷提示琥珀黄
+    /// Amber for the peak-hours hint
     pub peak: [f32; 4],
-    /// logo 磁贴底色，与主按钮同源
+    /// Logo tile base color, sharing the source with the primary button
     pub logo_tile: [f32; 4],
-    /// 卡片描边
+    /// Card stroke
     pub card_border: [f32; 4],
 }
 
 pub const PANEL_WIDTH: i32 = 340;
-/// 控件级圆角
+/// Control-level corner radius
 pub const RADIUS: f32 = 4.0;
-/// 卡片级圆角
+/// Card-level corner radius
 pub const CARD_RADIUS: f32 = 6.0;
 
-/// 配置外观字符串的显式值：Some 为显式 light/dark，None 为跟随系统；
-/// 先 trim 再忽略大小写，是字面量解析的唯一事实源，控件高亮与生效同引。
+/// Explicit value of the configured appearance string: Some means an explicit light/dark,
+/// None means follow the system;
+/// trims first then ignores case — the single source of truth for literal parsing,
+/// shared by the control highlighting and the effective value.
 pub fn explicit_appearance(setting: Option<&str>) -> Option<Appearance> {
     match setting.map(str::trim) {
         Some(s) if s.eq_ignore_ascii_case("light") => Some(Appearance::Light),
@@ -54,9 +56,18 @@ pub fn explicit_appearance(setting: Option<&str>) -> Option<Appearance> {
     }
 }
 
-/// 解析配置为实际外观：显式优先，未配置/未知跟随系统。
+/// Resolves the config into the effective appearance: explicit wins; unconfigured/unknown
+/// follows the system, and a failed system read falls back to light.
 pub fn resolved(setting: Option<&str>) -> Appearance {
-    explicit_appearance(setting).unwrap_or_else(Theme::system_appearance)
+    resolved_checked(setting).unwrap_or(Appearance::Light)
+}
+
+/// Same resolution with the read-failure case surfaced: None only when
+/// following the system and the registry read failed — callers that can
+/// keep their previous value (apply_appearance) use this so a transient
+/// read failure never flips the theme.
+pub fn resolved_checked(setting: Option<&str>) -> Option<Appearance> {
+    explicit_appearance(setting).or_else(system_appearance)
 }
 
 fn rgba(r: u8, g: u8, b: u8, a: f32) -> [f32; 4] {
@@ -100,17 +111,20 @@ impl Theme {
             },
         }
     }
+}
 
-    /// 检测系统外观
-    pub fn system_appearance() -> Appearance {
-        let val = windows_registry::CURRENT_USER
-            .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-            .and_then(|k| k.get_u32("AppsUseLightTheme"))
-            .unwrap_or(1);
-        if val == 1 {
-            Appearance::Light
-        } else {
-            Appearance::Dark
-        }
-    }
+/// Detects the system appearance; None on a registry read failure so
+/// callers can keep their last applied value instead of flipping.
+pub fn system_appearance() -> Option<Appearance> {
+    windows_registry::CURRENT_USER
+        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
+        .and_then(|k| k.get_u32("AppsUseLightTheme"))
+        .ok()
+        .map(|val| {
+            if val == 1 {
+                Appearance::Light
+            } else {
+                Appearance::Dark
+            }
+        })
 }

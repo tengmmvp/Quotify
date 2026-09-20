@@ -1,4 +1,4 @@
-//! 账号切换弹窗
+//! Account switcher popup
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -12,13 +12,14 @@ use crate::ui::panel::{dpi_of, monitor_info};
 
 const POPUP_WND_CLASS: &str = "QuotifyAccountPopup";
 
-/// 账号切换弹窗
+/// Account switcher popup
 pub struct AccountPopup {
     pub wnd: FloatWnd,
-    /// 宿主面板：开合时联动重绘其 chevron。
+    /// Host panel: its chevron is repainted in linkage on open/close.
     panel: Option<HWND>,
-    /// 监视器派生缓存：(句柄, dpi, 工作区)；面板换屏自动失效，
-    /// 显示配置与 DPI 变更由失效钩子处理
+    /// Monitor-derived cache: (handle, dpi, work area); invalidated automatically when
+    /// the panel changes monitors,
+    /// with display-configuration and DPI changes handled by the invalidation hook
     monitor: Option<(HMONITOR, f32, RECT)>,
 }
 
@@ -35,33 +36,37 @@ impl AccountPopup {
         self.wnd.is_open()
     }
 
-    /// 显示配置或 DPI 变更后失效派生缓存，下次对位重取
+    /// Invalidates the derived cache after a display-configuration or DPI change;
+    /// the next positioning re-queries
     pub fn invalidate_monitor(&mut self) {
         self.monitor = None;
     }
 
-    /// 面板左侧弹出
-    /// 贴近触发按钮定位，越出工作区左界改放右侧，纵向以面板顶对齐并
-    /// 夹回工作区。
+    /// Pops out to the left of the panel.
+    /// Positioned next to the trigger button; if it would cross the work area's left edge
+    /// it is placed on the right instead, aligned with the panel's top vertically and
+    /// clamped back into the work area.
     pub fn open(&mut self, tray: HWND, panel_hwnd: HWND, accounts: usize) {
         let was_open = self.is_open();
-        // 点击不激活：前台留在面板，跑马灯不因点弹窗而冻结。
+        // Clicks do not activate: the foreground stays on the panel, so
+        // the marquee does not freeze from clicking the popup.
         let Some(h) =
             self.wnd
                 .ensure_window(tray, POPUP_WND_CLASS, Some(popup_wndproc), "账号弹窗", true)
         else {
             return;
         };
-        // 状态记录与面板重绘先于 show_at：其 SW_SHOW 同步重入消息泵，
-        // 泵后不得再用本引用。
+        // State recording and the panel repaint go before show_at:
+        // its SW_SHOW synchronously reenters the message pump,
+        // and this reference must not be used after the pump.
         self.panel = Some(panel_hwnd);
         if !was_open {
             self.repaint_panel();
         }
         unsafe {
             let monitor = MonitorFromWindow(panel_hwnd, MONITOR_DEFAULTTONEAREST);
-            // 派生缓存命中免 dpi 与工作区两次查询：拖动与高度动画的
-            // 高频重对位只重取面板矩形。
+            // A derived-cache hit spares the dpi and work-area queries: the high-frequency
+            // repositioning during dragging and the height animation re-fetches only the panel rectangle.
             let (dpi, work) = match self.monitor {
                 Some((m, dpi, work)) if m == monitor => (dpi, work),
                 _ => {
@@ -75,12 +80,13 @@ impl AccountPopup {
             let mut pr = RECT::default();
             let _ = GetWindowRect(panel_hwnd, &mut pr);
 
-            let w = (view::POPUP_W * dpi).round() as i32;
-            let hgt = (view::popup_height(accounts) as f32 * dpi).round() as i32;
-            let gap = (8.0 * dpi).round() as i32;
+            let w = self.wnd.pxf(view::POPUP_W);
+            let hgt = self.wnd.pxf(view::popup_height(accounts) as f32);
+            let gap = self.wnd.pxf(8.0);
             let mut x = pr.left - w - gap;
             if x < work.left {
-                // 右侧回退同样夹回左界：极窄工作区下宁与面板重叠不出屏。
+                // The right-side fallback is clamped to the left edge as well:
+                // on an extremely narrow work area, overlapping the panel beats leaving the screen.
                 x = (pr.right + gap).min(work.right - w).max(work.left);
             }
             let y = pr.top.clamp(work.top, (work.bottom - hgt).max(work.top));
@@ -91,14 +97,14 @@ impl AccountPopup {
 
     pub fn close(&mut self) {
         let was_open = self.is_open();
-        // 重绘标记先于隐藏：隐藏持捕获窗口会重入消息泵。
+        // The repaint flag goes before hiding: hiding a window that holds capture reenters the message pump.
         if was_open {
             self.repaint_panel();
         }
         self.wnd.close();
     }
 
-    /// 开合联动面板重绘：chevron 随弹窗可见性翻转。
+    /// Panel repaint linked to open/close: the chevron flips with the popup's visibility.
     fn repaint_panel(&self) {
         if let Some(p) = self.panel {
             unsafe {
@@ -107,7 +113,7 @@ impl AccountPopup {
         }
     }
 
-    /// 已开时随面板几何重对位，未开不动。
+    /// Repositions with the panel geometry when open; does nothing when closed.
     pub fn reposition(&mut self, tray: HWND, panel_hwnd: HWND, accounts: usize) {
         if self.is_open() {
             self.open(tray, panel_hwnd, accounts);
@@ -115,7 +121,8 @@ impl AccountPopup {
     }
 }
 
-/// 弹窗的窗口过程：公共臂走 float_wndproc，差异点由 FloatKind::Popup 注入。
+/// The popup's window procedure: common arms go through float_wndproc,
+/// with the divergence points injected by FloatKind::Popup.
 pub extern "system" fn popup_wndproc(
     hwnd: HWND,
     msg: u32,

@@ -1,15 +1,16 @@
-//! 展示格式化
+//! Display formatting
 
 use chrono::{DateTime, Local, Utc};
 
 use crate::ui::i18n::Lang;
 
-/// 缺失值占位符
+/// Placeholder for missing values
 pub const MISSING: &str = "—";
 
-/// 大数字紧凑缩写
+/// Compact abbreviation for large numbers.
 ///
-/// ≥1000 缩为 k/M/B 保留一位小数，跨档进位升后缀。
+/// Values ≥1000 shrink to k/M/B with one decimal place; crossing a tier boundary promotes
+/// the suffix.
 pub fn compact_number(v: f64) -> String {
     let (mut num, unit) = compact_number_split(v);
     if !unit.is_empty() {
@@ -18,9 +19,10 @@ pub fn compact_number(v: f64) -> String {
     num
 }
 
-/// 分离式大数字紧凑缩写
+/// Split compact abbreviation for large numbers.
 ///
-/// 数字与单位分离返回，卡片排版用大数字配小单位。
+/// Returns the number and the unit separately so card layouts can pair a big number with
+/// a small unit.
 pub fn compact_number_split(v: f64) -> (String, &'static str) {
     if !v.is_finite() {
         return ("0".to_string(), "");
@@ -37,7 +39,8 @@ pub fn compact_number_split(v: f64) -> (String, &'static str) {
         (1e3, "k")
     };
     let mut s = format!("{:.1}", v / div);
-    // 进位跨档：按绝对值判定，负值同升档，不出 "1000k"/"1000M"。
+    // Carry across tiers: decided by absolute value, so negatives promote too —
+    // never produces "1000k"/"1000M".
     if suffix != "B" && s.parse::<f64>().is_ok_and(|n| n.abs() >= 1000.0) {
         div *= 1000.0;
         suffix = if suffix == "k" { "M" } else { "B" };
@@ -47,20 +50,20 @@ pub fn compact_number_split(v: f64) -> (String, &'static str) {
     (s, suffix)
 }
 
-/// 百分比显示
+/// Percentage display
 pub fn percent(p: f64) -> String {
     let clamped = p.clamp(0.0, 999.0);
     format!("{}%", clamped.round() as i64)
 }
 
-/// 重置倒计时
+/// Reset countdown
 pub fn countdown(until: DateTime<Utc>, lang: Lang) -> String {
     countdown_from(until, Utc::now(), lang)
 }
 
-/// 倒计时主体
+/// Countdown core.
 ///
-/// 时间源注入解耦，供测试钉位。
+/// The time source is injected for decoupling, so tests can pin it.
 fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> String {
     let s = i18n_units(lang);
     let u = |unit: &str| -> String {
@@ -89,19 +92,36 @@ fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> Strin
     }
 }
 
-/// 页脚「数据更新」文案
+/// Elapsed-minute bucket of a millisecond delta: the single source shared
+/// by the footer text's minute tier and the footer cache key — ago() buckets
+/// whole elapsed seconds / 60, and the key must floor the identical way or
+/// a cached footer keeps the previous tier's copy up to a minute late.
+pub(crate) fn elapsed_minutes(delta_ms: i64) -> i64 {
+    delta_ms.div_euclid(60_000)
+}
+
+/// Footer "data updated" text.
 ///
-/// 60 秒内「刚刚更新」，否则相对时长；换装动画的 old_text 与静态
-/// 页脚共用本函数，防两份实现漂移致动画起点错。
+/// "Just updated" is exactly elapsed-minutes bucket 0 — the same boundary
+/// function as the footer cache key, so the copy tier and the key switch
+/// land on the same tick and a cached footer never keeps the previous
+/// tier's copy; the swap animation's old_text and the static footer share
+/// this function, so the two implementations cannot drift and misplace the
+/// animation start.
 pub fn updated_text(s: &crate::ui::i18n::Strings, lang: Lang, at: DateTime<Local>) -> String {
-    if (Local::now() - at).num_seconds() < 60 {
+    // Clamped at zero: a wall-clock step back (NTP correction) leaves the
+    // snapshot stamped in the future — a negative bucket would read as -1
+    // minutes and fall through to "1m ago"; zero keeps "just updated"
+    // until wall time passes the stamp, matching ago()'s own clamp.
+    let delta_ms = (Local::now() - at).num_milliseconds().max(0);
+    if elapsed_minutes(delta_ms) == 0 {
         s.updated_just_now.to_string()
     } else {
         s.updated_ago.replace("{t}", &ago(at, lang))
     }
 }
 
-/// 更新时间脚注用的距今时长短表述
+/// Short elapsed-time phrasing for the updated-time footnote
 pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
     let secs = (Local::now() - at).num_seconds().clamp(0, i64::MAX);
     match lang {
@@ -126,7 +146,7 @@ pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
     }
 }
 
-/// 倒计时单位文案
+/// Countdown unit strings
 struct Units {
     day: &'static str,
     hour: &'static str,
@@ -134,7 +154,7 @@ struct Units {
     second: &'static str,
 }
 
-/// 按语言取倒计时单位文案
+/// Gets the countdown unit strings for the language
 fn i18n_units(lang: Lang) -> Units {
     let s = lang.strings();
     Units {
@@ -149,6 +169,19 @@ fn i18n_units(lang: Lang) -> Units {
 mod tests {
     use super::*;
 
+    /// The minute bucket must agree with ago()'s text tiering (whole
+    /// elapsed seconds / 60): the footer cache key derives from this, and a
+    /// disagreement caches a stale tier's copy.
+    #[test]
+    fn elapsed_minutes_matches_text_bucket() {
+        for &delta in &[
+            0i64, 59_999, 60_000, 60_001, 119_999, 120_000, 3_599_999, 3_600_000,
+        ] {
+            let secs = delta / 1000; // num_seconds truncation for non-negative deltas
+            assert_eq!(elapsed_minutes(delta), secs / 60, "delta {delta}");
+        }
+    }
+
     #[test]
     fn compact() {
         assert_eq!(compact_number(87.0), "87");
@@ -158,14 +191,15 @@ mod tests {
         assert_eq!(compact_number(3_400_000_000.0), "3.4B");
         assert_eq!(compact_number(1200.0), "1.2k");
         assert_eq!(compact_number(999.0), "999");
-        // 进位跨档：后缀随之升档，不出 "1000k"/"1000M"
+        // Carry across tiers: the suffix promotes with it, never producing "1000k"/"1000M"
         assert_eq!(compact_number(999_960.0), "1M");
         assert_eq!(compact_number(999_950_000.0), "1B");
-        // 负值按绝对值同升档
+        // Negatives promote by absolute value as well
         assert_eq!(compact_number(-4233.0), "-4.2k");
         assert_eq!(compact_number(-999_960.0), "-1M");
         assert_eq!(compact_number(-999_950_000.0), "-1B");
-        // 非有限值归零：饱和转换会产出 19 位整数撑爆卡片
+        // Non-finite values fall back to zero: a saturated cast would produce a 19-digit
+        // integer and blow up the card
         assert_eq!(compact_number(f64::INFINITY), "0");
         assert_eq!(compact_number(f64::NAN), "0");
     }
@@ -190,7 +224,7 @@ mod tests {
         assert_eq!(countdown_from(t, now, zh), "2 小时 13 分钟");
         let t = now + chrono::Duration::days(3);
         assert_eq!(countdown_from(t, now, zh), "3 天");
-        // 已过期 → 0 秒，不出现负数
+        // Already expired → 0 seconds, never negative
         assert_eq!(
             countdown_from(now - chrono::Duration::minutes(5), now, zh),
             "0 秒"

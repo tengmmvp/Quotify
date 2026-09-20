@@ -1,4 +1,4 @@
-//! 托盘图标
+//! Tray icon
 
 use std::ffi::c_void;
 
@@ -7,11 +7,26 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, DestroyIcon, HICON, ICONINFO};
 
-/// 图标最小边长（px）
+/// Minimum icon edge length (px)
 const MIN_PX: i32 = 16;
 
-/// 从嵌入资源加载指定尺寸的独立图标句柄，取 assets/icon.ico 的对应层，
-/// 由调用方销毁；不带 LR_SHARED——共享句柄归系统，销毁会破坏共享缓存
+/// Physical-pixel size of the tray icon: twice the small-icon metric,
+/// with the floor sharing the same source as MIN_PX.
+/// The icon content key and the bitmap build share this value.
+pub(crate) fn tray_px() -> i32 {
+    unsafe {
+        windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(
+            windows::Win32::UI::WindowsAndMessaging::SM_CXSMICON,
+        )
+    }
+    .max(MIN_PX)
+        * 2
+}
+
+/// Loads an owned icon handle at the given size from the embedded resource,
+/// taking the matching layer of assets/icon.ico;
+/// the caller destroys it. No LR_SHARED — shared handles belong to the system, and
+/// destroying one would corrupt the shared cache
 pub fn resource_icon(px: i32) -> Option<HICON> {
     let hinst = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None).ok()? };
     #[allow(clippy::manual_dangling_ptr)]
@@ -30,7 +45,7 @@ pub fn resource_icon(px: i32) -> Option<HICON> {
     }
 }
 
-/// 加载嵌入资源中的应用图标
+/// Loads the app icon from the embedded resource
 pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
     #[allow(clippy::manual_dangling_ptr)]
     let resid = 1usize as *const u16;
@@ -49,19 +64,25 @@ pub fn app_icon(hinst: windows::Win32::Foundation::HINSTANCE) -> Option<HICON> {
     }
 }
 
-/// 用量档位颜色
+/// Critical usage threshold (percent): shared by the tray icon's red tier and
+/// the panel's red text and red bar
+pub(crate) const CRITICAL_PCT: f64 = 90.0;
+
+/// Usage tier colors
 fn tier_color(used_percent: f64) -> (u8, u8, u8) {
     if used_percent < 70.0 {
         (0x34, 0xC7, 0x59) // systemGreen
-    } else if used_percent < 90.0 {
+    } else if used_percent < CRITICAL_PCT {
         (0xFF, 0x9F, 0x0A) // systemOrange
     } else {
         (0xFF, 0x45, 0x3A) // systemRed
     }
 }
 
-/// Q 字轮廓三件（30×30 网格）：外环、内环、尾部斜杠；面板 D2D 路径与
-/// 托盘像素图标共用，几何与 assets/icon.svg 同源，改动两处同步
+/// The three pieces of the Q outline (30×30 grid): outer ring, inner ring, and
+/// tail slash; shared by the panel's D2D path and
+/// the tray pixel icon. The geometry shares its source with assets/icon.svg;
+/// keep both sides in sync when changing it
 pub fn q_outline() -> [Vec<(f32, f32)>; 3] {
     let ring = |r: f32| -> Vec<(f32, f32)> {
         (0..24)
@@ -75,7 +96,8 @@ pub fn q_outline() -> [Vec<(f32, f32)>; 3] {
     [
         ring(9.2),
         ring(4.2),
-        // 尾部斜矩形：起点埋进环带避免交界露缝。
+        // Tail slanted rectangle: its start point is buried into the ring band so
+        // the junction shows no seam.
         vec![
             (17.62, 19.84),
             (21.69, 23.91),
@@ -85,7 +107,7 @@ pub fn q_outline() -> [Vec<(f32, f32)>; 3] {
     ]
 }
 
-/// 默认 logo 图标
+/// Default logo icon
 pub fn logo_icon(px: i32) -> Option<HICON> {
     let px = px.max(MIN_PX);
     let mut buf = vec![0u8; (px * px * 4) as usize];
@@ -105,7 +127,7 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
 
     for y in 0..px {
         for x in 0..px {
-            // 4× 子采样取覆盖率做边缘抗锯齿，16 = 4×4 采样数。
+            // 4× supersampling takes coverage for edge antialiasing; 16 = the 4×4 sample count.
             let mut hit = 0u32;
             for sy in 0..4u32 {
                 for sx in 0..4u32 {
@@ -120,8 +142,8 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
             }
             let a = (hit * 255 / 16) as u8;
             if a > 0 {
-                // 颜色按像素中心单判，半透明边缘不混色；
-                // RGB 按覆盖率预乘，HICON 合成按预乘约定。
+                // Color is decided once at the pixel center, so translucent edges do not blend colors;
+                // RGB is premultiplied by coverage, matching the premultiplied convention of HICON composition.
                 let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
                 let in_q = (in_polygon(cx, cy, &outer) && !in_polygon(cx, cy, &inner))
                     || in_polygon(cx, cy, &tail);
@@ -138,7 +160,21 @@ pub fn logo_icon(px: i32) -> Option<HICON> {
     pixels_to_hicon(&buf, px)
 }
 
-/// 环形余量图标
+/// Screen angle in degrees measured clockwise from 12 o'clock, in [0, 360):
+/// the arc predicate compares against remain×360 directly, so a raw atan2
+/// range would silently offset the arc's start (and thus its length).
+fn ring_angle(fx: f32, fy: f32) -> f32 {
+    let a = fy.atan2(fx).to_degrees() + 90.0;
+    if a < 0.0 { a + 360.0 } else { a }
+}
+
+/// Arc membership: the remaining arc grows clockwise from 12 o'clock;
+/// below 0.4% remaining counts as exhausted (gray track).
+fn ring_on_arc(a: f32, remain: f32, failed: bool) -> bool {
+    !failed && remain > 0.004 && a <= remain * 360.0
+}
+
+/// Ring remaining-quota icon
 pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
     let px = px.max(MIN_PX);
     let mut buf = vec![0u8; (px * px * 4) as usize];
@@ -158,22 +194,17 @@ pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
                 continue;
             }
             let cov = (0.5 - edge).clamp(0.0, 1.0);
-            // 屏幕角度：12 点方向为 -90°，顺时针增加。
-            let mut a = fy.atan2(fx).to_degrees();
-            if a < -90.0 {
-                a += 360.0;
-            }
+            let a = ring_angle(fx, fy);
             let i = ((y * px + x) * 4) as usize;
-            // 余量不足 0.4% 视为耗尽，画灰轨道。
-            let on_arc = !failed && remain > 0.004 && a <= remain * 360.0;
-            if on_arc {
-                // 档位色（BGRA），RGB 按覆盖率预乘，HICON 合成按预乘约定。
+            if ring_on_arc(a, remain, failed) {
+                // Tier color (BGRA); RGB premultiplied by coverage,
+                // matching the premultiplied convention of HICON composition.
                 buf[i] = (tb as f32 * cov) as u8;
                 buf[i + 1] = (tg as f32 * cov) as u8;
                 buf[i + 2] = (tr as f32 * cov) as u8;
                 buf[i + 3] = (0xFF as f32 * cov) as u8;
             } else {
-                // 半透明深灰轨道，深浅任务栏下均可见。
+                // Translucent dark-gray track, visible under both light and dark taskbars.
                 buf[i] = (0x66 as f32 * cov) as u8;
                 buf[i + 1] = (0x66 as f32 * cov) as u8;
                 buf[i + 2] = (0x66 as f32 * cov) as u8;
@@ -225,7 +256,7 @@ fn in_polygon(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
     inside
 }
 
-/// 像素缓冲（BGRA）→ HICON：AND 掩码全 0，透明度由 alpha 决定。
+/// Pixel buffer (BGRA) → HICON: the AND mask is all zeros; opacity is decided by alpha.
 fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
     let hdr = |bpp: u16| BITMAPINFOHEADER {
         biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -266,7 +297,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         ) {
             Ok(m) => m,
             Err(_) => {
-                // 掩码创建失败：回收已建的颜色位图再放弃。
+                // Mask creation failed: reclaim the already-built color bitmap, then give up.
                 let _ = DeleteObject(color.into());
                 return None;
             }
@@ -289,7 +320,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
         let hicon = match CreateIconIndirect(&info) {
             Ok(h) => h,
             Err(_) => {
-                // 图标合成失败：两张位图所有权仍在自己手里，一并回收。
+                // Icon composition failed: ownership of both bitmaps is still here, so reclaim them together.
                 let _ = DeleteObject(color.into());
                 let _ = DeleteObject(mask.into());
                 return None;
@@ -301,7 +332,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
     }
 }
 
-/// 释放本进程自建（`CreateIconIndirect` 系）的 HICON
+/// Destroys an HICON built by this process (`CreateIconIndirect` family)
 pub fn destroy_owned(h: HICON) {
     unsafe { DestroyIcon(h) }.ok();
 }
@@ -362,5 +393,29 @@ mod tests {
         assert_eq!(tier_color(89.9), (0xFF, 0x9F, 0x0A));
         assert_eq!(tier_color(90.0), (0xFF, 0x45, 0x3A), "90 起进红档");
         assert_eq!(tier_color(100.0), (0xFF, 0x45, 0x3A));
+    }
+
+    /// Ring arc orientation: 12 o'clock is 0°, clockwise positive, in
+    /// [0, 360); the arc covers exactly remain×360 degrees from the top.
+    #[test]
+    fn ring_arc_orientation() {
+        let close = |a: f32, b: f32| (a - b).abs() < 0.001;
+        assert!(close(ring_angle(0.0, -1.0), 0.0), "正上=0°");
+        assert!(close(ring_angle(1.0, 0.0), 90.0), "正右=90°");
+        assert!(close(ring_angle(0.0, 1.0), 180.0), "正下=180°");
+        assert!(close(ring_angle(-1.0, 0.0), 270.0), "正左=270°");
+
+        // 25% remaining: exactly the 12→3 o'clock quarter lights up
+        let remain = 0.25f32;
+        assert!(ring_on_arc(0.0, remain, false), "起点亮");
+        assert!(ring_on_arc(90.0, remain, false), "终点亮");
+        assert!(!ring_on_arc(90.1, remain, false), "终点后不亮");
+        assert!(!ring_on_arc(270.0, remain, false), "对侧不亮");
+        // Exhausted and error states: no arc, the gray track draws instead
+        assert!(!ring_on_arc(0.0, 0.0, false), "余 0 无弧");
+        assert!(!ring_on_arc(0.0, 0.003, false), "低于 0.4% 视为耗尽");
+        assert!(!ring_on_arc(0.0, 0.5, true), "失败态无弧");
+        // Full ring
+        assert!(ring_on_arc(359.9, 1.0, false));
     }
 }

@@ -9,8 +9,10 @@ pub(crate) const NOTIFY_TITLE: &str = "Quotify";
 
 /// A changed reset time means a new window; armed here means "the new
 /// window starts from low usage", so it is re-armed regardless of the
-/// notification toggle. Produces the message text without sending;
-/// routing is composed by the caller.
+/// notification toggle. A missing resets_at is no information rather
+/// than a reset: the baseline is kept so the next real window still
+/// notifies. Produces the message text without sending; routing is
+/// composed by the caller.
 pub(crate) fn check_reset(
     bucket: Option<&QuotaBucket>,
     last: &mut Option<DateTime<Utc>>,
@@ -18,13 +20,15 @@ pub(crate) fn check_reset(
     enabled: bool,
     msg: &'static str,
 ) -> Option<String> {
-    if let Some(b) = bucket {
-        if last.is_some_and(|old| old != b.resets_at.unwrap_or(old)) {
+    if let Some(b) = bucket
+        && let Some(resets_at) = b.resets_at
+    {
+        if last.is_some_and(|old| old != resets_at) {
             *armed = true;
-            *last = b.resets_at;
+            *last = Some(resets_at);
             return enabled.then(|| msg.to_string());
         }
-        *last = b.resets_at;
+        *last = Some(resets_at);
     }
     None
 }
@@ -205,8 +209,8 @@ mod tests {
         );
         assert!(armed);
 
-        // resets_at missing: not treated as a reset; the baseline falls back
-        // to None and is rebuilt from the next snapshot.
+        // resets_at missing: no information, not a reset — the baseline is
+        // kept untouched (still the initial None here).
         assert_eq!(
             check_reset(
                 Some(&bucket(50.0, None)),
@@ -231,6 +235,52 @@ mod tests {
             Some("5h 已超 80% 80%".to_string())
         );
         assert!(!armed);
+    }
+
+    /// A missing resets_at is no information, not a reset: the Some(T1)
+    /// baseline survives the missing round, so the following real new
+    /// window (Some(T2)) still notifies.
+    #[test]
+    fn missing_reset_round_keeps_baseline_for_next_window() {
+        let mut last: Option<DateTime<Utc>> = None;
+        let mut armed = false;
+
+        check_reset(
+            Some(&bucket(50.0, Some(at(9)))),
+            &mut last,
+            &mut armed,
+            true,
+            "5h 已重置",
+        );
+        assert_eq!(last, Some(at(9)));
+
+        // Missing round: silent, baseline kept.
+        assert_eq!(
+            check_reset(
+                Some(&bucket(50.0, None)),
+                &mut last,
+                &mut armed,
+                true,
+                "5h 已重置"
+            ),
+            None
+        );
+        assert_eq!(last, Some(at(9)));
+
+        // The next real new window is still a change against the kept
+        // baseline: it must notify.
+        assert_eq!(
+            check_reset(
+                Some(&bucket(20.0, Some(at(14)))),
+                &mut last,
+                &mut armed,
+                true,
+                "5h 已重置"
+            ),
+            Some("5h 已重置".to_string())
+        );
+        assert_eq!(last, Some(at(14)));
+        assert!(armed);
     }
 
     #[test]

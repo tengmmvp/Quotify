@@ -6,6 +6,10 @@ use crate::service::update::REPO;
 /// Upper bound on the news item count
 pub const NEWS_MAX: usize = 3;
 
+/// Upper bound on body lines kept per item: expanded-state rendering and
+/// window height derive from the line count, so it must stay bounded.
+pub const NEWS_LINES_MAX: usize = 16;
+
 /// One news item
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewsItem {
@@ -67,10 +71,11 @@ pub fn parse_news(text: &str) -> Vec<NewsItem> {
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("## ") else {
             // Non-header lines go into the current section's body; blank
-            // lines and Markdown rules are dropped.
+            // lines and Markdown rules are dropped; beyond NEWS_LINES_MAX
+            // the rest of the body is dropped with them.
             if let Some(cur) = out.last_mut() {
                 let t = line.trim();
-                if !t.is_empty() && t != "---" {
+                if !t.is_empty() && t != "---" && cur.lines.len() < NEWS_LINES_MAX {
                     cur.lines.push(t.to_string());
                 }
             }
@@ -152,6 +157,20 @@ mod tests {
             items.iter().map(|n| n.title.as_str()).collect::<Vec<_>>(),
             vec!["标题5", "标题4", "标题3"]
         );
+    }
+
+    /// Body lines beyond NEWS_LINES_MAX are dropped at collection time:
+    /// the first NEWS_LINES_MAX lines stay, the tail never reaches render
+    #[test]
+    fn long_body_truncates_to_lines_max() {
+        let mut md = String::from("## 2026-08-27 · 标题\n");
+        for i in 0..(NEWS_LINES_MAX + 5) {
+            md.push_str(&format!("第{i}行\n"));
+        }
+        let items = parse_news(&md);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].lines.len(), NEWS_LINES_MAX);
+        assert_eq!(items[0].lines.last().map(String::as_str), Some("第15行"));
     }
 
     /// Read-marker normalization: zero-padding is canonical (lexical

@@ -82,7 +82,7 @@ impl Poller {
             let stop = match CreateEventW(None, true, false, None) {
                 Ok(s) => s,
                 Err(e) => {
-                    crate::platform::log(&format!("[Quotify] 轮询停止事件创建失败: {e}"));
+                    crate::platform::log(&format!("轮询停止事件创建失败: {e}"));
                     let _ = windows::Win32::Foundation::CloseHandle(wake);
                     return None;
                 }
@@ -111,7 +111,7 @@ impl Poller {
                     // If the thread fails to start, the Poller is never
                     // born and Drop provides no fallback, so both event
                     // handles must be closed here to avoid a leak.
-                    crate::platform::log(&format!("[Quotify] 轮询线程创建失败，托盘将无数据: {e}"));
+                    crate::platform::log(&format!("轮询线程创建失败，托盘将无数据: {e}"));
                     let _ = windows::Win32::Foundation::CloseHandle(wake);
                     let _ = windows::Win32::Foundation::CloseHandle(stop);
                     return None;
@@ -246,6 +246,43 @@ fn schedule_next(
     }
 }
 
+/// Paired holder of the monotonic anchor and the wall anchor
+struct Due {
+    next: Instant,
+    wall: chrono::DateTime<chrono::Utc>,
+}
+
+impl Due {
+    fn now() -> Self {
+        Self {
+            next: Instant::now(),
+            wall: chrono::Utc::now(),
+        }
+    }
+
+    /// Move both anchors forward together by secs seconds
+    fn set(&mut self, secs: u64) {
+        self.next = Instant::now() + Duration::from_secs(secs);
+        self.wall = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+    }
+
+    /// Due once either anchor has passed: the wall anchor covers the
+    /// monotonic clock stalling during sleep
+    fn expired(&self) -> bool {
+        Instant::now() >= self.next || chrono::Utc::now() >= self.wall
+    }
+
+    /// Take each anchor's max with now+secs: the schedule only pushes
+    /// out, never earlier. Reserved for the manual-failure
+    /// queue-jump semantics — regular re-anchoring goes through set.
+    fn push_out(&mut self, secs: u64) {
+        let n = Instant::now() + Duration::from_secs(secs);
+        let w = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
+        self.next = self.next.max(n);
+        self.wall = self.wall.max(w);
+    }
+}
+
 /// The polling loop
 fn poll_loop(
     hwnd: windows::Win32::Foundation::HWND,
@@ -264,43 +301,6 @@ fn poll_loop(
     // Paired updates go through one method so a new schedule point can
     // never update just one anchor.
     let mut due = Due::now();
-
-    /// Paired holder of the monotonic anchor and the wall anchor
-    struct Due {
-        next: Instant,
-        wall: chrono::DateTime<chrono::Utc>,
-    }
-
-    impl Due {
-        fn now() -> Self {
-            Self {
-                next: Instant::now(),
-                wall: chrono::Utc::now(),
-            }
-        }
-
-        /// Move both anchors forward together by secs seconds
-        fn set(&mut self, secs: u64) {
-            self.next = Instant::now() + Duration::from_secs(secs);
-            self.wall = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
-        }
-
-        /// Due once either anchor has passed: the wall anchor covers the
-        /// monotonic clock stalling during sleep
-        fn expired(&self) -> bool {
-            Instant::now() >= self.next || chrono::Utc::now() >= self.wall
-        }
-
-        /// Take each anchor's max with now+secs: the schedule only pushes
-        /// out, never earlier. Reserved for the manual-failure
-        /// queue-jump semantics — regular re-anchoring goes through set.
-        fn push_out(&mut self, secs: u64) {
-            let n = Instant::now() + Duration::from_secs(secs);
-            let w = chrono::Utc::now() + chrono::Duration::seconds(secs as i64);
-            self.next = self.next.max(n);
-            self.wall = self.wall.max(w);
-        }
-    }
 
     // Consecutive-429 count: zeroed by success, a non-429 result, or a
     // source-switch generation, handing the wait cadence back to plain
@@ -540,5 +540,97 @@ mod tests {
                 2
             )
         ));
+    }
+
+    /// Dual-anchor expiry pinned with fixed anchor pairs: due once
+    /// either anchor passes — the wall arm covers a monotonic clock
+    /// stalled by sleep, the monotonic arm keeps the schedule when the
+    /// wall clock rolls back
+    #[test]
+    fn due_expires_on_either_anchor() {
+        let mono_ahead = Instant::now() + Duration::from_secs(3600);
+        let wall_ahead = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        // Both anchors ahead: not due
+        assert!(
+            !Due {
+                next: mono_ahead,
+                wall: wall_ahead
+            }
+            .expired()
+        );
+        // Monotonic passed while the wall anchor is far ahead (the wall
+        // clock rolled back): still due — the monotonic anchor leads
+        assert!(
+            Due {
+                next: Instant::now() - Duration::from_secs(1),
+                wall: wall_ahead
+            }
+            .expired()
+        );
+        // Wall passed while the monotonic anchor is far ahead (sleep
+        // stalled the monotonic clock): still due — the catch-up arm
+        assert!(
+            Due {
+                next: mono_ahead,
+                wall: chrono::Utc::now() - chrono::Duration::seconds(1)
+            }
+            .expired()
+        );
+    }
+
+    /// set re-anchors both clocks together at now+secs, earlier points
+    /// included (unlike push_out); each new anchor lands inside the
+    /// before/after now-window of the call
+    #[test]
+    fn due_set_moves_both_anchors_together() {
+        let mut d = Due {
+            next: Instant::now() + Duration::from_secs(3600),
+            wall: chrono::Utc::now() + chrono::Duration::seconds(3600),
+        };
+        let (m0, w0) = (Instant::now(), chrono::Utc::now());
+        d.set(60);
+        let (m1, w1) = (Instant::now(), chrono::Utc::now());
+        assert!(d.next >= m0 + Duration::from_secs(60) && d.next <= m1 + Duration::from_secs(60));
+        assert!(
+            d.wall >= w0 + chrono::Duration::seconds(60)
+                && d.wall <= w1 + chrono::Duration::seconds(60)
+        );
+        assert!(!d.expired());
+        // set(0) lands both anchors on now: immediately due (the
+        // source-switch reset path)
+        d.set(0);
+        assert!(d.expired());
+    }
+
+    /// push_out only pushes later, never earlier: each anchor keeps the
+    /// max with now+secs — a far anchor survives a short floor
+    /// untouched, and an expired pair moves out to the floor
+    #[test]
+    fn due_push_out_never_earlier() {
+        // Far anchors + short floor: both anchors keep their old values
+        let mut d = Due {
+            next: Instant::now() + Duration::from_secs(3600),
+            wall: chrono::Utc::now() + chrono::Duration::seconds(3600),
+        };
+        let (n0, w0) = (d.next, d.wall);
+        d.push_out(5);
+        assert_eq!(d.next, n0);
+        assert_eq!(d.wall, w0);
+        assert!(!d.expired());
+
+        // Expired anchors + floor 30: both move out to ≈now+30
+        let mut d = Due {
+            next: Instant::now() - Duration::from_secs(1),
+            wall: chrono::Utc::now() - chrono::Duration::seconds(1),
+        };
+        let (m0, w0) = (Instant::now(), chrono::Utc::now());
+        d.push_out(30);
+        let (m1, w1) = (Instant::now(), chrono::Utc::now());
+        assert!(d.next >= m0 + Duration::from_secs(30) && d.next <= m1 + Duration::from_secs(30));
+        assert!(
+            d.wall >= w0 + chrono::Duration::seconds(30)
+                && d.wall <= w1 + chrono::Duration::seconds(30)
+        );
+        assert!(!d.expired());
     }
 }

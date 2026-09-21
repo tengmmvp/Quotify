@@ -56,9 +56,28 @@ pub fn percent(p: f64) -> String {
     format!("{}%", clamped.round() as i64)
 }
 
+/// Balance display: ¥ prefix, compacts at and above a million, two decimals below
+pub fn money(v: f64) -> String {
+    let amount = if v.abs() >= 1e6 {
+        compact_number(v)
+    } else {
+        format!("{v:.2}")
+    };
+    format!("¥{amount}")
+}
+
 /// Reset countdown
 pub fn countdown(until: DateTime<Utc>, lang: Lang) -> String {
     countdown_from(until, Utc::now(), lang)
+}
+
+/// Count–unit joining shared by the countdown and elapsed tiers:
+/// zh separates with a space, en stays compact.
+fn join_unit(lang: Lang, n: i64, unit: &str) -> String {
+    match lang {
+        Lang::Zh => format!("{n} {unit}"),
+        Lang::En => format!("{n}{unit}"),
+    }
 }
 
 /// Countdown core.
@@ -66,12 +85,6 @@ pub fn countdown(until: DateTime<Utc>, lang: Lang) -> String {
 /// The time source is injected for decoupling, so tests can pin it.
 fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> String {
     let s = i18n_units(lang);
-    let u = |unit: &str| -> String {
-        match lang {
-            Lang::Zh => format!(" {unit}"),
-            Lang::En => unit.to_string(),
-        }
-    };
     let secs = (until - now).num_seconds().max(0);
     let days = secs / 86400;
     let hours = (secs % 86400) / 3600;
@@ -79,16 +92,24 @@ fn countdown_from(until: DateTime<Utc>, now: DateTime<Utc>, lang: Lang) -> Strin
     let sec = secs % 60;
     if days > 0 {
         if hours > 0 {
-            format!("{days}{} {hours}{}", u(s.day), u(s.hour))
+            format!(
+                "{} {}",
+                join_unit(lang, days, s.day),
+                join_unit(lang, hours, s.hour)
+            )
         } else {
-            format!("{days}{}", u(s.day))
+            join_unit(lang, days, s.day)
         }
     } else if hours > 0 {
-        format!("{hours}{} {mins}{}", u(s.hour), u(s.minute))
+        format!(
+            "{} {}",
+            join_unit(lang, hours, s.hour),
+            join_unit(lang, mins, s.minute)
+        )
     } else if mins > 0 {
-        format!("{mins}{}", u(s.minute))
+        join_unit(lang, mins, s.minute)
     } else {
-        format!("{sec}{}", u(s.second))
+        join_unit(lang, sec, s.second)
     }
 }
 
@@ -131,29 +152,25 @@ pub fn updated_text(s: &crate::ui::i18n::Strings, lang: Lang, at: DateTime<Local
     }
 }
 
-/// Short elapsed-time phrasing for the updated-time footnote
+/// Short elapsed-time phrasing for the updated-time footnote;
+/// units share the i18n single source with countdown().
 pub fn ago(at: DateTime<Local>, lang: Lang) -> String {
-    let secs = (Local::now() - at).num_seconds().clamp(0, i64::MAX);
-    match lang {
-        Lang::Zh => {
-            if secs < 3600 {
-                format!("{} 分钟", (secs / 60).max(1))
-            } else if secs < 86400 {
-                format!("{} 小时", secs / 3600)
-            } else {
-                format!("{} 天", secs / 86400)
-            }
-        }
-        Lang::En => {
-            if secs < 3600 {
-                format!("{}m", (secs / 60).max(1))
-            } else if secs < 86400 {
-                format!("{}h", secs / 3600)
-            } else {
-                format!("{}d", secs / 86400)
-            }
-        }
-    }
+    ago_from(at, Local::now(), lang)
+}
+
+/// Elapsed-time core; the time source is injected for decoupling, mirroring
+/// countdown_from.
+fn ago_from(at: DateTime<Local>, now: DateTime<Local>, lang: Lang) -> String {
+    let s = i18n_units(lang);
+    let secs = (now - at).num_seconds().clamp(0, i64::MAX);
+    let (n, unit) = if secs < 3600 {
+        ((secs / 60).max(1), s.minute)
+    } else if secs < 86400 {
+        (secs / 3600, s.hour)
+    } else {
+        (secs / 86400, s.day)
+    };
+    join_unit(lang, n, unit)
 }
 
 /// Countdown unit strings
@@ -234,6 +251,17 @@ mod tests {
     }
 
     #[test]
+    fn money_format() {
+        assert_eq!(money(0.0), "¥0.00");
+        assert_eq!(money(12.3), "¥12.30");
+        assert_eq!(money(-12.5), "¥-12.50", "负值语义随现行渲染平移");
+        assert_eq!(money(999_999.99), "¥999999.99", "1M 边界以下保留两位小数");
+        assert_eq!(money(1_000_000.0), "¥1M", "≥1M 走紧凑缩写");
+        assert_eq!(money(1_200_000.0), "¥1.2M");
+        assert_eq!(money(3.4e9), "¥3.4B", "超大值升 B 档");
+    }
+
+    #[test]
     fn countdown_granularity() {
         let zh = Lang::Zh;
         let now = Utc::now();
@@ -259,5 +287,33 @@ mod tests {
         assert_eq!(countdown_from(t, now, Lang::En), "2h 13m");
         let t = now + chrono::Duration::days(3) + chrono::Duration::hours(4);
         assert_eq!(countdown_from(t, now, Lang::En), "3d 4h");
+    }
+
+    /// ago()'s tier boundaries in both languages; the units themselves come from
+    /// the i18n single source, same strings as countdown().
+    #[test]
+    fn ago_tier_boundaries() {
+        let now = Local::now();
+        let at = |secs: i64| now - chrono::Duration::seconds(secs);
+        // Minute tier: <3600s, with 0–59s held at "1"
+        assert_eq!(ago_from(at(59), now, Lang::Zh), "1 分钟");
+        assert_eq!(ago_from(at(59), now, Lang::En), "1m");
+        assert_eq!(ago_from(at(60), now, Lang::Zh), "1 分钟");
+        assert_eq!(ago_from(at(60), now, Lang::En), "1m");
+        assert_eq!(ago_from(at(3599), now, Lang::Zh), "59 分钟");
+        assert_eq!(ago_from(at(3599), now, Lang::En), "59m");
+        // Hour tier: 3600s–86399s
+        assert_eq!(ago_from(at(3600), now, Lang::Zh), "1 小时");
+        assert_eq!(ago_from(at(3600), now, Lang::En), "1h");
+        assert_eq!(ago_from(at(86399), now, Lang::Zh), "23 小时");
+        assert_eq!(ago_from(at(86399), now, Lang::En), "23h");
+        // Day tier: ≥86400s
+        assert_eq!(ago_from(at(86400), now, Lang::Zh), "1 天");
+        assert_eq!(ago_from(at(86400), now, Lang::En), "1d");
+        // A stepped-back wall clock clamps at zero, never reads negative
+        assert_eq!(
+            ago_from(now + chrono::Duration::seconds(30), now, Lang::Zh),
+            "1 分钟"
+        );
     }
 }

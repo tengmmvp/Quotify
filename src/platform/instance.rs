@@ -302,17 +302,15 @@ unsafe fn wait_for_tray_window() {
 }
 
 /// Whether the mutex holder is the current user: read the object's owner
-/// SID and compare it against the process token (the user SID or any group
-/// SID — an elevated instance's owner is the Administrators group). The
-/// owner implicitly holds READ_CONTROL, so the same user can always read
-/// it; a read failure yields as if another user, never hurting multi-user
+/// SID and compare it against the process token's user SID only. The owner
+/// implicitly holds READ_CONTROL, so the same user can always read it; a
+/// read failure yields as if another user, never hurting multi-user
 /// coexistence.
-/// Known edge, kept by design: another elevated admin's legacy instance
-/// (owner also Administrators) is misidentified as one's own, and the new
-/// build exits. No signal distinguishes elevated-self from elevated-other;
-/// the alternative (yielding on group matches) would reopen same-user
-/// cross-elevation double-run, which overwrites config — the exit is the
-/// safer side of the trade.
+/// Known edge, kept by design: matching group SIDs would let a pre-created
+/// Everyone-owned object pose as a same-user instance and deny other users'
+/// launches, so an elevated same-user instance (whose mutex owner is the
+/// Administrators group) is no longer recognized and a duplicate may run
+/// alongside it.
 unsafe fn kernel_object_owner_is_me(h: HANDLE) -> bool {
     use windows::Win32::Foundation::{HLOCAL, LocalFree};
     use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};

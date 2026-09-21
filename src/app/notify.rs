@@ -34,11 +34,14 @@ pub(crate) fn check_reset(
 }
 
 /// Crossing the threshold alerts once (armed set to false); falling back
-/// below the threshold re-arms.
+/// below the threshold re-arms. Arming runs regardless of the toggle,
+/// same reason as check_reset: an alert fired while disabled would
+/// otherwise stay permanently silent. enabled gates only the sending.
 pub(crate) fn check_threshold(
     bucket: Option<&QuotaBucket>,
     armed: &mut bool,
     th: f64,
+    enabled: bool,
     label: &'static str,
     title: &'static str,
 ) -> Option<String> {
@@ -47,10 +50,12 @@ pub(crate) fn check_threshold(
             *armed = false;
             // The percentage format shares the same single source as the
             // tooltip/metric rows, with identical out-of-range clamping.
-            return Some(format!(
-                "{label} {title} {}",
-                crate::ui::fmt::percent(b.used_percent)
-            ));
+            return enabled.then(|| {
+                format!(
+                    "{label} {title} {}",
+                    crate::ui::fmt::percent(b.used_percent)
+                )
+            });
         } else if b.used_percent < th {
             *armed = true;
         }
@@ -170,6 +175,7 @@ mod tests {
                 Some(&bucket(85.4, None)),
                 &mut armed,
                 80.0,
+                true,
                 "5h",
                 "已超 80%"
             ),
@@ -183,6 +189,7 @@ mod tests {
                 Some(&bucket(90.0, None)),
                 &mut armed,
                 80.0,
+                true,
                 "5h",
                 "已超 80%"
             ),
@@ -204,7 +211,7 @@ mod tests {
         assert_eq!(last, None);
         assert!(armed);
         assert_eq!(
-            check_threshold(None, &mut armed, 80.0, "5h", "已超 80%"),
+            check_threshold(None, &mut armed, 80.0, true, "5h", "已超 80%"),
             None
         );
         assert!(armed);
@@ -229,6 +236,7 @@ mod tests {
                 Some(&bucket(80.0, None)),
                 &mut armed,
                 80.0,
+                true,
                 "5h",
                 "已超 80%"
             ),
@@ -292,6 +300,7 @@ mod tests {
                 Some(&bucket(85.0, None)),
                 &mut armed,
                 80.0,
+                true,
                 "周",
                 "已超 80%"
             ),
@@ -305,6 +314,7 @@ mod tests {
                 Some(&bucket(60.0, None)),
                 &mut armed,
                 80.0,
+                true,
                 "周",
                 "已超 80%"
             ),
@@ -318,10 +328,73 @@ mod tests {
                 Some(&bucket(82.0, None)),
                 &mut armed,
                 80.0,
+                true,
                 "周",
                 "已超 80%"
             ),
             Some("周 已超 80% 82%".to_string())
+        );
+        assert!(!armed);
+    }
+
+    /// The disabled period re-arms on falling below (check_reset parity):
+    /// without it, an alert fired before the toggle went off would never
+    /// fire again after re-enabling — up to a full weekly window unreported.
+    #[test]
+    fn threshold_disabled_skips_notify_but_rearms() {
+        let mut armed = true;
+
+        // Fired while enabled: disarms.
+        assert_eq!(
+            check_threshold(
+                Some(&bucket(85.0, None)),
+                &mut armed,
+                80.0,
+                true,
+                "5h",
+                "已超 80%"
+            ),
+            Some("5h 已超 80% 85%".to_string())
+        );
+        assert!(!armed);
+
+        // Still above the line while off: no notification is sent.
+        assert_eq!(
+            check_threshold(
+                Some(&bucket(90.0, None)),
+                &mut armed,
+                80.0,
+                false,
+                "5h",
+                "已超 80%"
+            ),
+            None
+        );
+        // Falls below while off: silently re-arms.
+        assert_eq!(
+            check_threshold(
+                Some(&bucket(60.0, None)),
+                &mut armed,
+                80.0,
+                false,
+                "5h",
+                "已超 80%"
+            ),
+            None
+        );
+        assert!(armed);
+
+        // Crosses the line again after re-enabling: fires once more.
+        assert_eq!(
+            check_threshold(
+                Some(&bucket(82.0, None)),
+                &mut armed,
+                80.0,
+                true,
+                "5h",
+                "已超 80%"
+            ),
+            Some("5h 已超 80% 82%".to_string())
         );
         assert!(!armed);
     }

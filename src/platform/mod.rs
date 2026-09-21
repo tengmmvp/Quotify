@@ -71,6 +71,10 @@ pub(crate) fn redact_user_segment(path: &str) -> String {
     format!("{}***{}", &path[..name_start], &path[name_end..])
 }
 
+/// Single source of the `[Quotify] ` log-line prefix (the panic hook's
+/// stderr fallback reuses it)
+pub(crate) const LOG_PREFIX: &str = "[Quotify] ";
+
 /// Unified diagnostic logging: the `[Quotify] ` prefix is single-sourced
 /// here (call sites stay bare), and the whole prefixed line passes the
 /// profile-name redaction before it leaves the process — the debug output
@@ -78,7 +82,7 @@ pub(crate) fn redact_user_segment(path: &str) -> String {
 /// redacted line, so an embedded config path leaks no account name into
 /// either sink.
 pub fn log(msg: &str) {
-    let line = redact_user_segment(&format!("[Quotify] {msg}"));
+    let line = redact_user_segment(&format!("{LOG_PREFIX}{msg}"));
     ring_push(&mut crate::locks::borrow(&RECENT_LOGS), &line);
     let w = wide(&line);
     unsafe { OutputDebugStringW(PCWSTR(w.as_ptr())) };
@@ -298,8 +302,9 @@ fn file_dialog(owner: HWND, default_name: &str, save: bool) -> Option<std::path:
     let filter: Vec<u16> = "JSON (*.json)\0*.json\0All files (*.*)\0*.*\0\0"
         .encode_utf16()
         .collect();
-    let mut file = [0u16; 260];
-    for (i, c) in default_name.encode_utf16().take(259).enumerate() {
+    // 32767 chars + NUL: deep trees exceed the 260-unit classic buffer.
+    let mut file = [0u16; 32768];
+    for (i, c) in default_name.encode_utf16().take(file.len() - 1).enumerate() {
         file[i] = c;
     }
     let mut ofn = OPENFILENAMEW {
@@ -506,60 +511,16 @@ pub(crate) fn current_user_sid() -> windows::core::Result<(Vec<u64>, windows::Wi
     }
 }
 
-/// Whether the SID belongs to the current process token (the user SID or
-/// any group SID): objects created in an elevated context carry the
-/// Administrators group SID as owner, so comparing against the user SID
-/// alone would misjudge an elevated instance of the same user as another
-/// user.
+/// Whether the SID is the current process token's user SID. Group SIDs are
+/// deliberately not matched: a local low-privilege process could pre-create
+/// a mutex owned by Everyone (or any group shared with the victim) and pose
+/// as a same-user instance, denying other users' launches. Trade-off: an
+/// elevated same-user instance — owner Administrators group — is no longer
+/// recognized, and a duplicate runs alongside it.
 pub(crate) fn sid_belongs_to_token(sid: windows::Win32::Security::PSID) -> bool {
-    use windows::Win32::Security::{
-        EqualSid, GetTokenInformation, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_USER, TokenGroups,
-        TokenUser,
-    };
-    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-
-    unsafe {
-        let mut token = HANDLE::default();
-        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token).is_err() {
-            return false;
-        }
-        // u64 buffer for alignment; shared by both query types and grown on
-        // demand.
-        let mut buf: Vec<u64> = Vec::new();
-        let mut found = false;
-        for ty in [TokenUser, TokenGroups] {
-            let mut len = 0u32;
-            let _ = GetTokenInformation(token, ty, None, 0, &mut len);
-            if buf.len() * 8 < len as usize {
-                buf.resize(len.div_ceil(8) as usize, 0);
-            }
-            if GetTokenInformation(token, ty, Some(buf.as_mut_ptr().cast()), len, &mut len).is_err()
-            {
-                continue;
-            }
-            if ty == TokenUser {
-                found = EqualSid((*(buf.as_ptr() as *const TOKEN_USER)).User.Sid, sid).is_ok();
-            } else {
-                let g = &*(buf.as_ptr() as *const TOKEN_GROUPS);
-                // Groups is declared as a 1-element array but carries
-                // GroupCount entries (the classic variable-length tail):
-                // indexing it directly panics on i >= 1, so walk the raw
-                // slice.
-                let groups = std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize);
-                for grp in groups {
-                    if EqualSid(grp.Sid, sid).is_ok() {
-                        found = true;
-                        break;
-                    }
-                }
-            }
-            if found {
-                break;
-            }
-        }
-        let _ = windows::Win32::Foundation::CloseHandle(token);
-        found
-    }
+    current_user_sid().is_ok_and(|(_buf, user_sid)| unsafe {
+        windows::Win32::Security::EqualSid(user_sid, sid).is_ok()
+    })
 }
 
 /// Construction product of the restricted DACL: the security descriptor,
@@ -847,5 +808,39 @@ mod tests {
                 .iter()
                 .any(|l| l == "[Quotify] poison-marker")
         );
+    }
+
+    /// The owner gate matches only the token's user SID: a group SID (here
+    /// Everyone, present in every token) must not pass — group matching let
+    /// a pre-created Everyone-owned mutex pose as a same-user instance and
+    /// deny other users' launches.
+    #[test]
+    fn sid_belongs_to_token_user_sid_only() {
+        use windows::Win32::Security::{
+            AllocateAndInitializeSid, FreeSid, PSID, SECURITY_WORLD_SID_AUTHORITY,
+        };
+        let (_buf, user) = super::current_user_sid().expect("token user SID 应可获取");
+        assert!(super::sid_belongs_to_token(user));
+        // S-1-1-0 (Everyone): a group SID in every token, never a user SID.
+        let mut world = PSID(std::ptr::null_mut());
+        unsafe {
+            AllocateAndInitializeSid(
+                &SECURITY_WORLD_SID_AUTHORITY,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                &mut world,
+            )
+            .expect("Everyone SID 应可构造");
+        }
+        let matched = super::sid_belongs_to_token(world);
+        unsafe { FreeSid(world) };
+        assert!(!matched);
     }
 }

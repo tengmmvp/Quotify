@@ -11,11 +11,17 @@ pub enum Lang {
 pub fn detect_system_lang() -> Lang {
     use windows::Win32::Globalization::GetUserDefaultUILanguage;
     let lang_id = unsafe { GetUserDefaultUILanguage() };
-    // 0x0804 = Simplified Chinese (China), 0x0404 = Traditional Chinese (Taiwan),
-    // 0x0C04 = Traditional Chinese (Hong Kong)
-    matches!(lang_id, 0x0804 | 0x0404 | 0x0C04)
-        .then_some(Lang::Zh)
-        .unwrap_or(Lang::En)
+    if is_chinese_lang_id(lang_id) {
+        Lang::Zh
+    } else {
+        Lang::En
+    }
+}
+
+/// Chinese by primary-language id (low 10 bits) — 0x04 marks every zh- variant,
+/// present (0x0804/0x0404/0x0C04/0x1004/0x1404) or future.
+fn is_chinese_lang_id(lang_id: u16) -> bool {
+    lang_id & 0x3FF == 0x04
 }
 
 /// Explicit value of the configured language string: Some means an explicit zh/en,
@@ -210,6 +216,8 @@ pub struct Strings {
     pub notify_reset_5h: &'static str,
     pub notify_reset_weekly: &'static str,
     pub notify_config_broken: &'static str,
+    /// Save-failure toast: config.toml could not be written
+    pub notify_save_failed: &'static str,
     pub notify_diag_copied: &'static str,
     /// Copy-diagnostics failure feedback (clipboard busy, etc.)
     pub notify_copy_failed: &'static str,
@@ -372,12 +380,13 @@ const ZH: Strings = Strings {
     notify_reset_5h: "5 小时窗口已重置",
     notify_reset_weekly: "周额度已重置",
     notify_config_broken: "config.toml 解析失败，已回退默认配置，原文件留档为 config.toml.bak，账号与设置需重新配置",
+    notify_save_failed: "config.toml 保存失败，本次改动未写入磁盘",
     notify_diag_copied: "诊断信息已复制到剪贴板",
     notify_copy_failed: "复制失败：剪贴板被占用，请稍后重试",
     notify_interval_invalid: "自定义间隔无效：{v}",
     notify_proxy_invalid: "代理地址无效，未保存",
     notify_team_required: "团队账号需填写组织 ID 与项目 ID",
-    notify_account_limit: "账号数已达上限（100）",
+    notify_account_limit: "账号数已达上限（{v}）",
 };
 
 const EN: Strings = Strings {
@@ -532,12 +541,13 @@ const EN: Strings = Strings {
     notify_reset_5h: "5-hour window has reset",
     notify_reset_weekly: "Weekly quota has reset",
     notify_config_broken: "config.toml failed to parse; defaults restored and the original saved as config.toml.bak. Accounts and settings need to be re-entered",
+    notify_save_failed: "Failed to save config.toml; the change was not written",
     notify_diag_copied: "Diagnostics copied to clipboard",
     notify_copy_failed: "Copy failed: the clipboard is busy, try again shortly",
     notify_interval_invalid: "Invalid custom interval: {v}",
     notify_proxy_invalid: "Invalid proxy address; not saved",
     notify_team_required: "Team accounts require Organization ID and Project ID",
-    notify_account_limit: "Account limit reached (100)",
+    notify_account_limit: "Account limit reached ({v})",
 };
 
 impl Lang {
@@ -573,36 +583,57 @@ mod tests {
         names
     }
 
-    /// Compares ZH/EN wholesale after serialization: there is no hand-copied field list
-    /// to miss anything, and every field's placeholder set
+    /// Every language instance; a new language joins the parity check by
+    /// extending this array alone.
+    fn all_langs() -> [(&'static str, &'static Strings); 2] {
+        [("zh", &ZH), ("en", &EN)]
+    }
+
+    /// Compares every language pair wholesale after serialization: there is no hand-copied
+    /// field list to miss anything, and every field's placeholder set
     /// is brought under fully automatic checking [equal key sets are guaranteed
     /// structurally by the identical shape; this is a backstop against drift]
     #[test]
     fn zh_en_parity() {
-        let zh = serde_json::to_value(&ZH).unwrap();
-        let en = serde_json::to_value(&EN).unwrap();
-        let zh = zh.as_object().expect("Strings 序列化为对象");
-        let en = en.as_object().expect("Strings 序列化为对象");
+        let objs: Vec<(&str, serde_json::Map<String, serde_json::Value>)> = all_langs()
+            .iter()
+            .map(|(name, s)| {
+                let v = serde_json::to_value(s).unwrap();
+                (*name, v.as_object().expect("Strings 序列化为对象").clone())
+            })
+            .collect();
+        for (i, (na, a)) in objs.iter().enumerate() {
+            for (nb, b) in objs.iter().skip(i + 1) {
+                let a_only: Vec<_> = a.keys().filter(|k| !b.contains_key(*k)).collect();
+                let b_only: Vec<_> = b.keys().filter(|k| !a.contains_key(*k)).collect();
+                assert!(
+                    a_only.is_empty() && b_only.is_empty(),
+                    "{na}/{nb} 键集合不一致，仅 {na}: {a_only:?}，仅 {nb}: {b_only:?}"
+                );
 
-        let zh_only: Vec<_> = zh.keys().filter(|k| !en.contains_key(*k)).collect();
-        let en_only: Vec<_> = en.keys().filter(|k| !zh.contains_key(*k)).collect();
-        assert!(
-            zh_only.is_empty() && en_only.is_empty(),
-            "ZH/EN 键集合不一致，仅 ZH: {zh_only:?}，仅 EN: {en_only:?}"
-        );
-
-        for (key, value) in zh {
-            let text = value.as_str().expect("文案字段皆为字符串");
-            let other = en
-                .get(key)
-                .and_then(serde_json::Value::as_str)
-                .expect("文案字段皆为字符串");
-            assert_eq!(
-                placeholder_set(text),
-                placeholder_set(other),
-                "占位符集合不一致: {key}"
-            );
+                for (key, value) in a {
+                    let text = value.as_str().expect("文案字段皆为字符串");
+                    let other = b
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .expect("文案字段皆为字符串");
+                    assert_eq!(
+                        placeholder_set(text),
+                        placeholder_set(other),
+                        "{na}/{nb} 占位符集合不一致: {key}"
+                    );
+                }
+            }
         }
+    }
+
+    /// Every Chinese variant — including the once-missed zh-SG/zh-MO — detects Zh
+    #[test]
+    fn chinese_lang_variants() {
+        for &id in &[0x0804, 0x0404, 0x0C04, 0x1004, 0x1404] {
+            assert!(is_chinese_lang_id(id), "0x{id:04X} 应判中文");
+        }
+        assert!(!is_chinese_lang_id(0x0409), "英语不判中文");
     }
 
     /// Pins the placeholder-bearing strings against their placeholder-name lists:
@@ -626,6 +657,7 @@ mod tests {
                 ZH.notify_interval_invalid,
                 &["v"],
             ),
+            ("notify_account_limit", ZH.notify_account_limit, &["v"]),
         ];
         for (name, text, expect) in cases {
             assert_eq!(&placeholder_set(text), expect, "占位符漂移: {name}");

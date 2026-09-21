@@ -9,8 +9,8 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 use super::{
-    AccountSpec, Balance, ERR_BODY_CHARS, ErrorInfo, FetchError, Platform, TOKEN_LEGS, TokenStats,
-    UsageSnapshot, parse_response, parse_token_total,
+    AccountSpec, Balance, ERR_BODY_CHARS, ErrorInfo, FetchError, Platform, TOKEN_LEGS, TokenLeg,
+    TokenStats, UsageSnapshot, parse_response, parse_token_total,
 };
 
 /// Hard cap on response body reads.
@@ -66,8 +66,8 @@ fn agents() -> AgentCache {
     }
     let cache = AgentCache {
         proxy: None,
-        short: build_agent(5, None),
-        long: build_agent(15, None),
+        short: build_agent(SHORT_TIMEOUT_SECS, None),
+        long: build_agent(LONG_TIMEOUT_SECS, None),
     };
     *guard = Some(cache.cloned());
     cache
@@ -95,13 +95,17 @@ pub fn proxy_split_userinfo(rest: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// Byte-length cap for proxy strings. Same value as the ui layer's
-/// `PROXY_MAX_BYTES` (same-value linkage, deliberately two copies): the
-/// api layer must not depend on ui, yet the input buffer cap and the
-/// validation gate must agree — without this gate, an over-cap value
-/// imported from an external file would be silently corrupted to the
-/// truncated display buffer by one settings-page Apply.
+/// Byte-length cap for proxy strings — the sole source: the ui layer's
+/// input buffer limit (panel/fields.rs) references this constant directly,
+/// so an over-cap value from an imported file is rejected here rather than
+/// silently truncated by one settings-page Apply.
 pub(crate) const PROXY_MAX_BYTES: usize = 512;
+
+/// Agent timeout tiers: short covers small-body endpoints, long covers the
+/// body-largest ones (main usage and the month token window); poller's Drop
+/// join bound follows LONG.
+const SHORT_TIMEOUT_SECS: u64 = 5;
+const LONG_TIMEOUT_SECS: u64 = 15;
 
 /// Validate proxy address shape.
 /// Explicit http:// or socks5:// prefix, non-empty host, port 1–65535,
@@ -160,8 +164,8 @@ pub fn set_proxy(proxy: Option<String>) -> Result<(), String> {
         },
         None => None,
     };
-    let short = build_agent(5, parsed.as_ref());
-    let long = build_agent(15, parsed.as_ref());
+    let short = build_agent(SHORT_TIMEOUT_SECS, parsed.as_ref());
+    let long = build_agent(LONG_TIMEOUT_SECS, parsed.as_ref());
     *agents_write() = Some(AgentCache { proxy, short, long });
     Ok(())
 }
@@ -285,14 +289,16 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
     let team = spec.team_scope();
     // quota is the primary data, with independent failure semantics. Auth retries with the other
     // credential shape; all other errors propagate directly.
-    let plain = spec.api_key.as_str();
+    let plain = spec.trimmed_key();
     let bearer = format!("Bearer {plain}");
     let remembered = needs_bearer(plain);
     let (first, second) = auth_order(plain, &bearer, remembered);
-    let TokenWindows { starts, end } = token_params(chrono::Local::now());
+    let TokenWindows { mut starts, end } = token_params(chrono::Local::now());
     // Five parallel paths: the primary data is never held up by slow sidecar endpoints; a sidecar
-    // failure only drops its block without dragging down main usage. On the shape-switch round,
-    // sidecar endpoints may 401 and drop blocks; the next round recovers once the shape is remembered.
+    // failure only drops its block without dragging down main usage. Timeout tiers follow
+    // criticality and response-body size together — the month leg is a sidecar yet rides the long
+    // agent for its 30-day body. On the shape-switch round, sidecar endpoints may 401 and drop
+    // blocks; the next round recovers once the shape is remembered.
     let (quota, legs, balance) = std::thread::scope(|scope| {
         let quota = scope.spawn(|| match fetch_quota(spec.platform, first, team) {
             Ok(snap) => Ok(snap),
@@ -309,8 +315,11 @@ pub fn fetch_usage(spec: &AccountSpec) -> Result<UsageSnapshot, FetchError> {
         });
         let end = end.as_str();
         // Single source of the tier mechanism: adding/removing tiers only touches TOKEN_LEGS.
-        let legs: [_; TOKEN_LEGS.len()] = starts.map(|s| {
-            s.map(|s| scope.spawn(move || fetch_token_window(spec.platform, first, team, &s, end)))
+        let legs: [_; TOKEN_LEGS.len()] = std::array::from_fn(|i| {
+            let leg = TOKEN_LEGS[i].0;
+            starts[i].take().map(|s| {
+                scope.spawn(move || fetch_token_window(spec.platform, first, team, leg, &s, end))
+            })
         });
         // The balance endpoint exists only on the domestic edition.
         let balance = (spec.platform == Platform::Cn).then(|| scope.spawn(|| fetch_balance(first)));
@@ -400,12 +409,31 @@ fn token_params(now: chrono::DateTime<chrono::Local>) -> TokenWindows {
     }
 }
 
+/// Timeout tier per token window: the month window's 30-day body is the
+/// largest — slow links need the long timeout; today/week stay short.
+fn leg_timeout_secs(leg: TokenLeg) -> u64 {
+    match leg {
+        TokenLeg::Today | TokenLeg::Week => SHORT_TIMEOUT_SECS,
+        TokenLeg::Month => LONG_TIMEOUT_SECS,
+    }
+}
+
+/// Cached agent for a token window, picked by its timeout tier — a fresh
+/// build would leave the pool empty every round.
+fn leg_agent(leg: TokenLeg) -> ureq::Agent {
+    match leg_timeout_secs(leg) {
+        LONG_TIMEOUT_SECS => agent_long(),
+        _ => agent_short(),
+    }
+}
+
 /// Fetch one interval's total token consumption.
 /// Prefers the server-side totalUsage for the total.
 fn fetch_token_window(
     platform: Platform,
     api_key: &str,
     team: Option<(&str, &str)>,
+    leg: TokenLeg,
     start: &str,
     end: &str,
 ) -> Result<f64, FetchError> {
@@ -414,7 +442,7 @@ fn fetch_token_window(
         platform.base_url()
     );
     let extra = team_parts(&mut url, "3", team);
-    let body = http_get_text(&agent_short(), &url, api_key, &extra)?;
+    let body = http_get_text(&leg_agent(leg), &url, api_key, &extra)?;
     parse_token_total(&body)
 }
 
@@ -661,9 +689,11 @@ fn fetch_quota(
 #[cfg(test)]
 mod tests {
     use super::{
-        PROXY_MAX_BYTES, auth_order, is_auth_status, parse_balance, proxy_valid, token_params,
+        LONG_TIMEOUT_SECS, PROXY_MAX_BYTES, SHORT_TIMEOUT_SECS, auth_order, is_auth_status,
+        leg_timeout_secs, parse_balance, proxy_valid, team_parts, token_params,
     };
     use crate::api::FetchError;
+    use crate::api::TokenLeg;
     use serde_json::json;
 
     /// Credential shape order: bare key first by default, Bearer first once remembered as needed.
@@ -671,6 +701,48 @@ mod tests {
     fn auth_order_by_memory() {
         assert_eq!(auth_order("k", "Bearer k", false), ("k", "Bearer k"));
         assert_eq!(auth_order("k", "Bearer k", true), ("Bearer k", "k"));
+    }
+
+    /// Timeout tier per token window pinned: the month window's 30-day body
+    /// rides the long agent; today/week keep the short one.
+    #[test]
+    fn token_window_timeout_tiers() {
+        assert_ne!(SHORT_TIMEOUT_SECS, LONG_TIMEOUT_SECS);
+        assert_eq!(leg_timeout_secs(TokenLeg::Today), SHORT_TIMEOUT_SECS);
+        assert_eq!(leg_timeout_secs(TokenLeg::Week), SHORT_TIMEOUT_SECS);
+        assert_eq!(leg_timeout_secs(TokenLeg::Month), LONG_TIMEOUT_SECS);
+    }
+
+    /// Team request shape pinned: the type param (quota/limit=2,
+    /// model-usage=3) joins with the separator the existing query dictates,
+    /// plus both selection headers; personal edition gets neither.
+    #[test]
+    fn team_parts_shape() {
+        let mut url = String::from("https://open.bigmodel.cn/api/monitor/usage/quota/limit");
+        let extra = team_parts(&mut url, "2", Some(("org-9", "proj-8")));
+        assert_eq!(
+            url,
+            "https://open.bigmodel.cn/api/monitor/usage/quota/limit?type=2"
+        );
+        assert_eq!(
+            extra,
+            vec![
+                ("Bigmodel-Organization", "org-9"),
+                ("Bigmodel-Project", "proj-8")
+            ]
+        );
+        // model-usage already carries a query: the separator is '&'.
+        let mut url = String::from(
+            "https://open.bigmodel.cn/api/monitor/usage/model-usage?startTime=a&endTime=b",
+        );
+        let extra = team_parts(&mut url, "3", Some(("o", "p")));
+        assert!(url.ends_with("&type=3"));
+        assert_eq!(extra.len(), 2);
+        // Personal edition: URL untouched, no headers.
+        let mut url = String::from("https://open.bigmodel.cn/api/monitor/usage/quota/limit");
+        let before = url.clone();
+        assert!(team_parts(&mut url, "2", None).is_empty());
+        assert_eq!(url, before);
     }
 
     /// Shape-switch retry only recognizes status-side auth failures:

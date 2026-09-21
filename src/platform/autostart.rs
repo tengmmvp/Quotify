@@ -19,16 +19,33 @@ pub fn is_enabled() -> bool {
     else {
         return false;
     };
-    let registered = value.trim().trim_matches('"');
-    if registered.is_empty() {
-        return false;
-    }
     let Ok(exe) = std::env::current_exe() else {
         return false;
     };
-    registered
-        .replace('/', "\\")
-        .eq_ignore_ascii_case(&exe.display().to_string().replace('/', "\\"))
+    points_to_exe(&value, &exe.display().to_string())
+}
+
+/// The executable path segment of a Run value: the quoted span when
+/// quoted, otherwise up to the first whitespace — the rest is arguments.
+fn exe_segment(value: &str) -> &str {
+    let v = value.trim();
+    if let Some(rest) = v.strip_prefix('"') {
+        rest.split('"').next().unwrap_or("")
+    } else {
+        v.split_whitespace().next().unwrap_or("")
+    }
+}
+
+/// Whether a Run value's exe segment is the given path, compared
+/// case-insensitively with slashes normalized — hand-edited forms
+/// (arguments, quoting, case) still count as enabled instead of being
+/// overwritten on the next enable.
+fn points_to_exe(value: &str, exe: &str) -> bool {
+    let seg = exe_segment(value);
+    !seg.is_empty()
+        && seg
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&exe.replace('/', "\\"))
 }
 
 /// Enable/disable autostart
@@ -53,5 +70,37 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
             }
             Err(e) => Err(format!("删除自启注册表失败: {e}")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const EXE: &str = r"C:\Apps\Quotify\Quotify.exe";
+
+    /// A Run value in any of the three live forms — bare path, quoted,
+    /// argument-carrying — reads as enabled, including case and slash
+    /// variants.
+    #[test]
+    fn points_to_exe_matches_edited_forms() {
+        assert!(super::points_to_exe(EXE, EXE));
+        assert!(super::points_to_exe(&format!("\"{EXE}\""), EXE));
+        assert!(super::points_to_exe(&format!("{EXE} --minimized"), EXE));
+        assert!(super::points_to_exe(&format!("\"{EXE}\" --minimized"), EXE));
+        assert!(super::points_to_exe(
+            &format!("\"{}\"", EXE.to_ascii_lowercase()),
+            EXE
+        ));
+        assert!(super::points_to_exe(&EXE.replace('\\', "/"), EXE));
+    }
+
+    /// A different exe, blank values, and a path merely prefixed by ours
+    /// all stay disabled.
+    #[test]
+    fn points_to_exe_rejects_other_targets() {
+        assert!(!super::points_to_exe("\"C:\\Other\\app.exe\"", EXE));
+        assert!(!super::points_to_exe("", EXE));
+        assert!(!super::points_to_exe("   ", EXE));
+        assert!(!super::points_to_exe("\"\"", EXE));
+        assert!(!super::points_to_exe(&format!("{EXE}.bak --arg"), EXE));
     }
 }

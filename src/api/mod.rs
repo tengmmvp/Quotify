@@ -76,6 +76,13 @@ impl AccountSpec {
         let project = self.project_id.trim();
         (!org.is_empty() && !project.is_empty()).then_some((org, project))
     }
+
+    /// Effective API key: surrounding whitespace/CR/LF trimmed, same
+    /// discipline as org/project — a key pasted with stray newlines would
+    /// reach the Authorization header verbatim and fail as a Network error.
+    fn trimmed_key(&self) -> &str {
+        self.api_key.trim()
+    }
 }
 
 /// Plan generation.
@@ -327,7 +334,6 @@ pub(crate) fn merge_sidecar(new: &mut UsageSnapshot, prev: Option<&UsageSnapshot
     }
 }
 
-/// Main-view height features.
 /// The single source of truth for the four features — metric row count, composition section,
 /// Token stats, balance; sync_derived's height input derives from here, and block display
 /// decisions must share this source — a missed sync means clipped content or
@@ -707,6 +713,19 @@ fn parse_bucket(item: &Value) -> QuotaBucket {
 /// count feeding render and height stays bounded.
 const MCP_TOP_N: usize = 20;
 
+/// Char cap for untrusted display strings (plan label, model code): a
+/// hostile value must not blow the panel layout.
+const UNTRUSTED_FIELD_CHARS: usize = 64;
+
+/// Clean an untrusted display string: control characters stripped, length
+/// capped at UNTRUSTED_FIELD_CHARS.
+fn clean_field_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(UNTRUSTED_FIELD_CHARS)
+        .collect()
+}
+
 /// Parsed per-model breakdown with the whole-set totals kept: returns
 /// (capped details, raw entry count, whole-set usage sum) — the totals
 /// are recorded before the cap so the truncated tail still counts in
@@ -719,7 +738,7 @@ fn parse_mcp_details(item: &Value) -> (Vec<McpDetail>, usize, f64) {
                 .iter()
                 .filter_map(|d| {
                     Some(McpDetail {
-                        model_code: d.get("modelCode")?.as_str()?.to_string(),
+                        model_code: clean_field_text(d.get("modelCode")?.as_str()?),
                         usage: d.get("usage").and_then(Value::as_f64).unwrap_or(0.0),
                     })
                 })
@@ -746,7 +765,7 @@ pub fn parse_usage(data: &Value) -> UsageSnapshot {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .map(str::to_string)
+                .map(clean_field_text)
         });
     let tier = plan_label
         .as_deref()
@@ -979,6 +998,24 @@ mod tests {
         assert!(spec(Platform::Intl).team_scope().is_none());
     }
 
+    /// Key trim discipline pinned, matching org/project: surrounding
+    /// whitespace/CR/LF never reach the Authorization header.
+    #[test]
+    fn trimmed_key_strips_surrounding_whitespace() {
+        let spec = |key: &str| AccountSpec {
+            platform: Platform::Cn,
+            team: false,
+            org_id: String::new(),
+            project_id: String::new(),
+            api_key: key.into(),
+        };
+        assert_eq!(spec(" k ").trimmed_key(), "k");
+        assert_eq!(spec("\r\nk\r\n").trimmed_key(), "k");
+        assert_eq!(spec("\tk\t").trimmed_key(), "k");
+        assert_eq!(spec("k").trimmed_key(), "k");
+        assert_eq!(spec(" \r\n ").trimmed_key(), "");
+    }
+
     /// Minimal test snapshot: feature fields filled per argument, the rest left empty.
     /// mcp Some(n): bucket present with n details; Some(0): bucket present with empty
     /// details; None: bucket absent
@@ -1088,6 +1125,36 @@ mod tests {
         assert_eq!(mcp.total_count, MCP_TOP_N + 6);
         let whole: f64 = (0..(MCP_TOP_N + 5)).map(|i| i as f64).sum::<f64>() + 1000.0;
         assert_eq!(mcp.total_usage, whole);
+    }
+
+    /// Untrusted display fields cleaned: control characters stripped and
+    /// length capped on both the plan label and model codes — tier
+    /// classification reads the cleaned label.
+    #[test]
+    fn untrusted_field_text_capped_and_control_stripped() {
+        use serde_json::json;
+        let long = "m".repeat(UNTRUSTED_FIELD_CHARS + 20);
+        let body = json!({
+            "success": true,
+            "data": {
+                "planName": " \u{2}Lite\u{3} ",
+                "limits": [{
+                    "type": "TIME_LIMIT",
+                    "percentage": 1.0,
+                    "usageDetails": [
+                        { "modelCode": "a\r\u{1}b", "usage": 9 },
+                        { "modelCode": long, "usage": 1 }
+                    ]
+                }]
+            }
+        })
+        .to_string();
+        let snap = parse_response(&body).unwrap();
+        assert_eq!(snap.plan_label.as_deref(), Some("Lite"));
+        assert_eq!(snap.tier, PlanTier::Lite);
+        let details = snap.mcp.unwrap().details;
+        assert_eq!(details[0].model_code, "ab");
+        assert_eq!(details[1].model_code.chars().count(), UNTRUSTED_FIELD_CHARS);
     }
 
     /// Tray ring priority: a present 5h bucket beats everything, absence falls back to the weekly

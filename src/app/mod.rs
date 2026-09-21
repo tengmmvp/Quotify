@@ -86,9 +86,10 @@ struct TrayState {
     last_icon_key: Option<(i32, i64, bool, bool)>,
     /// Tray state generation: each successful writer (this round's commit,
     /// a nested refresh, a rearm re-add) advances it once; compared after
-    /// the nested pump, and a change means yield — a single criterion
-    /// replacing the stacked guesswork of handle identity plus content-key
-    /// snapshots
+    /// the nested pump, and a change means yield for state commits —
+    /// surrendering a submitted icon handle additionally requires the
+    /// installed handle to have been replaced (a gen bump alone may be a
+    /// tooltip-only commit)
     generation: u64,
 }
 
@@ -154,6 +155,20 @@ impl TrayState {
         }
         self.icon = new;
         self.last_icon_key = Some(key);
+    }
+
+    /// Whether a nested writer replaced the installed icon during this
+    /// round's pump: the generation changed and the installed handle no
+    /// longer matches the pre-pump snapshot — the only positive evidence
+    /// for surrendering this round's submitted handle; a gen bump with the
+    /// handle untouched may be a tooltip-only commit, and the shell may
+    /// still be displaying this round's handle.
+    fn nested_replaced_icon(
+        &self,
+        gen_before: u64,
+        installed_before: Option<windows::Win32::UI::WindowsAndMessaging::HICON>,
+    ) -> bool {
+        self.generation != gen_before && self.icon != installed_before
     }
 
     /// Post-re-add write-back: mark registered, drop both content keys so
@@ -390,13 +405,15 @@ impl App {
         let Some(new) = new else {
             return;
         };
-        // Pre-pump generation: a nested refresh inside the pump installing
+        // Pre-pump snapshot: a nested refresh inside the pump installing
         // its own icon, or a rearm re-adding the in-use handle, both
-        // advance it; after the pump, yielding is decided on this one
-        // criterion alone. A nested writer winning means committing would
-        // destroy the in-use handle and writing back the key would seal off
-        // the full refresh rearm posted.
+        // advance the generation. A nested writer winning means committing
+        // would destroy the in-use handle and writing back the key would
+        // seal off the full refresh rearm posted; a gen bump alone is not
+        // proof of takeover — a tooltip-only commit whose icon submit
+        // failed leaves this round's handle still on screen.
         let gen_before = app.tray_state.generation();
+        let installed_before = app.tray_state.icon;
         // Destroy the old handle and advance the key only on successful
         // submission; failures are retried by the next refresh.
         let set = app.tray_state.update_icon(new);
@@ -407,6 +424,9 @@ impl App {
         let mut new = Some(new);
         if !submit_tray_gen(tray_hwnd, gen_before, |app| {
             app.tray_state.install_icon(new.take(), key);
+        }) && app_from(tray_hwnd).is_some_and(|app| {
+            app.tray_state
+                .nested_replaced_icon(gen_before, installed_before)
         }) && let Some(n) = new.take()
         {
             icon::destroy_owned(n);
@@ -543,23 +563,26 @@ impl App {
             self.strings.notify_reset_weekly,
         ));
 
-        if g.notify_threshold_enabled {
-            let th = g.notify_threshold_percent as f64;
-            out.extend(check_threshold(
-                snap.five_hour.as_ref(),
-                &mut self.threshold_armed_5h,
-                th,
-                self.strings.five_hour,
-                self.strings.notify_threshold_title,
-            ));
-            out.extend(check_threshold(
-                snap.weekly.as_ref(),
-                &mut self.threshold_armed_weekly,
-                th,
-                self.strings.weekly,
-                self.strings.notify_threshold_title,
-            ));
-        }
+        // The threshold checks run unconditionally (same shape as
+        // check_reset): enabled gates only the sending, so the
+        // fall-below re-arm still happens while notifications are off.
+        let th = g.notify_threshold_percent as f64;
+        out.extend(check_threshold(
+            snap.five_hour.as_ref(),
+            &mut self.threshold_armed_5h,
+            th,
+            g.notify_threshold_enabled,
+            self.strings.five_hour,
+            self.strings.notify_threshold_title,
+        ));
+        out.extend(check_threshold(
+            snap.weekly.as_ref(),
+            &mut self.threshold_armed_weekly,
+            th,
+            g.notify_threshold_enabled,
+            self.strings.weekly,
+            self.strings.notify_threshold_title,
+        ));
         out
     }
 
@@ -610,7 +633,8 @@ use crate::locks::borrow;
 /// a nested writer inside the pump (refresh or rearm) has already
 /// advanced the state, and pre-pump values would clobber it. Returns
 /// whether the commit ran; callers holding artifacts (an uninstalled
-/// icon handle) discard them on false.
+/// icon handle) discard them on false only once a nested install is
+/// confirmed (nested_replaced_icon).
 fn submit_tray_gen(tray_hwnd: HWND, gen_before: u64, commit: impl FnOnce(&mut App)) -> bool {
     if let Some(app) = app_from(tray_hwnd)
         && app.tray_state.generation() == gen_before
@@ -905,7 +929,14 @@ extern "system" fn tray_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LP
                     crate::platform::log(&format!("检查更新失败: {e}"));
                 }
                 app.set_update_status(Some(r));
-                if let Some(p) = app.panel.hwnd {
+                // update_status renders only on the settings page: gate the
+                // relayout on the visible settings view (the news arm gates
+                // refit_about the same way on is_open), so a result landing
+                // after the user left the page costs no full relayout.
+                if app.panel.view == crate::ui::panel::PanelView::Settings
+                    && app.panel.mode != crate::ui::panel::PanelMode::Hidden
+                    && let Some(p) = app.panel.hwnd
+                {
                     relayout_panel(app, p);
                     invalidate_panel(p);
                 }
@@ -1096,14 +1127,20 @@ fn open_anchor(hwnd: HWND, app: &App) -> RECT {
 /// Open-door anchor for when the icon rect is unobtainable: a small
 /// square at the bottom-right corner of the tray window's monitor work
 /// area — the panel pops out anchored as usual, just without the icon's
-/// exact position
+/// exact position. The square approximates the shell-reported icon rect
+/// (a taskbar-icon-sized square inset from the work-area corner).
+const FALLBACK_ANCHOR_INSET: i32 = 20;
+const FALLBACK_ANCHOR_SIZE: i32 = 24;
+
 fn fallback_anchor(hwnd: HWND) -> RECT {
     let mi = unsafe { crate::ui::panel::monitor_info_of(hwnd) };
+    let right = mi.rcWork.right - FALLBACK_ANCHOR_INSET;
+    let bottom = mi.rcWork.bottom - FALLBACK_ANCHOR_INSET;
     RECT {
-        left: mi.rcWork.right - 44,
-        top: mi.rcWork.bottom - 44,
-        right: mi.rcWork.right - 20,
-        bottom: mi.rcWork.bottom - 20,
+        left: right - FALLBACK_ANCHOR_SIZE,
+        top: bottom - FALLBACK_ANCHOR_SIZE,
+        right,
+        bottom,
     }
 }
 
@@ -1490,24 +1527,28 @@ pub fn run() -> i32 {
             crate::platform::log(&format!("初始图标加载失败 (px={px})"));
         }
         let initial = initial.unwrap_or_default();
-        app.tray_state
-            .install(TrayIcon::new(hwnd, initial), initial);
-        // Autostart may race an unready taskbar; on failure arm the
-        // short-haul retry until the icon is in place.
-        if !app.tray_state.registered() {
-            app.tray_state.retries = 0;
-            SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
-        }
+        // TrayIcon::new's NIM_ADD is a pump point: the startup tail runs on
+        // the re-fetched alias; the local Box alias must not cross it.
+        let tray = TrayIcon::new(hwnd, initial);
+        if let Some(app) = app_from(hwnd) {
+            app.tray_state.install(tray, initial);
+            // Autostart may race an unready taskbar; on failure arm the
+            // short-haul retry until the icon is in place.
+            if !app.tray_state.registered() {
+                app.tray_state.retries = 0;
+                SetTimer(Some(hwnd), TIMER_TRAY_RETRY, TRAY_RETRY_MS, None);
+            }
 
-        app.sync_poll_context();
-        app.poller = Poller::spawn(
-            hwnd,
-            app.poll_target.clone(),
-            app.poll_interval.clone(),
-            app.poll_gen.clone(),
-        );
-        if let Some(p) = &app.poller {
-            p.refresh_now();
+            app.sync_poll_context();
+            app.poller = Poller::spawn(
+                hwnd,
+                app.poll_target.clone(),
+                app.poll_interval.clone(),
+                app.poll_gen.clone(),
+            );
+            if let Some(p) = &app.poller {
+                p.refresh_now();
+            }
         }
 
         // Diagnostics backdoor, effective in debug only:
@@ -1619,6 +1660,61 @@ mod tests {
         assert_eq!(c.selected.as_deref(), Some("a2"));
     }
 
+    /// Team edition exists only on the CN site: an imported team+Intl
+    /// account is forced back to CN (polling would otherwise send team
+    /// params to the international base URL); the team flag itself stays,
+    /// and non-team Intl accounts pass through untouched.
+    #[test]
+    fn normalize_forces_team_intl_back_to_cn() {
+        fn acct(
+            id: &str,
+            platform: crate::api::Platform,
+            team: bool,
+        ) -> crate::app::config::Account {
+            crate::app::config::Account {
+                id: id.into(),
+                name: "n".into(),
+                platform,
+                team,
+                org_id: String::new(),
+                project_id: String::new(),
+                api_key: "k".into(),
+            }
+        }
+        let mut c = Config {
+            accounts: vec![
+                acct("a1", crate::api::Platform::Intl, true),
+                acct("a2", crate::api::Platform::Intl, false),
+                acct("a3", crate::api::Platform::Cn, true),
+            ],
+            ..Config::default()
+        };
+        normalize_config(&mut c);
+        assert_eq!(c.accounts[0].platform, crate::api::Platform::Cn);
+        assert!(c.accounts[0].team, "仅回站点，类型不改");
+        assert_eq!(c.accounts[1].platform, crate::api::Platform::Intl);
+        assert_eq!(c.accounts[2].platform, crate::api::Platform::Cn);
+    }
+
+    /// The read marker folds onto the canonical zero-padded form (the NEW
+    /// badge's lexical comparison depends on it); a non-date value carries
+    /// no marker semantics and clears back to the all-unread default.
+    #[test]
+    fn normalize_folds_news_read_marker() {
+        let mut c = Config::default();
+        c.general.last_news_read = Some("2026-8-7".into());
+        normalize_config(&mut c);
+        assert_eq!(c.general.last_news_read.as_deref(), Some("2026-08-07"));
+
+        c.general.last_news_read = Some("not-a-date".into());
+        normalize_config(&mut c);
+        assert_eq!(c.general.last_news_read, None, "非日期值无标记语义，清空");
+
+        c.general.last_news_read = Some("2026-08-27".into());
+        normalize_config(&mut c);
+        assert_eq!(c.general.last_news_read.as_deref(), Some("2026-08-27"));
+    }
+
     #[test]
     fn appearance_resolved_from_setting() {
         use crate::ui::panel::theme::{Appearance, resolved};
@@ -1631,5 +1727,28 @@ mod tests {
             resolved(None),
             "未知值与未配置同为跟随系统"
         );
+    }
+
+    /// Icon-handle yield verdict: destroy this round's handle only when the
+    /// generation changed AND the installed handle was replaced by another
+    /// icon; a generation bump alone may be a nested round that committed
+    /// only its tooltip (its icon commit failed) — the shell still displays
+    /// this round's handle, and destroying it would corrupt the tray icon.
+    #[test]
+    fn tray_yield_icon_needs_replaced_install() {
+        use windows::Win32::UI::WindowsAndMessaging::HICON;
+        let h = |v: usize| HICON(v as *mut core::ffi::c_void);
+        let mut t = TrayState::new();
+        t.icon = Some(h(1));
+        let gen_before = t.generation();
+        let installed_before = t.icon;
+        // 代际未变：本轮照常提交，不让位
+        assert!(!t.nested_replaced_icon(gen_before, installed_before));
+        // 代际不等 + 在装相同：可能是仅 tooltip 的提交，不销毁
+        t.bump_gen();
+        assert!(!t.nested_replaced_icon(gen_before, installed_before));
+        // 代际不等 + 在装不同：嵌套轮确已装入别的图标，销毁
+        t.icon = Some(h(2));
+        assert!(t.nested_replaced_icon(gen_before, installed_before));
     }
 }

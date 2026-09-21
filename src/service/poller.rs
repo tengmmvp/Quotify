@@ -67,7 +67,10 @@ pub struct Poller {
 }
 
 impl Poller {
-    /// Spawn the polling thread
+    /// Spawn the polling thread. Returns None when an event or the thread
+    /// fails to create — the sole caller (app/mod.rs) then simply keeps the
+    /// poller empty: no polling, no data until restart; every failure arm
+    /// logs.
     pub fn spawn(
         hwnd: windows::Win32::Foundation::HWND,
         target: PollTarget,
@@ -75,7 +78,13 @@ impl Poller {
         generation: PollGeneration,
     ) -> Option<Self> {
         unsafe {
-            let wake = CreateEventW(None, false, false, None).ok()?;
+            let wake = match CreateEventW(None, false, false, None) {
+                Ok(w) => w,
+                Err(e) => {
+                    crate::platform::log(&format!("轮询唤醒事件创建失败: {e}"));
+                    return None;
+                }
+            };
             // Partial-init rollback is symmetric with the thread-spawn arm
             // below: a failed stop-event creation must close the already
             // created wake handle, or it leaks with no log on this path.
@@ -142,9 +151,10 @@ impl Poller {
     /// Abandon the polling thread without joining or closing anything:
     /// session-end exit only — the process dies with the session
     /// regardless, and Drop's join bound (one in-flight request's agent
-    /// timeout, up to ~15s) would stall the session teardown and risk the
-    /// OS force-killing the process before the tray cleanup runs. Stop is
-    /// signaled first so a thread at the wait point exits promptly.
+    /// timeout, api::client::LONG_TIMEOUT_SECS) would stall the session
+    /// teardown and risk the OS force-killing the process before the tray
+    /// cleanup runs. Stop is signaled first so a thread at the wait point
+    /// exits promptly.
     pub fn detach(self) {
         unsafe {
             let _ = SetEvent(self.stop);
@@ -160,9 +170,9 @@ impl Drop for Poller {
         };
         if let Some(t) = self.thread.take() {
             // The join upper bound is one in-flight request's agent-global
-            // timeout (15s for the main endpoint): only after the request
-            // returns does the loop reach the wait point again and see
-            // stop.
+            // timeout (api::client::LONG_TIMEOUT_SECS): only after the
+            // request returns does the loop reach the wait point again and
+            // see stop.
             let _ = t.join();
         }
         unsafe {

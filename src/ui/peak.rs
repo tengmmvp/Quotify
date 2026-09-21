@@ -5,7 +5,9 @@ use chrono::{DateTime, Datelike, FixedOffset, Timelike};
 /// Minute range within a day, [start, end); the default is the official 14:00–18:00
 pub type PeakRange = (u32, u32);
 
-pub const DEFAULT_PEAK: PeakRange = (14 * 60, 18 * 60);
+/// Sole source of the default; app/config.rs's default value and template
+/// both render from this constant
+pub(crate) const DEFAULT_PEAK: PeakRange = (14 * 60, 18 * 60);
 
 fn beijing() -> FixedOffset {
     FixedOffset::east_opt(8 * 3600).expect("固定偏移恒合法")
@@ -50,9 +52,14 @@ pub fn peak_range(start: &str, end: &str) -> PeakRange {
     }
 }
 
+/// Renders minutes-of-day as HH:MM — the single HH:MM formatter, shared
+/// by fmt_range and config's default/template rendering
+pub(crate) fn hhmm(min: u32) -> String {
+    format!("{:02}:{:02}", min / 60, min % 60)
+}
+
 /// Formats the range as HH:MM–HH:MM
 pub fn fmt_range(range: PeakRange) -> String {
-    let hhmm = |t: u32| format!("{:02}:{:02}", t / 60, t % 60);
     format!("{}–{}", hhmm(range.0), hhmm(range.1))
 }
 
@@ -111,6 +118,7 @@ mod tests {
         assert_eq!(parse_hhmm("24:00"), None);
         assert_eq!(parse_hhmm("12:60"), None);
         assert_eq!(parse_hhmm("abc"), None);
+        assert_eq!(hhmm(9 * 60 + 5), "09:05");
         assert_eq!(fmt_range(DEFAULT_PEAK), "14:00–18:00");
     }
 

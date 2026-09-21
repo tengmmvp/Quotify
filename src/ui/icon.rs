@@ -35,9 +35,12 @@ pub fn resource_icon(px: i32) -> Option<HICON> {
 /// the panel's red text and red bar
 pub(crate) const CRITICAL_PCT: f64 = 90.0;
 
+/// Warning usage threshold (percent): the tray icon's orange tier
+const WARN_PCT: f64 = 70.0;
+
 /// Usage tier colors
 fn tier_color(used_percent: f64) -> (u8, u8, u8) {
-    if used_percent < 70.0 {
+    if used_percent < WARN_PCT {
         (0x34, 0xC7, 0x59) // systemGreen
     } else if used_percent < CRITICAL_PCT {
         (0xFF, 0x9F, 0x0A) // systemOrange
@@ -141,12 +144,27 @@ fn ring_on_arc(a: f32, remain: f32, failed: bool) -> bool {
     !failed && remain > 0.004 && a <= remain * 360.0
 }
 
+/// Ring stroke tuning: nominal share of the icon edge, with clamp bounds being the
+/// old absolute 2.5–7.0 px limits rescaled per px — the share, not the width, is
+/// the DPI-invariant quantity. The max bound dominates at every px (the nominal
+/// share exceeds it), so the effective share is constant.
+const RING_STROKE_SHARE: f32 = 0.22;
+const RING_STROKE_MIN_SHARE: f32 = 2.5 / 32.0;
+const RING_STROKE_MAX_SHARE: f32 = 7.0 / 32.0;
+
+/// Ring stroke width: edge × fixed share, so the ring keeps one proportion
+/// at every DPI.
+fn ring_stroke(px: i32) -> f32 {
+    let s = px as f32;
+    s * RING_STROKE_SHARE.clamp(RING_STROKE_MIN_SHARE, RING_STROKE_MAX_SHARE)
+}
+
 /// Ring remaining-quota icon
 pub fn ring_icon(px: i32, used_percent: f64, failed: bool) -> Option<HICON> {
     let px = px.max(MIN_PX);
     let mut buf = vec![0u8; (px * px * 4) as usize];
     let s = px as f32;
-    let stroke = (s * 0.22).clamp(2.5, 7.0);
+    let stroke = ring_stroke(px);
     let r_mid = (s - stroke) / 2.0 - 0.5;
     let (cx, cy) = ((s - 1.0) / 2.0, (s - 1.0) / 2.0);
     let (tr, tg, tb) = tier_color(used_percent);
@@ -223,6 +241,12 @@ fn in_polygon(x: f32, y: f32, pts: &[(f32, f32)]) -> bool {
     inside
 }
 
+/// AND-mask byte length: 1bpp DIB rows are DWORD-aligned (ceil(px/32)*4 bytes each),
+/// so the padded tail per row must be zeroed too.
+fn mask_len(px: i32) -> usize {
+    (px as usize).div_ceil(32) * 4 * px as usize
+}
+
 /// Pixel buffer (BGRA) → HICON: the AND mask is all zeros; opacity is decided by alpha.
 fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
     let hdr = |bpp: u16| BITMAPINFOHEADER {
@@ -270,11 +294,7 @@ fn pixels_to_hicon(pixels: &[u8], px: i32) -> Option<HICON> {
             }
         };
         if !mask_bits.is_null() {
-            std::ptr::write_bytes(
-                mask_bits as *mut u8,
-                0,
-                (px as usize * px as usize).div_ceil(8),
-            );
+            std::ptr::write_bytes(mask_bits as *mut u8, 0, mask_len(px));
         }
 
         let info = ICONINFO {
@@ -360,6 +380,28 @@ mod tests {
         assert_eq!(tier_color(89.9), (0xFF, 0x9F, 0x0A));
         assert_eq!(tier_color(90.0), (0xFF, 0x45, 0x3A), "90 起进红档");
         assert_eq!(tier_color(100.0), (0xFF, 0x45, 0x3A));
+    }
+
+    /// The mask must be zeroed over stride-padded rows, not the packed bit count:
+    /// px that is not a multiple of 32 leaves tail rows uninitialized otherwise.
+    #[test]
+    fn mask_len_covers_stride_padded_rows() {
+        assert_eq!(mask_len(16), 64);
+        assert_eq!(mask_len(32), 128, "32 倍数边长与旧公式数值一致");
+        assert_eq!(mask_len(40), 320, "125% DPI：8 字节行距×40 行");
+        assert_eq!(mask_len(48), 384, "150% DPI：8 字节行距×48 行");
+    }
+
+    #[test]
+    fn ring_stroke_share_is_dpi_invariant() {
+        assert_eq!(ring_stroke(32), 7.0, "32px 参考档维持旧值");
+        for &px in &[16, 40, 48, 64] {
+            assert!(
+                (ring_stroke(px) / px as f32 - ring_stroke(32) / 32.0).abs() < 1e-6,
+                "px {px} 占比漂移"
+            );
+        }
+        assert_eq!(ring_stroke(48), 10.5, "150% DPI 不再被绝对上限压细");
     }
 
     /// Ring arc orientation: 12 o'clock is 0°, clockwise positive, in

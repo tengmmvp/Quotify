@@ -81,16 +81,24 @@ pub fn handle_panel_hit(
         // ── Navigation ──
         Hit::Back => {
             app.panel.key_revealed = false;
-            app.panel.customizing.set_pending(false);
-            app.panel.clear_input(origin_hwnd);
             // Back from the form view returns to the settings page; back
             // from the settings page is what returns to the main view.
-            app.panel.view = if app.panel.view == crate::ui::panel::PanelView::AddForm {
-                crate::ui::panel::PanelView::Settings
-            } else {
-                crate::ui::panel::PanelView::Main
-            };
-            relayout_panel(app, origin_hwnd);
+            let keeps_row = back_keeps_customizing(app.panel.view);
+            if !keeps_row {
+                app.panel.customizing.set_pending(false);
+            }
+            // clear_input's IME detach is a pump: the tail takes the
+            // re-fetched reference.
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
+                app.panel.clear_input(origin_hwnd);
+            }) {
+                app.panel.view = if keeps_row {
+                    crate::ui::panel::PanelView::Settings
+                } else {
+                    crate::ui::panel::PanelView::Main
+                };
+                relayout_panel(app, origin_hwnd);
+            }
         }
         Hit::ClosePanel => {
             hide_panel(app, origin_hwnd);
@@ -114,12 +122,14 @@ pub fn handle_panel_hit(
                 app.sync_poll_context();
             }
             app.panel.customizing.set_pending(false);
-            app.panel.clear_input(origin_hwnd);
-            // The layout sync's SetWindowPos is a pump: the retry goes
-            // last and takes the re-fetched reference. A changed value
-            // always refetches; an unchanged click retries only in the
-            // error state (no dead clicks).
+            // clear_input's IME detach and the layout sync's SetWindowPos
+            // are pumps: each stage takes the re-fetched reference, and
+            // the retry goes last. A changed value always refetches; an
+            // unchanged click retries only in the error state (no dead
+            // clicks).
             if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
+                app.panel.clear_input(origin_hwnd);
+            }) && let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
                 sync_layout_effective(app, origin_hwnd)
             }) {
                 if changed {
@@ -286,8 +296,13 @@ pub fn handle_panel_hit(
                 // type to team also snaps the platform back to CN.
                 app.panel.pending_platform = crate::api::Platform::Cn;
             }
-            reconcile_fading_focus(app, origin_hwnd);
-            sync_layout_effective(app, origin_hwnd);
+            // reconcile_fading_focus may clear_input (IME detach = pump):
+            // the layout sync takes the re-fetched reference.
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
+                reconcile_fading_focus(app, origin_hwnd);
+            }) {
+                sync_layout_effective(app, origin_hwnd);
+            }
         }
         Hit::InputName => {
             app.panel
@@ -324,8 +339,13 @@ pub fn handle_panel_hit(
                 // international site also snaps the type back to personal.
                 app.panel.team.set_pending(false);
             }
-            reconcile_fading_focus(app, origin_hwnd);
-            sync_layout_effective(app, origin_hwnd);
+            // reconcile_fading_focus may clear_input (IME detach = pump):
+            // the layout sync takes the re-fetched reference.
+            if let Some(app) = crate::app::pump(app, origin_hwnd, |app| {
+                reconcile_fading_focus(app, origin_hwnd);
+            }) {
+                sync_layout_effective(app, origin_hwnd);
+            }
         }
 
         // ── Settings · config management and about ──
@@ -428,24 +448,58 @@ pub fn handle_panel_hit(
         }
     }
     invalidate_panel(origin_hwnd);
+    // Save failures anywhere in this dispatch surface their toast here, at
+    // the arm's end: the WinRT toast is a pump point and no arm may use
+    // its reference past one — save's callers never learn the write
+    // outcome directly. The reference is re-fetched (arms may have moved
+    // it through their pumps), so the text follows the configured
+    // language, a mid-dispatch language switch included.
+    if crate::app::config::take_save_failed()
+        && let Some(app) = crate::app::app_from_tray(origin_hwnd)
+    {
+        crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_save_failed);
+    }
 }
+
+/// Back keeps the custom-interval row's state only on the add-form →
+/// settings return: a non-preset interval stays visible after the form
+/// round-trip; leaving the settings page folds the row along with it
+fn back_keeps_customizing(view: crate::ui::panel::PanelView) -> bool {
+    view == crate::ui::panel::PanelView::AddForm
+}
+
 /// Strips the user-credentials segment from a proxy string so the
 /// diagnostics output carries no userinfo
 fn redact_proxy(p: &str) -> String {
-    let Some(scheme_end) = p.find("://") else {
-        return p.to_string();
+    // A hand-written config entry may carry credentials with no scheme:
+    // the authority starts at the beginning there.
+    let (head, rest) = match p.find("://") {
+        Some(scheme_end) => (&p[..scheme_end + 3], &p[scheme_end + 3..]),
+        None => ("", p),
     };
-    let rest = &p[scheme_end + 3..];
     // The split shares proxy_split_userinfo with proxy_valid: a divergence
     // in the two parsers' edge semantics would leak the password tail into
     // the diagnostics text.
     let (userinfo, host) = crate::api::client::proxy_split_userinfo(rest);
     match userinfo {
-        // The head already contains the scheme's trailing "://"; just
-        // concatenate.
-        Some(_) => format!("{}{}", &p[..scheme_end + 3], host),
+        Some(_) => format!("{head}{host}"),
         None => p.to_string(),
     }
+}
+
+/// One-line sanitizing for diagnostics: error text originates from a
+/// server response body, so cap its length and blank control characters
+fn clean_for_diag(s: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let mut out: String = s
+        .chars()
+        .take(MAX_CHARS)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if s.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// Assembles the About window's "copy diagnostics" text
@@ -486,7 +540,9 @@ fn diagnostics_text(app: &App) -> String {
             None => "Proxy: direct".into(),
         },
         match &app.data.last_error {
-            Some(e) => format!("Last error: {e}"),
+            // The message originates from a server response body: cap and
+            // clean it before it enters the pasteable text.
+            Some(e) => format!("Last error: {}", clean_for_diag(&e.to_string())),
             None => "Last error: none".into(),
         },
     ]
@@ -510,6 +566,9 @@ fn diagnostics_text(app: &App) -> String {
 /// reset the notification state so the new account's first snapshot does
 /// not false-alarm
 fn reset_notify_state(app: &mut App) {
+    // Armed — deliberately unlike cold start (both start false): the
+    // account was switched to on purpose, so an over-threshold bucket
+    // alerts on its first snapshot instead of waiting for a re-arm dip.
     app.threshold_armed_5h = true;
     app.last_reset_5h = None;
     app.threshold_armed_weekly = true;
@@ -626,7 +685,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         ));
         // The toast is a pump point: the text is built up front and this
         // arm ends right after it — the reference is dead past the pump.
-        crate::platform::notify::show(NOTIFY_TITLE, app.strings.notify_account_limit);
+        crate::platform::notify::show(NOTIFY_TITLE, &account_limit_text(app.strings));
         return;
     }
     let name = app.panel.input.name.trim().to_string();
@@ -682,7 +741,7 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
         api_key: key,
     };
     let before = poll_target_id(app);
-    app.config.accounts.push(acc.clone());
+    app.config.accounts.push(acc);
     // Selection backfill goes through the shared single source: a first
     // account selects itself, an already-valid selection stays (adding a
     // non-selected account does not switch the source, so no
@@ -696,8 +755,20 @@ fn save_pending_account(app: &mut App, panel_hwnd: HWND) {
     app.panel
         .input
         .clear_field(crate::ui::panel::InputField::Key);
-    app.panel.clear_input(panel_hwnd);
-    relayout_panel(app, panel_hwnd);
+    // clear_input's IME detach is a pump: the relayout takes the
+    // re-fetched reference.
+    if let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
+        app.panel.clear_input(panel_hwnd);
+    }) {
+        relayout_panel(app, panel_hwnd);
+    }
+}
+
+/// Account-limit toast text: the template's {v} slot takes the live cap,
+/// so the copy never hard-codes the number
+fn account_limit_text(s: &crate::ui::i18n::Strings) -> String {
+    s.notify_account_limit
+        .replace("{v}", &crate::app::config::MAX_ACCOUNTS.to_string())
 }
 
 /// Custom interval text (minutes) → seconds: 0/non-numeric/overflow are
@@ -734,8 +805,13 @@ fn apply_interval(app: &mut App, panel_hwnd: HWND) {
     app.sync_poll_context();
     app.refresh_now();
     sync_customizing(app);
-    app.panel.clear_input(panel_hwnd);
-    sync_layout_effective(app, panel_hwnd);
+    // clear_input's IME detach is a pump: the layout sync takes the
+    // re-fetched reference.
+    if let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
+        app.panel.clear_input(panel_hwnd);
+    }) {
+        sync_layout_effective(app, panel_hwnd);
+    }
 }
 
 /// Applies the peak window: boxes left unedited keep the current config
@@ -751,15 +827,17 @@ fn apply_peak(app: &mut App, panel_hwnd: HWND) {
     } else {
         app.panel.input.peak_end.trim().to_string()
     };
-    if let (Some(s), Some(e)) = (
-        crate::ui::peak::parse_hhmm(&start),
-        crate::ui::peak::parse_hhmm(&end),
-    ) && s != e
-    {
+    let applied = matches!(
+        (
+            crate::ui::peak::parse_hhmm(&start),
+            crate::ui::peak::parse_hhmm(&end),
+        ),
+        (Some(s), Some(e)) if s != e
+    );
+    if applied {
         app.config.general.peak_start = start;
         app.config.general.peak_end = end;
         crate::app::config::save(&app.config);
-        app.panel.clear_input(panel_hwnd);
     } else {
         // The log carries the rejected pair, same style as the interval
         // and proxy rejection logs.
@@ -767,7 +845,15 @@ fn apply_peak(app: &mut App, panel_hwnd: HWND) {
             "高峰区间格式无效，应为 HH:MM 且两端不相等: {start} ~ {end}"
         ));
     }
-    relayout_panel(app, panel_hwnd);
+    // clear_input's IME detach is a pump: the relayout takes the
+    // re-fetched reference.
+    if let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
+        if applied {
+            app.panel.clear_input(panel_hwnd);
+        }
+    }) {
+        relayout_panel(app, panel_hwnd);
+    }
 }
 /// Invalidates and repaints the panel together with any open popup and
 /// the About window; shared by the appearance and language switch paths
@@ -852,11 +938,16 @@ fn apply_proxy(app: &mut App, panel_hwnd: HWND) {
     // gate reopens for later config-side changes (import).
     app.panel.input.proxy_edited = false;
     crate::app::config::save(&app.config);
-    app.panel.clear_input(panel_hwnd);
-    // The fetch after a proxy change is a fresh attempt round: a repeated
-    // failure with the same message gets logged again.
-    app.refresh_now();
-    relayout_panel(app, panel_hwnd);
+    // clear_input's IME detach is a pump: the tail takes the re-fetched
+    // reference.
+    if let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
+        app.panel.clear_input(panel_hwnd);
+    }) {
+        // The fetch after a proxy change is a fresh attempt round: a
+        // repeated failure with the same message gets logged again.
+        app.refresh_now();
+        relayout_panel(app, panel_hwnd);
+    }
 }
 /// Hit dispatch routing: modal-class hits are intercepted for the direct
 /// two-phase call and return true; the rest re-fetch the reference,
@@ -935,6 +1026,17 @@ pub(crate) fn confirm_panel_input(app: &mut App, panel_hwnd: HWND) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Back keeps the custom-interval row only on the form → settings
+    /// return; leaving settings for the main view folds it
+    #[test]
+    fn back_keeps_customizing_pinned() {
+        use crate::ui::panel::PanelView;
+        assert!(back_keeps_customizing(PanelView::AddForm));
+        assert!(!back_keeps_customizing(PanelView::Settings));
+        assert!(!back_keeps_customizing(PanelView::Main));
+    }
+
     /// With @ in the password, split at the last @: the password tail must
     /// not leak into the diagnostics text; no-credentials and standard
     /// forms pass through unchanged; a stray @ is stripped too
@@ -947,6 +1049,59 @@ mod tests {
         assert_eq!(redact_proxy("http://host:1080"), "http://host:1080");
         assert_eq!(redact_proxy("socks5://u:p@h:1"), "socks5://h:1");
         assert_eq!(redact_proxy("http://@proxy:1080"), "http://proxy:1080");
+    }
+
+    /// Credentials without a scheme are stripped too: hand-written config
+    /// entries may carry user:pass@host:port
+    #[test]
+    fn redact_proxy_without_scheme() {
+        assert_eq!(redact_proxy("user:p@ss@host:1080"), "host:1080");
+        assert_eq!(redact_proxy("user:pass@host"), "host");
+        assert_eq!(redact_proxy("host:1080"), "host:1080");
+    }
+
+    /// Server-sourced error text entering diagnostics is capped and
+    /// control characters blanked
+    #[test]
+    fn diag_error_text_capped_and_cleaned() {
+        assert_eq!(clean_for_diag("HTTP 500: boom"), "HTTP 500: boom");
+        assert_eq!(clean_for_diag("a\r\nb\u{1b}[0m"), "a  b [0m");
+        let out = clean_for_diag(&"x".repeat(500));
+        assert_eq!(out.chars().count(), 301);
+        assert!(out.ends_with('…'));
+    }
+
+    /// The account-limit toast injects the live cap into the {v} slot: no
+    /// raw placeholder left, no hard-coded number to drift
+    #[test]
+    fn account_limit_text_injects_cap() {
+        let msg = account_limit_text(crate::ui::i18n::Lang::En.strings());
+        let cap = crate::app::config::MAX_ACCOUNTS.to_string();
+        assert!(msg.contains(&cap), "未注入上限 {cap}: {msg}");
+        assert!(!msg.contains("{v}"), "占位符未替换: {msg}");
+    }
+
+    /// The account-switch path arms both thresholds (reset_notify_state):
+    /// an over-threshold bucket alerts on its first snapshot after the
+    /// switch — deliberately unlike cold start, whose armed=false keeps
+    /// the first snapshot silent
+    #[test]
+    fn account_switch_arms_first_snapshot_alert() {
+        use crate::api::QuotaBucket;
+        use crate::app::notify::check_threshold;
+        let mut app = App::new(crate::app::config::Config::default());
+        assert!(!app.threshold_armed_5h && !app.threshold_armed_weekly);
+        reset_notify_state(&mut app);
+        assert!(app.threshold_armed_5h && app.threshold_armed_weekly);
+        assert!(app.last_reset_5h.is_none() && app.last_reset_weekly.is_none());
+        let over = QuotaBucket {
+            used_percent: 95.0,
+            resets_at: None,
+            total: None,
+            current: None,
+        };
+        let mut armed = app.threshold_armed_5h;
+        assert!(check_threshold(Some(&over), &mut armed, 80.0, true, "5h", "已超 80%").is_some());
     }
 
     #[test]

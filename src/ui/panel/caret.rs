@@ -38,8 +38,16 @@ pub(super) type CaretCacheEntry = (String, std::rc::Rc<WidthArtifacts>);
 /// Slot count of the per-field width cache: the render side queries every
 /// visible field each frame, so one shared slot would thrash between
 /// fields and rebuild a full DWrite layout per field per frame. Kept in
-/// lockstep with InputField::slot by the pinned test in mod.rs.
+/// lockstep with InputField::slot by the pinned test in fields.rs.
 pub(super) const CARET_SLOTS: usize = 8;
+
+/// Blink half-period: on and off each span this; the phase decision and
+/// the focus-time clock arm share it
+const BLINK_HALF_MS: u32 = 500;
+
+/// Text-zone hit edge tolerance: the outermost strip inside the box edge is
+/// box chrome, not caret territory (the right side's strip is field_geo's tail)
+const FIELD_EDGE_TOL: f32 = 4.0;
 
 impl CaretLayout {
     /// Width of chars[a..b]; indices are clamped into the table, out-of-range never panics
@@ -116,6 +124,13 @@ pub(crate) fn masked_key_matches(cached: &str, key: &str, active: bool) -> bool 
     }
 }
 
+/// Focus-time blink-clock arm: from an idle clock, one arm at the flip
+/// point — the interaction zeroing puts the flip a full half-period out;
+/// a running clock (owned by an animation) or no caret means no tuning.
+fn blink_arm_period(clock_running: bool, caret_present: bool) -> Option<u32> {
+    (!clock_running && caret_present).then_some(BLINK_HALF_MS)
+}
+
 impl Panel {
     /// Focus an input field: enter the edit state, the IME composition window
     /// follows the caret. Switching fields resets the edit state — an undo
@@ -154,8 +169,14 @@ impl Panel {
         self.note_caret_interaction();
         unsafe {
             let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(hwnd));
-            // Keep the animation clock alive: the caret's blink-flip repaint is driven by TIMER_ANIM.
-            self.retune_anim(hwnd, 16);
+            // Blink clock follows the on_anim_tick discipline: from an idle
+            // clock, arm once at the caret's flip point; a running animation
+            // keeps its period (the next tick re-derives it), and no focus
+            // means no arm — zero spinning while idle.
+            let focused = windows::Win32::UI::Input::KeyboardAndMouse::GetFocus() == hwnd;
+            if let Some(period) = blink_arm_period(self.anim_period != 0, focused) {
+                self.retune_anim(hwnd, period);
+            }
             // Compute the layout only once: caret x and IME composition window
             // positioning share the same product; when the renderer is absent
             // (before the first frame), fall back to 0 and correct on the next
@@ -481,7 +502,7 @@ impl Panel {
         if let Some(f) = self.input.field {
             let (bx, w, tail) = layout::field_geo(f);
             let top = self.caret_line_y(f) - layout::CARET_Y_OFFSET;
-            x >= bx + 4.0 && x <= bx + w - tail && y >= top && y <= top + layout::INPUT_H
+            x >= bx + FIELD_EDGE_TOL && x <= bx + w - tail && y >= top && y <= top + layout::INPUT_H
         } else {
             false
         }
@@ -497,7 +518,7 @@ impl Panel {
     }
 
     /// Caret blink phase: measured from the last interaction moment, on/off
-    /// each half second via modulo; an interaction resets to zero so the
+    /// each half period via modulo; an interaction resets to zero so the
     /// caret shows immediately. Returns current visibility and milliseconds
     /// until the next flip.
     pub(crate) fn caret_blink(&self) -> (bool, u32) {
@@ -506,12 +527,10 @@ impl Panel {
 
     /// Phase decision decoupled from the time source, for pinned tests.
     fn blink_phase(elapsed_ms: u128) -> (bool, u32) {
-        const ON: u128 = 500;
-        const OFF: u128 = 500;
-        let total = ON + OFF;
+        let total = 2 * BLINK_HALF_MS as u128;
         let t = elapsed_ms % total;
-        if t < ON {
-            (true, (ON - t) as u32)
+        if t < BLINK_HALF_MS as u128 {
+            (true, BLINK_HALF_MS - t as u32)
         } else {
             (false, (total - t) as u32)
         }
@@ -643,6 +662,17 @@ mod tests {
         assert_eq!(Panel::blink_phase(1000), (true, 500));
         assert_eq!(Panel::blink_phase(1499), (true, 1));
         assert_eq!(Panel::blink_phase(1500), (false, 500));
+    }
+
+    /// Focus-time clock arm: idle + caret present arms once at the flip
+    /// point (the full on-half after the interaction zeroing, not the frame
+    /// rate); a running clock or an absent caret leaves the clock untouched.
+    #[test]
+    fn blink_arm_period_pinned() {
+        assert_eq!(blink_arm_period(false, true), Some(BLINK_HALF_MS));
+        assert_eq!(blink_arm_period(true, true), None);
+        assert_eq!(blink_arm_period(false, false), None);
+        assert_eq!(blink_arm_period(true, false), None);
     }
 
     /// Structural matching against the masked Key display: exact-count

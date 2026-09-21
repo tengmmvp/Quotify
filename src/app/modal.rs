@@ -6,9 +6,11 @@ use windows::Win32::UI::WindowsAndMessaging::SetTimer;
 use windows::core::PCWSTR;
 
 use super::config::Config;
-use super::hits::{switch_poll_source, sync_customizing};
+use super::hits::{invalidate_ui, switch_poll_source, sync_customizing};
 use super::notify::NOTIFY_TITLE;
-use super::{IDM_ABOUT, IDM_EXIT, IDM_SETTINGS, normalize_config, relayout_panel};
+use super::{
+    IDM_ABOUT, IDM_EXIT, IDM_SETTINGS, apply_appearance, normalize_config, relayout_panel,
+};
 use crate::platform::wide;
 use crate::ui::i18n::Strings;
 /// Size cap for imported config files
@@ -243,6 +245,21 @@ fn reject_import(panel_hwnd: HWND, pick: fn(&'static Strings) -> &'static str) {
     crate::platform::notify::show(NOTIFY_TITLE, pick(app.strings));
 }
 
+/// Re-syncs the settings-page input state to the imported config: the
+/// edited marks reset and every buffer follows the imported values — the
+/// settings page may be live on screen, and a stale draft there would let
+/// one Apply click silently revert the import (the peak buffers clear
+/// back to the config-value-as-placeholder state, apply_peak's
+/// empty-buffer rule).
+fn sync_input_to_imported(input: &mut crate::ui::panel::PanelInput, cfg: &Config) {
+    input.proxy_edited = false;
+    input.proxy = crate::ui::panel::InputField::Proxy
+        .clamp_prefill(&cfg.general.proxy.clone().unwrap_or_default());
+    input.interval_edited = false;
+    input.clear_field(crate::ui::panel::InputField::PeakStart);
+    input.clear_field(crate::ui::panel::InputField::PeakEnd);
+}
+
 /// Imports a config JSON; two-phase like export_config: the modal phase
 /// holds no App reference, and the apply phase re-fetches it.
 pub fn import_config(panel_hwnd: HWND) {
@@ -338,20 +355,17 @@ pub fn import_config(panel_hwnd: HWND) {
     // retain_keys from the alive set alone.
     let prev_proxy = app.config.general.proxy.clone();
     app.config = cfg;
-    // The imported config replaces both prefilled values wholesale: the
-    // edited marks reset and the proxy buffer re-syncs to the imported
-    // value — the settings page may be live on screen, and a stale buffer
-    // there would let one Apply click silently revert the import on the
-    // most security-sensitive field.
-    app.panel.input.proxy_edited = false;
-    app.panel.input.proxy = crate::ui::panel::InputField::Proxy
-        .clamp_prefill(&app.config.general.proxy.clone().unwrap_or_default());
-    app.panel.input.interval_edited = false;
+    sync_input_to_imported(&mut app.panel.input, &app.config);
     // The external file's value ranges are untrusted; normalize the same
     // way as the startup load (the selected backfill is included here).
     normalize_config(&mut app.config);
     app.lang = crate::ui::i18n::resolve_lang(app.config.general.language.as_deref());
     app.strings = app.lang.strings();
+    // The imported language/appearance reach open surfaces through the
+    // settings-switch refresh path (apply_appearance + invalidate_ui): an
+    // About window open alongside keeps its old texts and theme otherwise.
+    apply_appearance(app);
+    invalidate_ui(app);
     // The imported proxy must pass our own validation before being applied
     // (via try_apply_proxy, same rule as the settings page): once a form
     // that ureq accepts but validation rejects is persisted, every later
@@ -386,21 +400,177 @@ pub fn import_config(panel_hwnd: HWND) {
     switch_poll_source(app);
     // The shared release routine (not a hand-rolled subset): it also
     // resets the multi-click latch and repaints, keeping the import path
-    // in lockstep with the other release paths.
-    app.panel.end_edit_state(panel_hwnd);
+    // in lockstep with the other release paths. end_edit_state embeds
+    // clear_input's IME pump: the tail continues on the re-fetched
+    // reference.
+    let Some(app) = crate::app::pump(app, panel_hwnd, |app| {
+        app.panel.end_edit_state(panel_hwnd);
+    }) else {
+        return;
+    };
     // The update check's in-flight gate is not cleared: clearing it would
     // let a second run start concurrently; a late old result landing
     // naturally is harmless.
     app.set_update_status(None);
     // The outcome labels are &'static: copy them before the relayout — its
     // SetWindowPos is a pump, and reading through this alias afterwards is
-    // the one deviation this file forbids.
-    let (done_msg, skipped_msg) = (
+    // the one deviation this file forbids. A save failure from this
+    // import's own persist overrides the success wording: the import
+    // bypasses hit dispatch, so the failure mark drains here.
+    let (done_msg, skipped_msg, save_failed_msg) = (
         app.strings.import_done,
         app.strings.import_done_proxy_skipped,
+        app.strings.notify_save_failed,
     );
     sync_customizing(app);
     relayout_panel(app, panel_hwnd);
-    let msg = if proxy_applied { done_msg } else { skipped_msg };
+    let msg = if crate::app::config::take_save_failed() {
+        save_failed_msg
+    } else if proxy_applied {
+        done_msg
+    } else {
+        skipped_msg
+    };
+    // The toast is this segment's last act: it is itself a pump point, so
+    // nothing may touch the reference past it.
     crate::platform::notify::show(NOTIFY_TITLE, msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::ui::panel::render::{AppearanceChoice, Hit, LanguageChoice, ScopeChoice};
+
+    /// Importing re-syncs the input buffers to the imported values: peak
+    /// drafts from before the import die with it — one ApplyPeak click
+    /// must not resurrect them over the imported window
+    #[test]
+    fn import_resync_clears_preexisting_drafts() {
+        let mut input = crate::ui::panel::PanelInput {
+            peak_start: "09:00".into(),
+            peak_end: "23:30".into(),
+            proxy: "stale".into(),
+            proxy_edited: true,
+            interval_edited: true,
+            ..Default::default()
+        };
+        let mut cfg = super::Config::default();
+        cfg.general.proxy = Some("http://h:1080".into());
+        super::sync_input_to_imported(&mut input, &cfg);
+        assert!(
+            input.peak_start.is_empty() && input.peak_end.is_empty(),
+            "导入后 peak 草稿应清空（空缓冲即跟随新配置值）"
+        );
+        assert_eq!(input.proxy, "http://h:1080");
+        assert!(!input.proxy_edited && !input.interval_edited);
+    }
+
+    /// Exhaustive mirror of dispatch_modal's arm set: true = the variant
+    /// owns a dispatch arm. A new variant fails compilation here until
+    /// classified; the pin below then flags a classification that drifts
+    /// from is_modal.
+    fn has_dispatch_arm(h: Hit) -> bool {
+        match h {
+            Hit::ExportConfig | Hit::ImportConfig => true,
+            Hit::Refresh
+            | Hit::Settings
+            | Hit::AccountSwitch
+            | Hit::UsageInfo
+            | Hit::Back
+            | Hit::ClosePanel
+            | Hit::IntervalPreset(_)
+            | Hit::CustomizeInterval
+            | Hit::ApplyInterval
+            | Hit::InputInterval
+            | Hit::Language(_)
+            | Hit::Appearance(_)
+            | Hit::ToggleAutostart
+            | Hit::InputProxy
+            | Hit::ApplyProxy
+            | Hit::ToggleThreshold
+            | Hit::ToggleReset5h
+            | Hit::ToggleResetWeekly
+            | Hit::InputPeakStart
+            | Hit::InputPeakEnd
+            | Hit::ApplyPeak
+            | Hit::AddAccount
+            | Hit::RemoveAccount(_)
+            | Hit::PickAccount(_)
+            | Hit::AccountType(_)
+            | Hit::InputName
+            | Hit::InputKey
+            | Hit::RevealKey
+            | Hit::InputOrg
+            | Hit::InputProject
+            | Hit::SaveAccount
+            | Hit::Platform(_)
+            | Hit::CheckUpdate
+            | Hit::OpenDownload
+            | Hit::LinkRepo
+            | Hit::LinkIssues
+            | Hit::CopyDiagnostics
+            | Hit::NewsItem(_)
+            | Hit::AboutLogo => false,
+        }
+    }
+
+    /// One instance per Hit variant; extend alongside has_dispatch_arm
+    fn all_hits() -> Vec<Hit> {
+        vec![
+            Hit::Refresh,
+            Hit::Settings,
+            Hit::AccountSwitch,
+            Hit::UsageInfo,
+            Hit::Back,
+            Hit::ClosePanel,
+            Hit::IntervalPreset(300),
+            Hit::CustomizeInterval,
+            Hit::ApplyInterval,
+            Hit::InputInterval,
+            Hit::Language(LanguageChoice::System),
+            Hit::Appearance(AppearanceChoice::System),
+            Hit::ToggleAutostart,
+            Hit::InputProxy,
+            Hit::ApplyProxy,
+            Hit::ToggleThreshold,
+            Hit::ToggleReset5h,
+            Hit::ToggleResetWeekly,
+            Hit::InputPeakStart,
+            Hit::InputPeakEnd,
+            Hit::ApplyPeak,
+            Hit::AddAccount,
+            Hit::RemoveAccount(0),
+            Hit::PickAccount(0),
+            Hit::AccountType(ScopeChoice::Personal),
+            Hit::InputName,
+            Hit::InputKey,
+            Hit::RevealKey,
+            Hit::InputOrg,
+            Hit::InputProject,
+            Hit::SaveAccount,
+            Hit::Platform(crate::api::Platform::Cn),
+            Hit::ExportConfig,
+            Hit::ImportConfig,
+            Hit::CheckUpdate,
+            Hit::OpenDownload,
+            Hit::LinkRepo,
+            Hit::LinkIssues,
+            Hit::CopyDiagnostics,
+            Hit::NewsItem(0),
+            Hit::AboutLogo,
+        ]
+    }
+
+    /// Pins the is_modal ↔ dispatch_modal lockstep: a variant registered
+    /// on one side only fails here — the human-maintained sync the
+    /// compiler cannot check.
+    #[test]
+    fn is_modal_matches_dispatch_modal() {
+        for h in all_hits() {
+            assert_eq!(
+                h.is_modal(),
+                has_dispatch_arm(h),
+                "is_modal 与 dispatch_modal 登记不一致: {h:?}"
+            );
+        }
+    }
 }

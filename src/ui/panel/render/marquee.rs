@@ -1,6 +1,9 @@
-//! Error-summary marquee: scroll state, belt geometry, frame timing, and the tick
+//! Error marquee: scroll state, belt geometry, frame timing, the tick, and
+//! the error copy family shared by the card and the footer
 
 use super::{Renderer, TextBlock};
+use crate::api::{ErrorCategory, ErrorDetail, ErrorInfo, FetchError};
+use crate::ui::i18n::Strings;
 
 /// Full-value form of the marquee rebuild-decision key: the snapshot time leads —
 /// being equal across frames short-circuits the
@@ -169,11 +172,132 @@ impl Renderer {
         }
         false
     }
+
+    /// Error card body (cached): the key is a full-value pair of error
+    /// content and language, so marquee frames rebuild nothing; leaving
+    /// out the language would keep stale copy after a language switch.
+    /// An Rc refcount clone replaces a full deep copy of the string —
+    /// hit registration still needs &mut self mid-drawing, so it cannot
+    /// be borrowed out.
+    pub(super) fn cached_error_body(
+        &mut self,
+        s: &Strings,
+        e: &FetchError,
+        lang: crate::ui::i18n::Lang,
+    ) -> std::rc::Rc<str> {
+        // Reference comparison on the hit path; the owned clone only on a
+        // rebuild — the marquee calls this every frame while scrolling.
+        if let Some((k, b)) = self.err_card.as_ref()
+            && k.0 == *e
+            && k.1 == lang
+        {
+            return std::rc::Rc::clone(b);
+        }
+        let key = (e.clone(), lang);
+        let b: std::rc::Rc<str> = error_card_body(s, e).into();
+        self.err_card = Some((key, std::rc::Rc::clone(&b)));
+        b
+    }
+}
+
+/// Category title copy
+pub(super) fn category_label(s: &Strings, c: ErrorCategory) -> &'static str {
+    match c {
+        ErrorCategory::Unauthenticated => s.err_cat_auth,
+        ErrorCategory::Request => s.err_cat_bad_request,
+        ErrorCategory::Throttled => s.err_cat_rate_limited,
+        ErrorCategory::Server => s.err_cat_server,
+        ErrorCategory::Network => s.err_cat_network,
+        ErrorCategory::Empty => s.err_cat_no_data,
+    }
+}
+
+/// Footer cache key: a thin delegation to fmt::elapsed_minutes_since —
+/// the same clamped minute bucket the text tiers read, so key
+/// transitions land exactly at whole elapsed minutes (the zero clamp
+/// single-sources there; a wall-clock step back must not bucket to -1).
+/// Taking a whole-second timestamp would drop the snapshot's sub-second
+/// part; the key transition would lead the real one by up to a second,
+/// and crossing a tier would cache the stale copy under the new key,
+/// displaying it a full minute late
+pub(super) fn footer_key(now_ms: i64, at_ms: i64) -> i64 {
+    crate::ui::fmt::elapsed_minutes_since(now_ms, at_ms)
+}
+
+/// Display material for FetchError: the official error info and the
+/// fallback copy for categories with no official hint; categories whose
+/// info is None emit the raw copy directly, with no fallback chain. The
+/// error card and the footer tail segment share this source; the two
+/// views' fallback pairing never diverges.
+fn error_parts<'a>(e: &'a FetchError, s: &'a Strings) -> (Option<&'a ErrorInfo>, &'a str) {
+    match e {
+        FetchError::Unauthenticated(info) => (Some(info), s.err_auth_hint),
+        FetchError::Empty => (None, ""),
+        FetchError::Failure(info) => (Some(info), ""),
+        FetchError::Network(d) => (None, d),
+        FetchError::Throttled { info, .. } => (Some(info), ""),
+    }
+}
+
+/// Error display material shared by the card body and the footer tail:
+/// a (code, message) pair each surface renders its own way, or plain
+/// text (code-only template, raw message, fallback copy). One ladder —
+/// the two views' material selection cannot diverge.
+enum ErrorMaterial<'a> {
+    CodeMsg(i64, std::borrow::Cow<'a, str>),
+    Text(std::borrow::Cow<'a, str>),
+}
+
+/// Material selection has the single source `ErrorInfo::detail`
+fn error_material<'a>(e: &'a FetchError, s: &'a Strings) -> ErrorMaterial<'a> {
+    match error_parts(e, s) {
+        (Some(info), fallback) => match info.detail() {
+            ErrorDetail::CodeAndMsg { code, msg } => {
+                ErrorMaterial::CodeMsg(code, std::borrow::Cow::Borrowed(msg))
+            }
+            ErrorDetail::CodeOnly { code } => ErrorMaterial::Text(code_only_body(s, code).into()),
+            ErrorDetail::Msg(msg) => ErrorMaterial::Text(msg),
+            ErrorDetail::Fallback => ErrorMaterial::Text(fallback.into()),
+        },
+        (None, raw) => ErrorMaterial::Text(raw.into()),
+    }
+}
+
+/// Error card body: only the card template assembly happens here.
+fn error_card_body(s: &Strings, e: &FetchError) -> String {
+    // The empty state is onboarding body text and does not go through
+    // the fallback chain.
+    if matches!(e, FetchError::Empty) {
+        return s.err_empty_hint.to_string();
+    }
+    match error_material(e, s) {
+        ErrorMaterial::CodeMsg(code, msg) => s
+            .err_code_msg
+            .replace("{code}", &code.to_string())
+            .replace("{msg}", &msg),
+        ErrorMaterial::Text(t) => t.into_owned(),
+    }
+}
+
+/// Suffix segment of the footer summary; an empty string means no tail
+/// segment.
+pub(super) fn footer_error_tail(s: &Strings, e: &FetchError) -> String {
+    match error_material(e, s) {
+        ErrorMaterial::CodeMsg(_, msg) => msg.into_owned(),
+        ErrorMaterial::Text(t) => t.into_owned(),
+    }
+}
+
+/// Code-only error body: shared by the error card and the footer tail — the
+/// two views are mutually exclusive states of the same error and must not
+/// render it differently.
+fn code_only_body(s: &Strings, code: i64) -> String {
+    s.err_code_only.replace("{code}", &code.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::belt_width;
+    use super::{belt_width, footer_key};
 
     /// Belt geometry pins: empty blocks contribute zero (no bracket pair
     /// either), positive blocks accumulate width + pair each, and the
@@ -185,5 +309,20 @@ mod tests {
         assert_eq!(belt_width(&[0.0, 0.0, 0.0], 4.0), 0.0);
         assert_eq!(belt_width(&[10.0], 4.0), 14.0);
         assert_eq!(belt_width(&[10.0, 0.0, 20.0], 4.0), 38.0);
+    }
+
+    /// Footer key and copy tiers share the same boundary: transitions
+    /// land exactly at whole elapsed minutes; the snapshot's sub-second
+    /// part never makes the key early or late
+    #[test]
+    fn footer_key_matches_text_tiers() {
+        let at = 1_000_000i64 * 60_000 + 700;
+        assert_eq!(footer_key(at + 59_999, at), 0);
+        assert_eq!(footer_key(at + 60_000, at), 1);
+        assert_eq!(footer_key(at + 119_999, at), 1);
+        assert_eq!(footer_key(at + 120_000, at), 2);
+        // Wall clock stepped back (NTP correction): delta clamps to zero,
+        // never bucketing to -1 — same clamp as fmt::updated_text
+        assert_eq!(footer_key(at - 30_000, at), 0);
     }
 }

@@ -90,6 +90,16 @@ impl AboutWindow {
         self.egg_eaten = false;
         self.wnd.close();
     }
+
+    /// TIMER_ANIM tick: a finished easter-egg tween is consumed into the
+    /// eaten flag; returns whether an animation is still in flight
+    pub(crate) fn anim_tick(&mut self) -> bool {
+        if self.egg.as_ref().is_some_and(|t| t.finished()) {
+            self.egg = None;
+            self.egg_eaten = true;
+        }
+        self.egg.is_some()
+    }
 }
 
 /// The About window's window procedure: common arms go through float_wndproc,

@@ -38,7 +38,6 @@ pub struct Theme {
     pub card_border: [f32; 4],
 }
 
-pub const PANEL_WIDTH: i32 = 340;
 /// Control-level corner radius
 pub const RADIUS: f32 = 4.0;
 /// Card-level corner radius

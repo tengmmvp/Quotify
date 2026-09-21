@@ -8,14 +8,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, GetCursorPos, GetWindowRect, HTCLIENT, IDC_ARROW, IDC_HAND, IsWindowVisible,
     KillTimer, LoadCursorW, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOCOPYBITS, SWP_NOZORDER,
     SetCursor, SetForegroundWindow, SetTimer, SetWindowPos, ShowWindow, WM_CAPTURECHANGED,
-    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_SETCURSOR, WM_TIMER,
-    WNDPROC,
+    WM_ERASEBKGND, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT,
+    WM_SETCURSOR, WM_TIMER, WNDPROC,
 };
 
 use crate::app::{app_from_tray, pump};
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::render::Renderer;
-use crate::ui::panel::{PanelMode, PanelView, Release, track_leave};
+use crate::ui::panel::{PanelMode, PanelView, Release, WHEEL_STEP_PX, track_leave};
 use crate::ui::{x_of, y_of};
 
 /// Close patrol
@@ -25,7 +25,7 @@ pub(crate) const TIMER_ANIM: usize = 2;
 
 /// Kind of floating window.
 /// Close policy and foreground keep-alive differ by kind; the divergence points are
-/// TIMER_SWEEP and show_at,
+/// TIMER_SWEEP, TIMER_ANIM, and show_at,
 /// and the paint call plus click dispatch target also branch on kind.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FloatKind {
@@ -60,6 +60,10 @@ pub struct FloatWnd {
     /// Press gesture latch: UP is dispatched only when the press originated in this
     /// window; a press started in another window sliding in does not trigger.
     pub(crate) gesture: crate::ui::panel::PressGesture,
+    /// Wheel-scroll offset and cap (logical px); a zero cap leaves the wheel
+    /// inert — only the account popup arms them
+    pub(crate) scroll_dy: f32,
+    pub(crate) scroll_max: f32,
     class_registered: bool,
     /// Has drawn successfully at least once in this open lifecycle:
     /// on a device-loss rebuild the content is already on screen,
@@ -74,6 +78,8 @@ impl FloatWnd {
             renderer: None,
             dpi: crate::ui::panel::FALLBACK_DPI,
             gesture: crate::ui::panel::PressGesture::new(),
+            scroll_dy: 0.0,
+            scroll_max: 0.0,
             class_registered: false,
             painted: false,
         }
@@ -191,6 +197,8 @@ impl FloatWnd {
 
     pub fn close(&mut self) {
         self.gesture.clear();
+        // The scroll position resets with the open lifecycle
+        self.scroll_dy = 0.0;
         // The alpha-tiered brushes built during the animation are cleared on close, so
         // the cache does not accumulate across open/close cycles;
         // painted resets as well, so the next genuine open replays the fade-in.
@@ -251,6 +259,13 @@ fn close_float(hwnd: HWND, app: &mut crate::app::App, kind: FloatKind) {
     }
 }
 
+/// One wheel notch's scroll step: every 120 of delta counts three lines ≈
+/// WHEEL_STEP_PX logical px, the panel's scheme; positive delta scrolls
+/// back up. Clamped to [0, max]
+pub(crate) fn wheel_scroll(cur: f32, delta: f32, max: f32) -> f32 {
+    (cur - delta / 120.0 * WHEEL_STEP_PX).clamp(0.0, max)
+}
+
 /// Common window-procedure arms for floating windows, with the divergence points
 /// branching on kind in place: the stale check,
 /// the paint call, and the click dispatch target. The two windows' wndprocs are thin wrappers.
@@ -273,9 +288,9 @@ pub(crate) fn float_wndproc(
                 if let Some(app) = app_from_tray(hwnd) {
                     // Scalars are copied first, the renderer taken next,
                     // the config string borrowed last: the three borrow scopes do not overlap.
-                    let (dpi, painted) = {
+                    let (dpi, painted, scroll_dy) = {
                         let f = float_of(app, kind);
-                        (f.dpi, f.painted)
+                        (f.dpi, f.painted, f.scroll_dy)
                     };
                     let renderer = float_of(app, kind).renderer.take();
                     let appearance = app.config.general.appearance.as_deref();
@@ -286,9 +301,13 @@ pub(crate) fn float_wndproc(
                         painted,
                         dpi,
                         |r, rect| match kind {
-                            FloatKind::Popup => {
-                                r.paint_popup(hwnd, rect, &PanelModel::from_app(app), dpi)
-                            }
+                            FloatKind::Popup => r.paint_popup(
+                                hwnd,
+                                rect,
+                                &PanelModel::from_app(app),
+                                scroll_dy,
+                                dpi,
+                            ),
                             FloatKind::About => {
                                 let expanded = app.about.news_expanded;
                                 let egg = app.about.egg.as_ref().map(|t| t.progress());
@@ -353,16 +372,13 @@ pub(crate) fn float_wndproc(
                 }
                 TIMER_ANIM => {
                     let mut app = app_from_tray(hwnd);
-                    let mut egg_alive = false;
-                    if let Some(a) = app.as_mut()
-                        && kind == FloatKind::About
-                    {
-                        let finished = a.about.egg.as_ref().is_some_and(|t| t.finished());
-                        if finished {
-                            a.about.egg = None;
-                            a.about.egg_eaten = true;
-                        }
-                        egg_alive = a.about.egg.is_some();
+                    // Per-kind animation tick: the About window's easter egg lives there
+                    let mut anim_alive = false;
+                    if let Some(a) = app.as_mut() {
+                        anim_alive = match kind {
+                            FloatKind::Popup => false,
+                            FloatKind::About => a.about.anim_tick(),
+                        };
                     }
                     let appear_done = app.as_ref().is_none_or(|a| {
                         let f = match kind {
@@ -374,7 +390,7 @@ pub(crate) fn float_wndproc(
                             .and_then(|r| r.anim.appear.as_ref().map(|t| t.finished()))
                             .unwrap_or(true)
                     });
-                    if appear_done && !egg_alive {
+                    if appear_done && !anim_alive {
                         let _ = KillTimer(Some(hwnd), TIMER_ANIM);
                     }
                     let _ = InvalidateRect(Some(hwnd), None, false);
@@ -405,6 +421,19 @@ pub(crate) fn float_wndproc(
                     && r.hover.take().is_some()
                 {
                     let _ = InvalidateRect(Some(hwnd), None, false);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEWHEEL => {
+                // Row scrolling for oversize content; the cap is zero on windows that never scroll
+                if let Some(app) = app_from_tray(hwnd) {
+                    let f = float_of(app, kind);
+                    let delta = ((wparam.0 >> 16) & 0xFFFF) as u16 as i16 as f32;
+                    let next = wheel_scroll(f.scroll_dy, delta, f.scroll_max);
+                    if next != f.scroll_dy {
+                        f.scroll_dy = next;
+                        let _ = InvalidateRect(Some(hwnd), None, false);
+                    }
                 }
                 LRESULT(0)
             }
@@ -538,5 +567,23 @@ pub(crate) fn float_wndproc(
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wheel_scroll;
+    use crate::ui::panel::WHEEL_STEP_PX;
+
+    #[test]
+    fn wheel_scroll_steps_and_clamps() {
+        // One notch down = one wheel step; back up returns
+        assert_eq!(wheel_scroll(0.0, -120.0, 100.0), WHEEL_STEP_PX);
+        assert_eq!(wheel_scroll(WHEEL_STEP_PX, 120.0, 100.0), 0.0);
+        // Past either end: clamped
+        assert_eq!(wheel_scroll(0.0, 120.0, 100.0), 0.0);
+        assert_eq!(wheel_scroll(90.0, -240.0, 100.0), 100.0);
+        // Zero cap (non-scrolling window): always 0
+        assert_eq!(wheel_scroll(0.0, -120.0, 0.0), 0.0);
     }
 }

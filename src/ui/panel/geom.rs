@@ -6,8 +6,7 @@
 use super::Panel;
 use super::PanelView;
 use super::anim;
-use super::layout;
-use super::theme::PANEL_WIDTH;
+use super::layout::{self, PANEL_WIDTH};
 use windows::Win32::Foundation::{HWND, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint,
@@ -245,7 +244,7 @@ impl Panel {
                 y
             };
             let visible = target_h.min((mi.rcMonitor.bottom - final_y).max(0));
-            self.refresh_scroll(logical_h.0, visible);
+            self.refresh_scroll(logical_h, PhysPx(visible));
             let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
         }
     }
@@ -290,9 +289,9 @@ impl Panel {
 
     /// Recompute the scroll cap after the viewport's physical height changes, and
     /// clamp the offset back into range (visible logical height = physical height / dpi)
-    pub(crate) fn refresh_scroll(&mut self, logical_h: i32, physical_h: i32) {
-        let visible = physical_h as f32 / self.dpi;
-        self.scroll_max = (logical_h as f32 - visible).max(0.0);
+    pub(crate) fn refresh_scroll(&mut self, logical_h: LogPx, physical_h: PhysPx) {
+        let visible = physical_h.0 as f32 / self.dpi;
+        self.scroll_max = (logical_h.0 as f32 - visible).max(0.0);
         self.scroll_dy = if self.view == PanelView::Main {
             0.0
         } else {

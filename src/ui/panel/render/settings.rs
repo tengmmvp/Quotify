@@ -1,4 +1,4 @@
-//! Settings view and the add-account form
+//! Settings view
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -6,7 +6,7 @@ use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 use windows::Win32::Graphics::Direct2D::{D2D1_ROUNDED_RECT, ID2D1HwndRenderTarget};
 
 use super::widgets::BADGE_H;
-use super::{AppearanceChoice, Hit, InputStyle, LanguageChoice, Renderer, ScopeChoice};
+use super::{AppearanceChoice, Hit, InputStyle, LanguageChoice, Renderer};
 use crate::api::Platform;
 use crate::ui::panel::caret::FieldContent;
 use crate::ui::panel::model::PanelModel;
@@ -41,6 +41,38 @@ enum UpdateKey {
     New(String),
 }
 
+/// Borrowed mirror of UpdateKey straight off the frame data: the single
+/// model.update → state mapping — the key's hit-path comparison and the
+/// build-side key construction both read it, so the two cannot drift
+#[derive(Clone, Copy)]
+enum UpdateState<'a> {
+    Idle,
+    OkNoUpdate,
+    Err,
+    New(&'a str),
+}
+
+fn update_state_of<'m>(model: &'m PanelModel<'_>) -> UpdateState<'m> {
+    match model.update {
+        Some(Ok(info)) if model.update_available => UpdateState::New(&info.tag),
+        Some(Ok(_)) => UpdateState::OkNoUpdate,
+        Some(Err(_)) => UpdateState::Err,
+        None => UpdateState::Idle,
+    }
+}
+
+impl PartialEq<UpdateState<'_>> for UpdateKey {
+    fn eq(&self, s: &UpdateState<'_>) -> bool {
+        match (self, s) {
+            (Self::Idle, UpdateState::Idle)
+            | (Self::OkNoUpdate, UpdateState::OkNoUpdate)
+            | (Self::Err, UpdateState::Err) => true,
+            (Self::New(t), UpdateState::New(r)) => t == r,
+            _ => false,
+        }
+    }
+}
+
 /// Account-card identity: name, platform + team annotation, and the
 /// version/tier badge labels off the snapshot
 struct AccountKey {
@@ -70,9 +102,13 @@ struct AccountCardTexts {
     name: super::TextBlock,
 }
 
+/// Gap between the version line's right edge and the update button; the
+/// draw rect's right boundary and the ellipsis budget share it
+const VER_BTN_GAP: f32 = 12.0;
+
 /// About-section artifacts: the action button's label (whichever of the
-/// four update states it holds) with its measured width, plus the version
-/// line
+/// four update states it holds) with its measured width, plus the
+/// ellipsized version line
 struct AboutTexts {
     btn: super::TextBlock,
     btn_w: f32,
@@ -105,18 +141,19 @@ pub(super) struct SettingsLabels {
     pill_add: super::TextBlock,
     sec_platform: super::TextBlock,
     // Add form: sub labels 13/400, segmented items 13/400, pills 13/400
-    sub_platform: super::TextBlock,
-    seg_platform_cn: super::TextBlock,
-    seg_platform_intl: super::TextBlock,
-    sub_type: super::TextBlock,
-    seg_personal: super::TextBlock,
-    seg_team: super::TextBlock,
-    sub_name: super::TextBlock,
-    sub_key: super::TextBlock,
-    sub_org: super::TextBlock,
-    sub_project: super::TextBlock,
-    pill_save: super::TextBlock,
-    pill_cancel: super::TextBlock,
+    // (pub(super): the add-form view in add_form.rs reads this group)
+    pub(super) sub_platform: super::TextBlock,
+    pub(super) seg_platform_cn: super::TextBlock,
+    pub(super) seg_platform_intl: super::TextBlock,
+    pub(super) sub_type: super::TextBlock,
+    pub(super) seg_personal: super::TextBlock,
+    pub(super) seg_team: super::TextBlock,
+    pub(super) sub_name: super::TextBlock,
+    pub(super) sub_key: super::TextBlock,
+    pub(super) sub_org: super::TextBlock,
+    pub(super) sub_project: super::TextBlock,
+    pub(super) pill_save: super::TextBlock,
+    pub(super) pill_cancel: super::TextBlock,
     // Poll interval: title 13/600, segments 13/400, unit 12/400, apply 12/400
     sec_interval: super::TextBlock,
     iv_1m: super::TextBlock,
@@ -175,24 +212,14 @@ fn badge_labels<'a>(model: &'a PanelModel) -> (Option<&'static str>, Option<&'a 
 impl SettingsKey {
     /// Compare against borrowed frame data: the per-frame hit path
     /// allocates nothing (owned clones live in the key, taken only on
-    /// rebuild). The update arm mirrors build_settings_texts' state
-    /// mapping — update_available is derived from the same Result the
-    /// build reads.
+    /// rebuild). The update arm compares through update_state_of — the
+    /// same mapping build_settings_texts reads.
     fn matches(&self, model: &PanelModel, cw: f32) -> bool {
         if self.lang != model.lang
             || self.threshold != model.threshold_percent
             || self.cw != cw.to_bits()
+            || self.update != update_state_of(model)
         {
-            return false;
-        }
-        let update_ok = match (&self.update, model.update) {
-            (UpdateKey::Idle, None) => true,
-            (UpdateKey::OkNoUpdate, Some(Ok(_))) => !model.update_available,
-            (UpdateKey::Err, Some(Err(_))) => true,
-            (UpdateKey::New(tag), Some(Ok(info))) => model.update_available && *tag == info.tag,
-            _ => false,
-        };
-        if !update_ok {
             return false;
         }
         let (version, tier) = badge_labels(model);
@@ -224,13 +251,13 @@ impl Renderer {
         let s = model.strings;
         let pad = layout::CONTENT_PAD;
         let cw = w - pad * 2.0;
-        let mut y = dy + layout::SETTINGS_EDGE_PAD;
 
         // ── Frame caches (both exits below put them back): the key check
         // allocates zero on hits, so a key change is the only thing that
         // ever rebuilds layouts. The constant labels sit in their own
         // language-keyed cache — account switches and update results
         // rebuild the volatile part only ──
+        let on_add_form = panel.view == crate::ui::panel::PanelView::AddForm;
         let mut labels_opt = self.settings_labels.take();
         if labels_opt.as_ref().is_none_or(|(l, _)| *l != model.lang) {
             labels_opt = Some((model.lang, self.build_settings_labels(s)));
@@ -240,13 +267,74 @@ impl Renderer {
             .map(|(_, ls)| ls)
             .expect("settings_labels 上方必已置");
         let mut texts_opt = self.settings_texts.take();
-        if texts_opt.as_ref().is_none_or(|t| !t.key.matches(model, cw)) {
+        // The add form consumes no volatile artifacts: skipping the key
+        // check spares the full rebuild a background refresh would
+        // otherwise trigger while it is open.
+        if !on_add_form && texts_opt.as_ref().is_none_or(|t| !t.key.matches(model, cw)) {
             texts_opt = Some(self.build_settings_texts(s, model, cw));
+        }
+
+        let y = self.settings_nav(
+            target,
+            labels,
+            on_add_form,
+            pad,
+            w,
+            dy + layout::SETTINGS_EDGE_PAD,
+            alpha,
+        );
+        // ── Accounts: the settings page's first section is the data source; on the add page this heading reads "Account info" ──
+        let section = if on_add_form {
+            &labels.sec_platform
+        } else {
+            &labels.sec_accounts
+        };
+        let y = self.section_label(target, Some(section), pad, y, w, alpha, false);
+        if on_add_form {
+            self.draw_add_form(target, panel, labels, pad, cw, dy, y, alpha);
+            // Both exits put the taken caches back: losing them here would
+            // force a full rebuild on the next paint.
+            self.settings_texts = texts_opt;
+            self.settings_labels = labels_opt;
+            return;
         }
         let texts = texts_opt.expect("settings_texts 上方必已置");
 
-        // ── Navigation bar ──
-        let on_add_form = panel.view == crate::ui::panel::PanelView::AddForm;
+        let y = self.accounts_section(target, panel, model, &texts, labels, pad, cw, y, alpha);
+
+        let y = self.interval_section(target, panel, model, labels, dy, pad, cw, w, y, alpha);
+
+        let y = self.notifications_section(target, model, &texts, labels, pad, cw, w, y, alpha);
+
+        let y = self.peak_section(target, panel, model, labels, dy, pad, w, y, alpha);
+
+        let y = self.general_section(target, model, labels, pad, cw, w, y, alpha);
+
+        let y = self.proxy_section(target, panel, model, labels, dy, pad, cw, w, y, alpha);
+
+        let y = self.backup_section(target, labels, pad, cw, w, y, alpha);
+
+        self.about_section(target, model, &texts, pad, w, y, alpha);
+        self.settings_texts = Some(texts);
+        self.settings_labels = labels_opt;
+    }
+
+    // ── Settings sections, in draw order: each advances the shared y
+    // chain and returns the next y ──
+
+    /// Navigation bar: back arrow (settings page only), close button,
+    /// and the page title
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn settings_nav(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        labels: &SettingsLabels,
+        on_add_form: bool,
+        pad: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
         if !on_add_form {
             self.back_arrow(target, Hit::Back, pad, y + 6.0);
         }
@@ -269,28 +357,27 @@ impl Renderer {
             self.theme.text_primary,
             alpha,
         );
-        y += layout::NAV_H;
+        y + layout::NAV_H
+    }
 
-        // ── Accounts: the settings page's first section is the data source; on the add page this heading reads "Account info" ──
-        let section = if on_add_form {
-            &labels.sec_platform
-        } else {
-            &labels.sec_accounts
-        };
-        y = self.section_label(target, Some(section), pad, y, w, alpha, false);
-        if on_add_form {
-            self.draw_add_form(target, panel, labels, pad, cw, dy, y, alpha);
-            // Both exits put the taken caches back: losing them here would
-            // force a full rebuild on the next paint.
-            self.settings_texts = Some(texts);
-            self.settings_labels = labels_opt;
-            return;
-        }
-
-        // Current active account card (shown when present); the add entry is always
-        // present, allowing more accounts to be added. All card text comes
-        // from the frame cache — badges, widths, and the ellipsized name
-        // are width-derived and were built together.
+    /// Accounts section: the active account card (plus the auth-error
+    /// row) when present, then the always-present add entry — it takes
+    /// its own full row spanning the content area for visual symmetry.
+    /// All card text comes from the frame cache — badges, widths, and the
+    /// ellipsized name are width-derived and were built together.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn accounts_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        model: &PanelModel,
+        texts: &SettingsTexts,
+        labels: &SettingsLabels,
+        pad: f32,
+        cw: f32,
+        mut y: f32,
+        alpha: f32,
+    ) -> f32 {
         if let (Some(acc), Some(card)) = (model.account, texts.card.as_ref()) {
             self.account_card(
                 target,
@@ -315,7 +402,6 @@ impl Renderer {
                 y += layout::AUTH_ERROR_H;
             }
         }
-        // Add-account takes its own full row: it spans the content area for visual symmetry.
         self.pill_button(
             target,
             Hit::AddAccount,
@@ -327,10 +413,26 @@ impl Renderer {
             alpha,
             false,
         );
-        y += layout::ADD_BTN_ROW_H;
+        y + layout::ADD_BTN_ROW_H
+    }
 
-        // ── Poll interval: the segmented control's 5th segment is "Custom"; selecting it expands an input row below ──
-        y = self.section_label(target, Some(&labels.sec_interval), pad, y, w, alpha, true);
+    /// Poll interval: the segmented control's 5th segment is "Custom";
+    /// selecting it expands an input row below
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn interval_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        model: &PanelModel,
+        labels: &SettingsLabels,
+        dy: f32,
+        pad: f32,
+        cw: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let mut y = self.section_label(target, Some(&labels.sec_interval), pad, y, w, alpha, true);
         // Fixed-length stack array with zero allocation; the sync between preset count and label slots is
         // pinned by the interval_preset_count test.
         let iv = [&labels.iv_1m, &labels.iv_5m, &labels.iv_15m, &labels.iv_30m];
@@ -400,9 +502,24 @@ impl Renderer {
             );
             y = iy + layout::CUSTOMIZE_EXTRA_H;
         }
+        y
+    }
 
-        // ── Notifications ──
-        y = self.section_label(
+    /// Notifications: threshold + window-reset toggles
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn notifications_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        model: &PanelModel,
+        texts: &SettingsTexts,
+        labels: &SettingsLabels,
+        pad: f32,
+        cw: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let mut y = self.section_label(
             target,
             Some(&labels.sec_notifications),
             pad,
@@ -433,7 +550,7 @@ impl Renderer {
             cw,
             alpha,
         );
-        y = self.toggle_row(
+        self.toggle_row(
             target,
             Hit::ToggleResetWeekly,
             &labels.t_reset_weekly,
@@ -443,9 +560,23 @@ impl Renderer {
             y,
             cw,
             alpha,
-        );
+        )
+    }
 
-        // ── Peak hours: effective on weekdays, custom start/end ──
+    /// Peak hours: effective on weekdays, custom start/end
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn peak_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        model: &PanelModel,
+        labels: &SettingsLabels,
+        dy: f32,
+        pad: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
         self.section_label(target, Some(&labels.sec_peak), pad, y, w, alpha, true);
         // y is pinned to layout::peak_input_y, sharing the source with the caret and the height formula.
         let pky = dy
@@ -550,10 +681,23 @@ impl Renderer {
                 );
             }
         }
-        y = pky + layout::INPUT_H + layout::PEAK_TAIL_GAP;
+        pky + layout::INPUT_H + layout::PEAK_TAIL_GAP
+    }
 
-        // ── General: language / appearance / autostart ──
-        y = self.section_label(target, Some(&labels.sec_general), pad, y, w, alpha, true);
+    /// General: language / appearance / autostart
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn general_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        model: &PanelModel,
+        labels: &SettingsLabels,
+        pad: f32,
+        cw: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let mut y = self.section_label(target, Some(&labels.sec_general), pad, y, w, alpha, true);
         y = self.sub_label(target, &labels.sub_language, pad, y, cw, alpha);
         let langs: [(Hit, &super::TextBlock); 3] = [
             (
@@ -595,7 +739,7 @@ impl Renderer {
             alpha,
         );
         y += layout::CHOICE_ROW_TAIL;
-        y = self.toggle_row(
+        self.toggle_row(
             target,
             Hit::ToggleAutostart,
             &labels.t_autostart,
@@ -605,10 +749,26 @@ impl Renderer {
             y,
             cw,
             alpha,
-        );
+        )
+    }
 
-        // ── Network proxy: empty address means direct connection; when unconfigured the field shows only the placeholder hint ──
-        y = self.section_label(target, Some(&labels.sec_network), pad, y, w, alpha, true);
+    /// Network proxy: empty address means direct connection; when
+    /// unconfigured the field shows only the placeholder hint
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn proxy_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        panel: &Panel,
+        model: &PanelModel,
+        labels: &SettingsLabels,
+        dy: f32,
+        pad: f32,
+        cw: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let y = self.section_label(target, Some(&labels.sec_network), pad, y, w, alpha, true);
         self.sub_label(target, &labels.sub_proxy, pad, y, cw, alpha);
         // y is pinned to layout::proxy_input_y, sharing the source with the caret and the height formula.
         let py = dy
@@ -630,7 +790,7 @@ impl Renderer {
             py,
             None,
             FieldContent::Plain(&panel.input.proxy),
-            s.proxy_hint,
+            model.strings.proxy_hint,
             panel.input.field == Some(InputField::Proxy),
             alpha,
         );
@@ -644,10 +804,22 @@ impl Renderer {
             &labels.btn_apply,
             alpha,
         );
-        y = py + layout::INPUT_H + layout::PROXY_TAIL_GAP;
+        py + layout::INPUT_H + layout::PROXY_TAIL_GAP
+    }
 
-        // ── Config management: export / import, placed before the about section ──
-        y = self.section_label(target, Some(&labels.sec_backup), pad, y, w, alpha, true);
+    /// Config management: export / import, placed before the about section
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn backup_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        labels: &SettingsLabels,
+        pad: f32,
+        cw: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) -> f32 {
+        let y = self.section_label(target, Some(&labels.sec_backup), pad, y, w, alpha, true);
         let pair_w = 104.0 * 2.0 + 12.0;
         let bx = pad + (cw - pair_w) / 2.0;
         self.outline_button_blk(
@@ -670,16 +842,28 @@ impl Renderer {
             &labels.btn_import,
             alpha,
         );
-        y += layout::BACKUP_ROW_H;
+        y + layout::BACKUP_ROW_H
+    }
 
-        // ── About: check update + version, at the bottom ──
+    /// About: check update + version, at the bottom
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn about_section(
+        &mut self,
+        target: &ID2D1HwndRenderTarget,
+        model: &PanelModel,
+        texts: &SettingsTexts,
+        pad: f32,
+        w: f32,
+        y: f32,
+        alpha: f32,
+    ) {
         // Version line closing: with a new release the text reads "current → latest" and
         // the button switches to "Go download". The label/width/version
         // line all come from the cache — the update state is part of the
         // key, so the button never shows stale copy; btn_w feeds the
-        // version line's right boundary exactly as the old per-frame
-        // measure did.
-        y = self.section_label(target, None, pad, y, w, alpha, true);
+        // version line's right boundary and its build-time ellipsis
+        // budget alike.
+        let y = self.section_label(target, None, pad, y, w, alpha, true);
         let btn_hit = if model.update_available {
             Hit::OpenDownload
         } else {
@@ -689,7 +873,7 @@ impl Renderer {
         let ver_rect = D2D_RECT_F {
             left: pad,
             top: y + 7.0,
-            right: w - pad - btn_w - 12.0,
+            right: w - pad - btn_w - VER_BTN_GAP,
             bottom: y + 23.0,
         };
         self.block_l(
@@ -709,228 +893,65 @@ impl Renderer {
             &texts.about.btn,
             alpha,
         );
-        self.settings_texts = Some(texts);
-        self.settings_labels = labels_opt;
     }
 
     // ── Settings-page-specific widgets ──
-
-    /// Add-account form: platform → type → name/key, team appends org/project IDs.
-    /// The y chain is pinned to layout constants: drawing, the caret, and
-    /// the height formula share one source. Labels come from the caller's
-    /// frame caches (passed by reference — both were taken out of self).
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn draw_add_form(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        panel: &Panel,
-        labels: &SettingsLabels,
-        pad: f32,
-        cw: f32,
-        dy: f32,
-        y: f32,
-        alpha: f32,
-    ) {
-        let mut y = y;
-        // Add flow: platform → type → name/key, team appends org/project IDs.
-        y = self.sub_label(target, &labels.sub_platform, pad, y, cw, alpha);
-        let plats: [(Hit, &super::TextBlock); 2] = [
-            (Hit::Platform(Platform::Cn), &labels.seg_platform_cn),
-            (Hit::Platform(Platform::Intl), &labels.seg_platform_intl),
-        ];
-        let cur_plat = panel.pending_platform;
-        y = self.segmented_raw(
-            target,
-            &plats,
-            |h| matches!(h, Hit::Platform(v) if cur_plat == *v),
-            pad,
-            y,
-            cw,
-            alpha,
-        );
-        y = self.sub_label(target, &labels.sub_type, pad, y, cw, alpha);
-        // The row set and y chain follow the effective layout.
-        let team = panel.team.effective;
-        let team_sel = panel.team.pending;
-        let types: [(Hit, &super::TextBlock); 2] = [
-            (
-                Hit::AccountType(ScopeChoice::Personal),
-                &labels.seg_personal,
-            ),
-            (Hit::AccountType(ScopeChoice::Team), &labels.seg_team),
-        ];
-        y = self.segmented_raw(
-            target,
-            &types,
-            |h| matches!(h, Hit::AccountType(v) if team_sel == matches!(*v, ScopeChoice::Team)),
-            pad,
-            y,
-            cw,
-            alpha,
-        );
-        // y is pinned to layout constants: drawing, the caret, and the height formula share one source.
-        let input = &panel.input;
-        self.sub_label(target, &labels.sub_name, pad, y, cw, alpha);
-        let name_y = dy + layout::ADD_NAME_Y;
-        self.input_field(
-            panel,
-            target,
-            Hit::InputName,
-            name_y,
-            None,
-            FieldContent::Plain(&input.name),
-            "",
-            input.field == Some(InputField::Name),
-            alpha,
-        );
-        y = name_y + layout::INPUT_H + layout::INPUT_GAP;
-        self.sub_label(target, &labels.sub_key, pad, y, cw, alpha);
-        let key_y = dy + layout::ADD_KEY_Y;
-        // The key never lands on screen in full: focused shows monospace dots,
-        // unfocused with 12+ chars reveals only the first and last 4, and
-        // the in-field eye toggles plain text. Both focus states carry the
-        // masked parts when unrevealed — the display string materializes
-        // only on a cache miss, and the plaintext never enters the
-        // generic content parameter, so any future branch drawing
-        // `content` verbatim can only ever leak dots.
-        let key_active = input.field == Some(InputField::Key);
-        let key_content = if panel.key_revealed {
-            FieldContent::Plain(&input.key)
-        } else {
-            FieldContent::Masked {
-                key: &input.key,
-                active: key_active,
-            }
-        };
-        self.input_field(
-            panel,
-            target,
-            Hit::InputKey,
-            key_y,
-            Some((Hit::RevealKey, panel.key_revealed)),
-            key_content,
-            "",
-            key_active,
-            alpha,
-        );
-        y = key_y + layout::INPUT_H + layout::INPUT_GAP;
-        if team {
-            // Team: org / project IDs (request headers Bigmodel-Organization / Bigmodel-Project)
-            self.sub_label(target, &labels.sub_org, pad, y, cw, alpha);
-            let org_y = dy + layout::ADD_ORG_Y;
-            self.input_field(
-                panel,
-                target,
-                Hit::InputOrg,
-                org_y,
-                None,
-                FieldContent::Plain(&input.org),
-                "",
-                input.field == Some(InputField::Org),
-                alpha,
-            );
-            y = org_y + layout::INPUT_H + layout::INPUT_GAP;
-            self.sub_label(target, &labels.sub_project, pad, y, cw, alpha);
-            let project_y = dy + layout::ADD_PROJECT_Y;
-            self.input_field(
-                panel,
-                target,
-                Hit::InputProject,
-                project_y,
-                None,
-                FieldContent::Plain(&input.project),
-                "",
-                input.field == Some(InputField::Project),
-                alpha,
-            );
-            y = project_y + layout::INPUT_H + layout::ADD_TEAM_TAIL;
-        } else {
-            y += layout::ADD_PERSONAL_TAIL;
-        }
-        let pair_w = 88.0 * 2.0 + 12.0;
-        let bx = pad + (cw - pair_w) / 2.0;
-        self.pill_button(
-            target,
-            Hit::SaveAccount,
-            bx,
-            y,
-            88.0,
-            layout::SAVE_BTN_H,
-            &labels.pill_save,
-            alpha,
-            true,
-        );
-        self.pill_button(
-            target,
-            Hit::Back,
-            bx + 100.0,
-            y,
-            88.0,
-            layout::SAVE_BTN_H,
-            &labels.pill_cancel,
-            alpha,
-            false,
-        );
-    }
 
     /// Rebuild the constant-label set: keyed by the language alone, so it
     /// lives in its own cache and survives key changes of the volatile
     /// settings cache (account switches, update results). Each block's
     /// size/weight is written here next to its field.
     unsafe fn build_settings_labels(&mut self, s: &crate::ui::i18n::Strings) -> SettingsLabels {
-        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
-            super::TextBlock::new(r.make_layout(t, size, weight, false))
-        };
         SettingsLabels {
-            nav_settings: blk(self, s.settings, 16.0, 400),
-            nav_add: blk(self, s.add_account, 16.0, 400),
-            sec_accounts: blk(self, s.accounts_section, 13.0, 600),
-            key_invalid: blk(self, s.key_invalid, 12.0, 400),
-            pill_add: blk(self, s.add_account, 13.0, 400),
-            sec_platform: blk(self, s.platform_section, 13.0, 600),
-            sub_platform: blk(self, s.account_platform, 13.0, 400),
-            seg_platform_cn: blk(self, s.platform_cn, 13.0, 400),
-            seg_platform_intl: blk(self, s.platform_intl, 13.0, 400),
-            sub_type: blk(self, s.account_type_label, 13.0, 400),
-            seg_personal: blk(self, s.type_personal, 13.0, 400),
-            seg_team: blk(self, s.type_team, 13.0, 400),
-            sub_name: blk(self, s.account_name, 13.0, 400),
-            sub_key: blk(self, s.api_key_label, 13.0, 400),
-            sub_org: blk(self, s.org_id_label, 13.0, 400),
-            sub_project: blk(self, s.project_id_label, 13.0, 400),
-            pill_save: blk(self, s.save, 13.0, 400),
-            pill_cancel: blk(self, s.cancel, 13.0, 400),
-            sec_interval: blk(self, s.poll_interval, 13.0, 600),
-            iv_1m: blk(self, s.interval_1m, 13.0, 400),
-            iv_5m: blk(self, s.interval_5m, 13.0, 400),
-            iv_15m: blk(self, s.interval_15m, 13.0, 400),
-            iv_30m: blk(self, s.interval_30m, 13.0, 400),
-            iv_custom: blk(self, s.interval_custom, 13.0, 400),
-            iv_unit: blk(self, s.interval_custom_unit, 12.0, 400),
-            btn_apply: blk(self, s.apply, 12.0, 400),
-            sec_notifications: blk(self, s.notifications, 13.0, 600),
-            t_threshold: blk(self, s.notify_threshold, 13.0, 400),
-            t_reset_5h: blk(self, s.notify_reset_5h_opt, 13.0, 400),
-            d_reset_5h: blk(self, s.notify_reset_5h_desc, 12.0, 400),
-            t_reset_weekly: blk(self, s.notify_reset_weekly_opt, 13.0, 400),
-            d_reset_weekly: blk(self, s.notify_reset_weekly_desc, 12.0, 400),
-            sec_peak: blk(self, s.peak_section, 13.0, 600),
-            peak_start: blk(self, s.peak_start_label, 12.0, 400),
-            peak_end: blk(self, s.peak_end_label, 12.0, 400),
-            sec_general: blk(self, s.settings_general, 13.0, 600),
-            sub_language: blk(self, s.language, 13.0, 400),
-            seg_follow_system: blk(self, s.follow_system, 13.0, 400),
-            seg_lang_zh: blk(self, s.lang_name_zh, 13.0, 400),
-            seg_lang_en: blk(self, s.lang_name_en, 13.0, 400),
-            sub_appearance: blk(self, s.appearance_section, 13.0, 400),
-            seg_light: blk(self, s.theme_light, 13.0, 400),
-            seg_dark: blk(self, s.theme_dark, 13.0, 400),
-            t_autostart: blk(self, s.autostart, 13.0, 400),
-            sec_network: blk(self, s.network_section, 13.0, 600),
-            sub_proxy: blk(self, s.proxy_label, 13.0, 400),
-            sec_backup: blk(self, s.backup_section, 13.0, 600),
-            btn_export: blk(self, s.export_config, 12.0, 400),
-            btn_import: blk(self, s.import_config, 12.0, 400),
+            nav_settings: self.make_text_block(s.settings, 16.0, 400),
+            nav_add: self.make_text_block(s.add_account, 16.0, 400),
+            sec_accounts: self.make_text_block(s.accounts_section, 13.0, 600),
+            key_invalid: self.make_text_block(s.key_invalid, 12.0, 400),
+            pill_add: self.make_text_block(s.add_account, 13.0, 400),
+            sec_platform: self.make_text_block(s.platform_section, 13.0, 600),
+            sub_platform: self.make_text_block(s.account_platform, 13.0, 400),
+            seg_platform_cn: self.make_text_block(s.platform_cn, 13.0, 400),
+            seg_platform_intl: self.make_text_block(s.platform_intl, 13.0, 400),
+            sub_type: self.make_text_block(s.account_type_label, 13.0, 400),
+            seg_personal: self.make_text_block(s.type_personal, 13.0, 400),
+            seg_team: self.make_text_block(s.type_team, 13.0, 400),
+            sub_name: self.make_text_block(s.account_name, 13.0, 400),
+            sub_key: self.make_text_block(s.api_key_label, 13.0, 400),
+            sub_org: self.make_text_block(s.org_id_label, 13.0, 400),
+            sub_project: self.make_text_block(s.project_id_label, 13.0, 400),
+            pill_save: self.make_text_block(s.save, 13.0, 400),
+            pill_cancel: self.make_text_block(s.cancel, 13.0, 400),
+            sec_interval: self.make_text_block(s.poll_interval, 13.0, 600),
+            iv_1m: self.make_text_block(s.interval_1m, 13.0, 400),
+            iv_5m: self.make_text_block(s.interval_5m, 13.0, 400),
+            iv_15m: self.make_text_block(s.interval_15m, 13.0, 400),
+            iv_30m: self.make_text_block(s.interval_30m, 13.0, 400),
+            iv_custom: self.make_text_block(s.interval_custom, 13.0, 400),
+            iv_unit: self.make_text_block(s.interval_custom_unit, 12.0, 400),
+            btn_apply: self.make_text_block(s.apply, 12.0, 400),
+            sec_notifications: self.make_text_block(s.notifications, 13.0, 600),
+            t_threshold: self.make_text_block(s.notify_threshold, 13.0, 400),
+            t_reset_5h: self.make_text_block(s.notify_reset_5h_opt, 13.0, 400),
+            d_reset_5h: self.make_text_block(s.notify_reset_5h_desc, 12.0, 400),
+            t_reset_weekly: self.make_text_block(s.notify_reset_weekly_opt, 13.0, 400),
+            d_reset_weekly: self.make_text_block(s.notify_reset_weekly_desc, 12.0, 400),
+            sec_peak: self.make_text_block(s.peak_section, 13.0, 600),
+            peak_start: self.make_text_block(s.peak_start_label, 12.0, 400),
+            peak_end: self.make_text_block(s.peak_end_label, 12.0, 400),
+            sec_general: self.make_text_block(s.settings_general, 13.0, 600),
+            sub_language: self.make_text_block(s.language, 13.0, 400),
+            seg_follow_system: self.make_text_block(s.follow_system, 13.0, 400),
+            seg_lang_zh: self.make_text_block(s.lang_name_zh, 13.0, 400),
+            seg_lang_en: self.make_text_block(s.lang_name_en, 13.0, 400),
+            sub_appearance: self.make_text_block(s.appearance_section, 13.0, 400),
+            seg_light: self.make_text_block(s.theme_light, 13.0, 400),
+            seg_dark: self.make_text_block(s.theme_dark, 13.0, 400),
+            t_autostart: self.make_text_block(s.autostart, 13.0, 400),
+            sec_network: self.make_text_block(s.network_section, 13.0, 600),
+            sub_proxy: self.make_text_block(s.proxy_label, 13.0, 400),
+            sec_backup: self.make_text_block(s.backup_section, 13.0, 600),
+            btn_export: self.make_text_block(s.export_config, 12.0, 400),
+            btn_import: self.make_text_block(s.import_config, 12.0, 400),
         }
     }
 
@@ -944,11 +965,7 @@ impl Renderer {
         model: &PanelModel,
         cw: f32,
     ) -> SettingsTexts {
-        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
-            super::TextBlock::new(r.make_layout(t, size, weight, false))
-        };
-        let threshold_desc = blk(
-            self,
+        let threshold_desc = self.make_text_block(
             &s.notify_threshold_desc
                 .replace("{p}", &model.threshold_percent.to_string()),
             12.0,
@@ -956,11 +973,11 @@ impl Renderer {
         );
         // About artifacts follow the live update state: New swaps both the
         // button copy ("go download") and the version line ("cur → new").
-        let update = match model.update {
-            Some(Ok(info)) if model.update_available => UpdateKey::New(info.tag.clone()),
-            Some(Ok(_)) => UpdateKey::OkNoUpdate,
-            Some(Err(_)) => UpdateKey::Err,
-            None => UpdateKey::Idle,
+        let update = match update_state_of(model) {
+            UpdateState::Idle => UpdateKey::Idle,
+            UpdateState::OkNoUpdate => UpdateKey::OkNoUpdate,
+            UpdateState::Err => UpdateKey::Err,
+            UpdateState::New(tag) => UpdateKey::New(tag.to_string()),
         };
         let cur = env!("CARGO_PKG_VERSION");
         let plain_ver = || s.version_label.replace("{v}", cur);
@@ -975,14 +992,24 @@ impl Renderer {
             UpdateKey::Err => (s.err_update.to_string(), plain_ver()),
             UpdateKey::Idle => (s.check_update.to_string(), plain_ver()),
         };
-        let btn = blk(self, &btn_text, 12.0, 400);
+        let btn = self.make_text_block(&btn_text, 12.0, 400);
         // Width from the same layout metrics the old per-frame measure
         // read — the version line's right boundary is unchanged.
         let btn_w = (btn.w + 28.0).max(104.0);
+        // A long release tag ellipsizes against the post-button remainder
+        // instead of the draw rect's hard clip — same discipline as the
+        // card name below.
+        let (ver_disp, _) = self.ellipsize(
+            &ver_text,
+            12.0,
+            (cw - btn_w - VER_BTN_GAP).max(0.0),
+            400,
+            false,
+        );
         let about = AboutTexts {
             btn,
             btn_w,
-            ver_line: blk(self, &ver_text, 12.0, 400),
+            ver_line: self.make_text_block(&ver_disp, 12.0, 400),
         };
         // Account card: badges (widths baked in) plus the name ellipsized
         // against the badge-zone remainder. The pad cancels out of the
@@ -1131,7 +1158,7 @@ impl Renderer {
 
     /// Sub-item label within a section: 13/400 secondary color, no accent bar
     /// Type scale: 16 navigation / 13·600 section titles / 13·400 control labels / 12·400 descriptions
-    unsafe fn sub_label(
+    pub(super) unsafe fn sub_label(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         label: &super::TextBlock,
@@ -1189,7 +1216,7 @@ impl Renderer {
     /// the unfocused state draws a tail slice.
     /// Geometry x, width, and right-edge clearance come from field_geo as the single source.
     #[allow(clippy::too_many_arguments)]
-    unsafe fn input_field(
+    pub(super) unsafe fn input_field(
         &mut self,
         panel: &Panel,
         target: &ID2D1HwndRenderTarget,
@@ -1452,7 +1479,7 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
-    unsafe fn segmented_raw(
+    pub(super) unsafe fn segmented_raw(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         items: &[(Hit, &super::TextBlock)],
@@ -1646,7 +1673,7 @@ impl Renderer {
 
     /// Small rounded filled button drawing a cached label block
     #[allow(clippy::too_many_arguments)]
-    unsafe fn pill_button(
+    pub(super) unsafe fn pill_button(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         hit: Hit,
@@ -1785,6 +1812,86 @@ mod tests {
         m.account = None;
         m.accounts_count = 0;
         assert!(!key.matches(&m, 200.0));
+    }
+
+    /// Update-mapping single-source pin: key/model equivalence per reachable
+    /// state; update_available drift or tag change must mismatch and rebuild
+    #[test]
+    fn update_key_state_equivalence() {
+        let info = |tag: &str| crate::service::update::ReleaseInfo {
+            tag: tag.to_string(),
+            url: String::new(),
+        };
+        fn upd_model<'a>(
+            update: Option<&'a Result<crate::service::update::ReleaseInfo, String>>,
+            avail: bool,
+        ) -> PanelModel<'a> {
+            PanelModel {
+                strings: Lang::Zh.strings(),
+                lang: Lang::Zh,
+                snapshot: None,
+                error: None,
+                account: Some(AccountView {
+                    index: 0,
+                    name: "acc",
+                    platform: Platform::Cn,
+                    team: false,
+                }),
+                accounts_count: 1,
+                popup_open: false,
+                accounts: &[],
+                poll_interval_secs: 300,
+                language: None,
+                appearance: None,
+                autostart: false,
+                threshold_enabled: true,
+                threshold_percent: 80,
+                reset_5h_enabled: true,
+                reset_weekly_enabled: false,
+                update_available: avail,
+                peak_range: (0, 0),
+                peak_start_raw: "",
+                peak_end_raw: "",
+                update,
+                news: None,
+                last_news_read: None,
+            }
+        }
+        let key = |update: UpdateKey| SettingsKey {
+            lang: Lang::Zh,
+            threshold: 80,
+            cw: 200.0f32.to_bits(),
+            update,
+            account: Some(AccountKey {
+                name: "acc".to_string(),
+                platform: Platform::Cn,
+                team: false,
+                version: None,
+                tier: None,
+            }),
+        };
+        // Idle ↔ no result yet; a arrived result mismatches
+        assert!(key(UpdateKey::Idle).matches(&upd_model(None, false), 200.0));
+        assert!(!key(UpdateKey::Idle).matches(&upd_model(Some(&Ok(info("v1"))), false), 200.0));
+        // Ok without availability ↔ up-to-date; availability on flips to New
+        assert!(
+            key(UpdateKey::OkNoUpdate).matches(&upd_model(Some(&Ok(info("v1"))), false), 200.0)
+        );
+        assert!(
+            !key(UpdateKey::OkNoUpdate).matches(&upd_model(Some(&Ok(info("v1"))), true), 200.0)
+        );
+        // Err ↔ failed check
+        assert!(key(UpdateKey::Err).matches(&upd_model(Some(&Err("net".into())), false), 200.0));
+        assert!(!key(UpdateKey::Err).matches(&upd_model(Some(&Ok(info("v1"))), false), 200.0));
+        // New ↔ same available tag; a different tag misses
+        assert!(
+            key(UpdateKey::New("v1".into()))
+                .matches(&upd_model(Some(&Ok(info("v1"))), true), 200.0)
+        );
+        assert!(
+            !key(UpdateKey::New("v1".into()))
+                .matches(&upd_model(Some(&Ok(info("v9"))), true), 200.0)
+        );
     }
 
     /// Preset count equals the render-side label slot count: adding a preset must sync

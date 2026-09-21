@@ -3,9 +3,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 pub mod about;
+mod add_form;
 mod hit;
 mod main;
 mod marquee;
+mod metrics;
 pub mod popup;
 mod settings;
 mod widgets;
@@ -348,8 +350,8 @@ pub struct Renderer {
     /// Main-view constant-label layout cache: the content changes only with the language,
     /// and the key is the language
     main_labels: Option<(crate::ui::i18n::Lang, main::MainLabels)>,
-    mcp_cache: Option<main::McpCompCache>,
-    token_cells: Option<main::TokenCells>,
+    mcp_cache: Option<metrics::McpCompCache>,
+    token_cells: Option<metrics::TokenCells>,
     /// Error-card body cache: keyed by the full-value pair of error content and language;
     /// marquee frames of the no-snapshot error
     /// view rebuild nothing
@@ -749,6 +751,12 @@ impl Renderer {
         let fmt = self.ro_format(size, weight, mono)?;
         let w16 = self.encode_u16(s);
         self.layout_sentinel(&w16, &fmt).ok()
+    }
+
+    /// Build a block of the non-mono tier (make_layout + metrics read in
+    /// one): the shared shape of every view's label-set builder
+    pub(crate) unsafe fn make_text_block(&self, s: &str, size: f32, weight: u16) -> TextBlock {
+        TextBlock::new(self.make_layout(s, size, weight, false))
     }
 
     /// Cached drawn-text block for one input field (see input_blocks).
@@ -1406,6 +1414,41 @@ impl Renderer {
     }
 }
 
+/// Creation-failure budget: consecutive same-window failures under this count
+/// keep self-retriggering retries; at the cap, back off to natural invalidation
+const RENDER_CREATE_BUDGET: u32 = 3;
+
+/// Per-window consecutive creation-failure counts (entries exist only while
+/// the renderer slot is None; any success clears them)
+static CREATE_FAILS: std::sync::Mutex<Vec<(isize, u32)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one creation failure for this window, returning the consecutive count
+fn bump_create_fail(hwnd: HWND) -> u32 {
+    let mut v = CREATE_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    create_fail_bump(&mut v, hwnd.0 as isize)
+}
+
+/// Clear this window's failure count (any successful-creation path)
+fn reset_create_fail(hwnd: HWND) {
+    let mut v = CREATE_FAILS.lock().unwrap_or_else(|e| e.into_inner());
+    create_fail_reset(&mut v, hwnd.0 as isize)
+}
+
+fn create_fail_bump(v: &mut Vec<(isize, u32)>, h: isize) -> u32 {
+    for (hh, n) in v.iter_mut() {
+        if *hh == h {
+            *n += 1;
+            return *n;
+        }
+    }
+    v.push((h, 1));
+    1
+}
+
+fn create_fail_reset(v: &mut Vec<(isize, u32)>, h: isize) {
+    v.retain(|(hh, _)| *hh != h);
+}
+
 /// Shared WM_PAINT skeleton: validate the client area → take out the renderer → on first
 /// creation align the configured appearance and add the
 /// fade-in → paint → put back unchanged on success, or request a full next-frame rebuild
@@ -1417,6 +1460,9 @@ impl Renderer {
 /// was just armed and the caller owning the TIMER_ANIM identity must mount
 /// its own clock — arming here would SetTimer a foreign HWND while the
 /// caller's shadow record stays unaware, stalling its animations.
+/// A failed renderer creation likewise requests repaints — within the
+/// per-window budget RENDER_CREATE_BUDGET; past it the retry waits for a
+/// natural invalidation, so a broken D2D cannot spin WM_PAINT.
 /// Writing back the painted flag and follow-up actions belong to the caller.
 pub(crate) unsafe fn paint_common(
     hwnd: HWND,
@@ -1433,6 +1479,9 @@ pub(crate) unsafe fn paint_common(
     let _ = GetClientRect(hwnd, &mut rect);
     let fresh = renderer.is_none();
     let mut renderer = renderer.or_else(|| Renderer::new(hwnd, &rect, dpi));
+    if fresh && renderer.is_some() {
+        reset_create_fail(hwnd);
+    }
     let mut keep = true;
     let mut need_anim = false;
     if let Some(r) = renderer.as_mut()
@@ -1459,6 +1508,14 @@ pub(crate) unsafe fn paint_common(
         // Without the request, a static panel would wait for the minute heartbeat for its
         // next frame, staying blank with hit testing dead in the meantime.
         super::invalidate_panel(hwnd);
+    }
+    if renderer.is_none() {
+        // Failure budget: under the cap keep self-triggering next-frame retries;
+        // at the cap back off to natural invalidation (minute tick / hover /
+        // size-DPI-theme changes), avoiding an unbounded WM_PAINT spin
+        if bump_create_fail(hwnd) <= RENDER_CREATE_BUDGET {
+            super::invalidate_panel(hwnd);
+        }
     }
     (renderer, keep, need_anim)
 }
@@ -1573,5 +1630,25 @@ unsafe fn create_hwnd_target(
 impl Default for AnimState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Failure-budget pin: counts are per-window and cleared on success;
+    /// at the cap (> budget) no more self-triggering
+    #[test]
+    fn create_fail_budget_pins() {
+        let mut v = Vec::new();
+        for n in 1..=RENDER_CREATE_BUDGET {
+            assert_eq!(create_fail_bump(&mut v, 7), n);
+        }
+        assert!(create_fail_bump(&mut v, 7) > RENDER_CREATE_BUDGET);
+        assert_eq!(create_fail_bump(&mut v, 9), 1);
+        create_fail_reset(&mut v, 7);
+        assert!(!v.iter().any(|(h, _)| *h == 7) && v.iter().any(|(h, _)| *h == 9));
+        assert_eq!(create_fail_bump(&mut v, 7), 1);
     }
 }

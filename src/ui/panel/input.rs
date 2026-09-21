@@ -4,7 +4,10 @@
 //! dispatch calls; bodies live here verbatim.
 
 use super::geom::LogPx;
-use super::{DRAG_SLOP, InputField, PanelInput, input_field_of_hit, invalidate_panel, manhattan};
+use super::{
+    DRAG_SLOP, InputField, MULTI_CLICK_MS, PanelInput, input_field_of_hit, invalidate_panel,
+    manhattan,
+};
 use crate::app::{app_from_tray, sync_caret_after_geometry};
 use crate::ui::panel::text_edit::{self, EditState};
 use crate::ui::{x_of, y_of};
@@ -265,7 +268,7 @@ pub(crate) unsafe fn handle_lbuttondown(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             // An already-focused box positions directly; an
             // unfocused box focuses on press then positions at the
             // click, so the second hit of a double click can already
-            // select a word. Multi-click judged by 500ms/8px: double
+            // select a word. Multi-click judged by MULTI_CLICK_MS/DRAG_SLOP: double
             // click selects a word, triple click selects all; with
             // Shift held, a click extends the selection instead of
             // resetting it.
@@ -286,7 +289,8 @@ pub(crate) unsafe fn handle_lbuttondown(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 let (px, py) = ((x * app.panel.dpi) as i32, (y * app.panel.dpi) as i32);
                 let count = match app.panel.text_clicks {
                     Some((t, cx, cy, n))
-                        if now.wrapping_sub(t) <= 500 && manhattan(px, py, cx, cy) <= DRAG_SLOP =>
+                        if now.wrapping_sub(t) <= MULTI_CLICK_MS
+                            && manhattan(px, py, cx, cy) <= DRAG_SLOP =>
                     {
                         n.saturating_add(1).min(3)
                     }
@@ -336,10 +340,15 @@ pub(crate) unsafe fn handle_lbuttondown(hwnd: HWND, lparam: LPARAM) -> LRESULT {
                 // at an intermediate animation height.
                 app.panel.height_anim = None;
                 app.panel.catch_up_layout();
-                crate::app::reconcile_fading_focus(app, hwnd);
-                let n = app.config.accounts.len();
-                let logical_h = app.panel.view_height(n);
-                app.panel.place(hwnd, LogPx(logical_h), false);
+                // reconcile_fading_focus may clear_input (IME detach = pump):
+                // the placement takes the re-fetched reference.
+                if let Some(app) = crate::app::pump(app, hwnd, |app| {
+                    crate::app::reconcile_fading_focus(app, hwnd);
+                }) {
+                    let n = app.config.accounts.len();
+                    let logical_h = app.panel.view_height(n);
+                    app.panel.place(hwnd, LogPx(logical_h), false);
+                }
                 // place's SetWindowPos can synchronously dispatch
                 // WM_DPICHANGED (cross-monitor), whose arm re-derives
                 // App: the drag latch writes go through the
@@ -361,5 +370,67 @@ pub(crate) unsafe fn handle_lbuttondown(hwnd: HWND, lparam: LPARAM) -> LRESULT {
             }
         }
         LRESULT(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(field: InputField) -> PanelInput {
+        PanelInput {
+            field: Some(field),
+            ..PanelInput::default()
+        }
+    }
+
+    /// Pins the prefill gates: a real edit latches the mark (prefill must
+    /// not overwrite the draft), a no-op edit or another field's edit
+    /// leaves it open (prefill follows external changes).
+    #[test]
+    fn prefill_gate_latches_on_real_edit_only() {
+        let mut i = input(InputField::Interval);
+        apply_edit(&mut i, |e, t| {
+            e.insert(t, '9', InputField::Interval.max_bytes())
+        });
+        assert!(i.interval_edited, "真实编辑关门，prefill 不再覆写");
+        assert!(!i.proxy_edited, "两个门闩各自独立");
+
+        // No-op edits: empty-stack undo, backspace on an empty buffer,
+        // over-budget insert — the gate stays open.
+        let mut i = input(InputField::Interval);
+        apply_edit(&mut i, EditState::undo);
+        apply_edit(&mut i, |e, t| e.backspace(t, false));
+        apply_edit(&mut i, |e, t| e.insert(t, '9', 0));
+        assert!(!i.interval_edited, "无变化编辑不关门，prefill 跟随外部变化");
+
+        // Clearing is an edit too: the mark, not buffer emptiness, decides.
+        i.interval = "30".into();
+        apply_edit(&mut i, |e, t| {
+            e.select_all(t);
+            e.delete(t, false);
+        });
+        assert!(
+            i.interval.is_empty() && i.interval_edited,
+            "清空也是编辑，门闩照闭"
+        );
+
+        let mut i = input(InputField::Proxy);
+        apply_edit(&mut i, |e, t| {
+            e.insert(t, 'x', InputField::Proxy.max_bytes())
+        });
+        assert!(
+            i.proxy_edited && !i.interval_edited,
+            "proxy 编辑只关 proxy 门闩"
+        );
+
+        let mut i = input(InputField::Name);
+        apply_edit(&mut i, |e, t| {
+            e.insert(t, 'n', InputField::Name.max_bytes())
+        });
+        assert!(
+            !i.interval_edited && !i.proxy_edited,
+            "其他字段编辑不动门闩"
+        );
     }
 }

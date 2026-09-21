@@ -79,7 +79,13 @@ impl AccountPopup {
             let _ = GetWindowRect(panel_hwnd, &mut pr);
 
             let w = self.wnd.pxf(view::POPUP_W);
-            let hgt = self.wnd.pxf(view::popup_height(accounts) as f32);
+            // Height caps at 80% of the work area; longer lists scroll
+            let work_h = (work.bottom - work.top) as f32 / dpi;
+            let h_log = view::popup_height(accounts, work_h) as f32;
+            let hgt = self.wnd.pxf(h_log);
+            // Scroll range: uncapped extent minus the viewport; a reposition re-clamps the offset
+            self.wnd.scroll_max = (view::popup_content_height(accounts) - h_log).max(0.0);
+            self.wnd.scroll_dy = self.wnd.scroll_dy.min(self.wnd.scroll_max);
             let gap = self.wnd.pxf(8.0);
             let mut x = pr.left - w - gap;
             if x < work.left {

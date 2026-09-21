@@ -382,9 +382,6 @@ impl Renderer {
         read: Option<&str>,
         w: f32,
     ) -> AboutTexts {
-        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
-            TextBlock::new(r.make_layout(t, size, weight, false))
-        };
         let ver = s.version_label.replace("{v}", env!("CARGO_PKG_VERSION"));
         let right = w - 24.0;
         let mut items = Vec::new();
@@ -425,7 +422,7 @@ impl Renderer {
                 body.push(TextBlock::new(self.make_layout(&disp, 12.0, 400, false)));
             }
             items.push(AboutItem {
-                date: blk(self, date_disp, 10.0, 400),
+                date: self.make_text_block(date_disp, 10.0, 400),
                 title,
                 body,
             });
@@ -438,15 +435,15 @@ impl Renderer {
                 expanded,
                 read.map(str::to_string),
             ),
-            name: blk(self, "Quotify", 21.0, 600),
-            ver: blk(self, &ver, 12.0, 400),
-            desc: blk(self, s.app_desc, 11.5, 400),
-            quote: blk(self, s.egg_quote, 11.5, 400),
-            repo: blk(self, &format!("[{}]", s.link_repo), 12.5, 500),
-            issues: blk(self, &format!("[{}]", s.link_issues), 12.5, 500),
-            diag: blk(self, &format!("[{}]", s.link_diag), 12.5, 500),
-            section: blk(self, s.whats_new_section, 11.0, 600),
-            new_badge: blk(self, "NEW", 9.0, 700),
+            name: self.make_text_block("Quotify", 21.0, 600),
+            ver: self.make_text_block(&ver, 12.0, 400),
+            desc: self.make_text_block(s.app_desc, 11.5, 400),
+            quote: self.make_text_block(s.egg_quote, 11.5, 400),
+            repo: self.make_text_block(&format!("[{}]", s.link_repo), 12.5, 500),
+            issues: self.make_text_block(&format!("[{}]", s.link_issues), 12.5, 500),
+            diag: self.make_text_block(&format!("[{}]", s.link_diag), 12.5, 500),
+            section: self.make_text_block(s.whats_new_section, 11.0, 600),
+            new_badge: self.make_text_block("NEW", 9.0, 700),
             items,
         }
     }

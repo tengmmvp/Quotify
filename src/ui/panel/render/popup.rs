@@ -14,13 +14,25 @@ use crate::ui::panel::theme::CARD_RADIUS;
 pub const POPUP_W: f32 = 220.0;
 /// Account row height
 pub const ROW_H: f32 = 36.0;
+/// Height cap as a share of the work-area height: longer lists scroll
+/// instead of running off the screen
+const HEIGHT_CAP: f32 = 0.8;
 /// Popup horizontal padding: the row insets, the badge anchor, and the hit
 /// rects share it (row build and row draw must not drift apart)
 const PAD: f32 = 10.0;
 
-/// Popup logical height: title area + account rows + top/bottom padding
-pub fn popup_height(accounts: usize) -> i32 {
-    (36.0 + accounts as f32 * ROW_H + 12.0).round() as i32
+/// Uncapped content extent (logical px): title area + account rows +
+/// top/bottom padding; the scroll range is this minus the viewport height
+pub(crate) fn popup_content_height(accounts: usize) -> f32 {
+    36.0 + accounts as f32 * ROW_H + 12.0
+}
+
+/// Popup logical height: the content extent capped at HEIGHT_CAP of the
+/// work-area height (logical px)
+pub fn popup_height(accounts: usize, work_h: f32) -> i32 {
+    popup_content_height(accounts)
+        .min(work_h * HEIGHT_CAP)
+        .round() as i32
 }
 
 /// Row badge geometry chain shared by the row build and the row draw:
@@ -95,23 +107,27 @@ impl Renderer {
         hwnd: windows::Win32::Foundation::HWND,
         rect_phys: &RECT,
         model: &PanelModel,
+        scroll_dy: f32,
         dpi: f32,
     ) -> bool {
         unsafe {
             self.paint_frame(hwnd, rect_phys, dpi, "弹窗", |s, t, w, h| {
-                s.draw_account_popup(t, model, w, h)
+                s.draw_account_popup(t, model, w, h, scroll_dy)
             })
         }
     }
 
     /// Account list: subdued title + rows; the current item gets a left
-    /// vertical bar, and hover fills the whole row lightly
+    /// vertical bar, and hover fills the whole row lightly. The whole
+    /// content translates with the scroll offset (logical px, same
+    /// discipline as the panel)
     unsafe fn draw_account_popup(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         model: &PanelModel,
         w: f32,
         h: f32,
+        scroll_dy: f32,
     ) {
         let s = model.strings;
 
@@ -151,14 +167,24 @@ impl Renderer {
             target,
             &cached.title,
             (w - cached.title.w) / 2.0,
-            dy + 13.0,
+            dy + 13.0 - scroll_dy,
             self.theme.text_tertiary,
             alpha,
             false,
         );
 
-        let mut y = dy + 36.0;
+        let mut y = dy + 36.0 - scroll_dy;
         for (i, row) in cached.rows.iter().enumerate() {
+            // Off-viewport rows draw nothing and register no hits; rows
+            // only go downward, so the first fully below the viewport ends
+            // the loop
+            if y >= h {
+                break;
+            }
+            if y + ROW_H <= 0.0 {
+                y += ROW_H;
+                continue;
+            }
             if self.hover == Some(Hit::PickAccount(i)) {
                 let row = D2D1_ROUNDED_RECT {
                     rect: D2D_RECT_F {
@@ -281,5 +307,28 @@ impl Renderer {
             title,
             rows,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn popup_height_caps_at_work_area_share() {
+        // Small sets take the raw formula
+        assert_eq!(popup_height(0, 240.0), 48);
+        assert_eq!(popup_height(3, 240.0), 156);
+        // Formula exactly at the cap: unchanged
+        assert_eq!(popup_height(4, 240.0), 192);
+        // Past the cap: pinned at 80% of the work-area height
+        assert_eq!(popup_height(5, 240.0), 192);
+        assert_eq!(popup_height(100, 1000.0), 800);
+    }
+
+    #[test]
+    fn popup_content_height_stays_uncapped() {
+        assert_eq!(popup_content_height(0), 48.0);
+        assert_eq!(popup_content_height(100), 3648.0);
     }
 }

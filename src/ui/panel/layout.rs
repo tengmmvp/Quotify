@@ -5,10 +5,12 @@
 //! for margins), with ≤2px optical corrections exempt.
 
 use crate::api::TOKEN_LEGS;
-use crate::ui::panel::theme::PANEL_WIDTH;
 
 /// Poll-interval preset tiers (seconds)
 pub const INTERVAL_PRESETS: [u64; 4] = [60, 300, 900, 1800];
+
+/// Panel fixed width (logical pixels)
+pub const PANEL_WIDTH: i32 = 340;
 
 /// Top navigation bar height
 pub const NAV_H: f32 = 30.0;
@@ -338,8 +340,8 @@ pub fn main_view_height(
 /// Panel::sync_derived's height computation shares it, composed here beside
 /// main_view_height so the height chain lives in one layer.
 pub fn main_height_of(snap: Option<&crate::api::UsageSnapshot>) -> i32 {
-    let (rows, comp, stats, bal) = crate::api::main_features(snap);
-    main_view_height(snap.is_some(), rows, comp, stats, bal)
+    let f = crate::api::main_features(snap);
+    main_view_height(snap.is_some(), f.rows, f.mcp_comp, f.token_stats, f.balance)
 }
 
 /// Pinned regressions: expected values derive from the render y chain;

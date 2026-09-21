@@ -334,19 +334,38 @@ pub(crate) fn merge_sidecar(new: &mut UsageSnapshot, prev: Option<&UsageSnapshot
     }
 }
 
+/// Main-view height features.
 /// The single source of truth for the four features — metric row count, composition section,
 /// Token stats, balance; sync_derived's height input derives from here, and block display
 /// decisions must share this source — a missed sync means clipped content or
 /// blank space at the bottom.
-pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> (usize, bool, bool, bool) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MainFeatures {
+    /// Present metric-row count
+    pub rows: usize,
+    /// MCP composition section present
+    pub mcp_comp: bool,
+    /// Token stats block present
+    pub token_stats: bool,
+    /// Balance block present
+    pub balance: bool,
+}
+
+/// The four features of a snapshot; None is the all-absent shape
+pub(crate) fn main_features(snap: Option<&UsageSnapshot>) -> MainFeatures {
     match snap {
-        None => (0, false, false, false),
-        Some(s) => (
-            s.present_buckets().count(),
-            s.has_mcp_details(),
-            s.token_stats.is_some(),
-            s.balance.is_some(),
-        ),
+        None => MainFeatures {
+            rows: 0,
+            mcp_comp: false,
+            token_stats: false,
+            balance: false,
+        },
+        Some(s) => MainFeatures {
+            rows: s.present_buckets().count(),
+            mcp_comp: s.has_mcp_details(),
+            token_stats: s.token_stats.is_some(),
+            balance: s.balance.is_some(),
+        },
     }
 }
 
@@ -1325,7 +1344,7 @@ mod tests {
         );
         // The row-count feature shares the bucket order's source.
         assert_eq!(
-            main_features(Some(&feature_snap(true, false, Some(1), false, false))).0,
+            main_features(Some(&feature_snap(true, false, Some(1), false, false))).rows,
             2
         );
     }
@@ -1334,27 +1353,55 @@ mod tests {
     /// display decisions of sync_derived / draw_main; any drift means a misaligned panel height
     #[test]
     fn main_features_matrix() {
-        assert_eq!(main_features(None), (0, false, false, false));
+        assert_eq!(
+            main_features(None),
+            MainFeatures {
+                rows: 0,
+                mcp_comp: false,
+                token_stats: false,
+                balance: false
+            }
+        );
         // All three buckets + 1 detail + stats + balance.
         assert_eq!(
             main_features(Some(&feature_snap(true, true, Some(1), true, true))),
-            (3, true, true, true)
+            MainFeatures {
+                rows: 3,
+                mcp_comp: true,
+                token_stats: true,
+                balance: true
+            }
         );
         // MCP bucket present with empty details: the row count includes it,
         // the composition section stays hidden.
         assert_eq!(
             main_features(Some(&feature_snap(true, false, Some(0), false, false))),
-            (2, false, false, false)
+            MainFeatures {
+                rows: 2,
+                mcp_comp: false,
+                token_stats: false,
+                balance: false
+            }
         );
         // Only the weekly bucket and balance remain.
         assert_eq!(
             main_features(Some(&feature_snap(false, true, None, false, true))),
-            (1, false, false, true)
+            MainFeatures {
+                rows: 1,
+                mcp_comp: false,
+                token_stats: false,
+                balance: true
+            }
         );
         // Empty snapshot (all absent): zero features.
         assert_eq!(
             main_features(Some(&feature_snap(false, false, None, false, false))),
-            (0, false, false, false)
+            MainFeatures {
+                rows: 0,
+                mcp_comp: false,
+                token_stats: false,
+                balance: false
+            }
         );
     }
 

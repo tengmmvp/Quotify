@@ -8,99 +8,17 @@ use windows::Win32::Graphics::Direct2D::{
 };
 use windows_numerics::Matrix3x2;
 
+use super::marquee::{category_label, footer_error_tail, footer_key};
 use super::widgets::PACMAN_R;
 use super::{
     Align, ERROR_SCROLL_BRACKET_WEIGHT, ERROR_SCROLL_PAUSE, ERROR_SCROLL_SIZE, ErrorScroll, Hit,
     Renderer, ScrollBlock, belt_width,
 };
-use crate::api::{ErrorCategory, ErrorDetail, ErrorInfo, FetchError, TOKEN_LEGS, TokenLeg};
 use crate::ui::fmt;
 use crate::ui::i18n::Strings;
 use crate::ui::panel::layout;
 use crate::ui::panel::model::PanelModel;
 use crate::ui::panel::theme::CARD_RADIUS;
-
-/// MCP tool palette
-const MCP_PALETTE: [[f32; 4]; 4] = [
-    [0.361, 0.616, 0.549, 1.0], // #5C9D8C gray-teal
-    [0.431, 0.529, 0.659, 1.0], // #6E87A8 mist blue
-    [0.584, 0.514, 0.624, 1.0], // #95839F gray-purple
-    [0.678, 0.624, 0.561, 1.0], // #AD9F8F warm gray
-];
-
-/// Energy cell geometry
-const MCP_CELLS: usize = 20;
-const MCP_CELL_W: f32 = 12.0;
-const MCP_CELL_GAP: f32 = 2.0;
-const MCP_CELL_R: f32 = 2.0;
-
-/// Token card typography spec: font sizes of number and unit, number
-/// weight, unit gap, and in-card truncation inset — the measure and
-/// draw sides share this source
-const TOKEN_NUM_SIZE: f32 = 20.0;
-const TOKEN_NUM_WEIGHT: u16 = 700;
-const TOKEN_UNIT_SIZE: f32 = 11.0;
-const TOKEN_UNIT_GAP: f32 = 1.0;
-const TOKEN_CARD_INSET: f32 = 4.0;
-
-/// Pending-fill range sequence for the energy bar (segment order is the
-/// draw order): cell positions not covered between data segments get
-/// track gap segments; colors are paired by the caller — data segments
-/// use their segment color, gap segments use the track color.
-fn mcp_job_ranges(segs: &[(usize, usize, [f32; 4])]) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut cursor = 0usize;
-    for (start, end, _) in segs {
-        if *start > cursor {
-            ranges.push((cursor, *start));
-        }
-        ranges.push((*start, *end));
-        cursor = *end;
-    }
-    if cursor < MCP_CELLS {
-        ranges.push((cursor, MCP_CELLS));
-    }
-    ranges
-}
-
-/// Legend badge geometry
-const MCP_BADGE_SIZE: f32 = 11.0;
-const MCP_SWATCH: f32 = 8.0;
-const MCP_SWATCH_GAP: f32 = 3.0;
-const MCP_BADGE_GAP: f32 = 6.0;
-
-/// Legend badge: swatch color and the prebuilt label layout — the
-/// over-width fallback layout is prebuilt alongside at cache build, so
-/// every frame path draws blocks and never re-measures
-struct McpBadge {
-    color: [f32; 4],
-    block: super::TextBlock,
-}
-
-/// Data-side artifacts of the MCP composition section, cached by
-/// (snapshot time, inner width); a hit skips sorting, segmentation, and
-/// all width measuring; drawing fills one rounded rect per cell
-/// following the cached segments.
-pub(super) struct McpCompCache {
-    key: chrono::DateTime<chrono::Local>,
-    inner_w: f32,
-    /// Energy-bar fill sequence (gap-filled, colors already paired — data
-    /// segments keep their color, gaps take the track color): the draw
-    /// loop iterates straight through without rebuilding the range walk
-    /// or re-searching colors per frame.
-    ranges: Vec<(usize, usize, [f32; 4])>,
-    badges: Vec<McpBadge>,
-    shown: usize,
-    /// Tools hidden from the legend: parse-side total_count minus the
-    /// shown badges — covers both width-dropped badges and parse-side
-    /// residency-truncated entries; the "+N" badge draws exactly when
-    /// this is > 0.
-    hidden: usize,
-    /// Truncated first-badge label for the over-width fallback
-    /// (shown == 0): the largest tool stays visible as ellipsized text
-    fallback: super::TextBlock,
-    plus: super::TextBlock,
-}
 
 /// Frame cache of poll-stable text in the main view: text is held as
 /// prebuilt layout blocks, so zero layouts are created during the
@@ -108,17 +26,11 @@ pub(super) struct McpCompCache {
 /// second and the footer per minute, each rebuilt independently. The
 /// title cache is snapshot-independent and lives on the Renderer side.
 pub(super) struct MainTexts {
-    /// (snapshot time, language, bucket discriminants): any change
-    /// rebuilds the whole cache. The discriminant sequence — not just a
-    /// count — guards a future snapshot-reuse path that copies a
-    /// timestamp with a different bucket set: same count with reordered
-    /// or substituted buckets would otherwise index the cached rows into
-    /// the wrong labels.
-    key: (
-        chrono::DateTime<chrono::Local>,
-        crate::ui::i18n::Lang,
-        Vec<u8>,
-    ),
+    /// (snapshot time, language): any change rebuilds the whole cache —
+    /// queried_at is a full-precision timestamp stamped on every parse
+    /// and the cache dies with the snapshot, so one timestamp cannot
+    /// carry two different bucket sets.
+    key: (chrono::DateTime<chrono::Local>, crate::ui::i18n::Lang),
     /// Top bar subtitle (version · tier); None when absent
     meta: Option<super::TextBlock>,
     /// Metric row texts, in draw order (present bucket order)
@@ -140,38 +52,10 @@ pub(super) struct MainTexts {
 
 /// Metric row texts: detail and percent are poll-stable; the countdown
 /// advances per second
-struct RowTexts {
-    detail: Option<super::TextBlock>,
-    percent: super::TextBlock,
-    reset: Option<super::TextBlock>,
-}
-
-/// Bucket discriminant sequence of a snapshot: MainTexts' cache key
-/// compares the ordered variant tags, not just a count — a same-count
-/// substitution or reorder must rebuild rather than index rows into the
-/// wrong labels.
-fn bucket_tags(snap: &crate::api::UsageSnapshot) -> Vec<u8> {
-    snap.present_buckets().map(bucket_tag).collect()
-}
-
-fn bucket_tag(b: crate::api::PresentBucket<'_>) -> u8 {
-    match b {
-        crate::api::PresentBucket::FiveHour(_) => 0,
-        crate::api::PresentBucket::Weekly(_) => 1,
-        crate::api::PresentBucket::Mcp(_) => 2,
-    }
-}
-
-/// Ordered bucket-tag comparison without materializing: short-circuits
-/// on the first mismatch, so cache-hit frames allocate nothing.
-fn buckets_match(cached: &[u8], snap: &crate::api::UsageSnapshot) -> bool {
-    let mut cached = cached.iter().copied();
-    for b in snap.present_buckets() {
-        if cached.next() != Some(bucket_tag(b)) {
-            return false;
-        }
-    }
-    cached.next().is_none()
+pub(super) struct RowTexts {
+    pub(super) detail: Option<super::TextBlock>,
+    pub(super) percent: super::TextBlock,
+    pub(super) reset: Option<super::TextBlock>,
 }
 
 /// Layout cache of the main view's constant labels: section titles,
@@ -184,25 +68,10 @@ pub(super) struct MainLabels {
     five_hour: super::TextBlock,
     weekly: super::TextBlock,
     mcp: super::TextBlock,
-    today: super::TextBlock,
-    week: super::TextBlock,
-    month: super::TextBlock,
+    pub(super) today: super::TextBlock,
+    pub(super) week: super::TextBlock,
+    pub(super) month: super::TextBlock,
     peak_badge: super::TextBlock,
-}
-
-/// Typography artifacts of the Token cards, cached by snapshot time:
-/// layout blocks change with polls and are not recomputed on animation
-/// frames
-pub(super) struct TokenCells {
-    key: chrono::DateTime<chrono::Local>,
-    cells: [TokenCell; TOKEN_LEGS.len()],
-}
-
-/// Single-card typography artifacts: prebuilt layouts for the number
-/// and unit
-struct TokenCell {
-    num: super::TextBlock,
-    unit: super::TextBlock,
 }
 
 impl Renderer {
@@ -253,19 +122,12 @@ impl Renderer {
                 reset: None,
             });
         }
-        let balance = snap.balance.as_ref().map(|b| {
-            let amount = if b.available.abs() >= 1e6 {
-                fmt::compact_number(b.available)
-            } else {
-                format!("{:.2}", b.available)
-            };
-            format!("¥{amount}")
-        });
+        let balance = snap.balance.as_ref().map(|b| fmt::money(b.available));
         let balance = balance.map(|l| super::TextBlock::new(self.make_layout(&l, 12.0, 500, true)));
         let footer = fmt::updated_text(s, lang, snap.queried_at);
         let footer_block = self.make_footer_block(&footer);
         let mut texts = MainTexts {
-            key: (snap.queried_at, lang, bucket_tags(snap)),
+            key: (snap.queried_at, lang),
             meta,
             rows,
             balance,
@@ -301,20 +163,17 @@ impl Renderer {
     /// Constant label layout set: the whole set is rebuilt on language
     /// change
     unsafe fn build_main_labels(&mut self, s: &Strings) -> MainLabels {
-        let blk = |r: &Self, t: &str, size: f32, weight: u16| {
-            super::TextBlock::new(r.make_layout(t, size, weight, false))
-        };
         MainLabels {
-            usage: blk(self, s.usage_section, 12.0, 600),
-            tokens: blk(self, s.token_usage_section, 12.0, 600),
-            balance: blk(self, s.balance_label, 12.0, 600),
-            five_hour: blk(self, s.five_hour, 14.0, 400),
-            weekly: blk(self, s.weekly, 14.0, 400),
-            mcp: blk(self, s.mcp_tools, 14.0, 400),
-            today: blk(self, s.today_tokens, 10.0, 400),
-            week: blk(self, s.week_tokens, 10.0, 400),
-            month: blk(self, s.month_tokens, 10.0, 400),
-            peak_badge: blk(self, s.peak_badge, 12.0, 600),
+            usage: self.make_text_block(s.usage_section, 12.0, 600),
+            tokens: self.make_text_block(s.token_usage_section, 12.0, 600),
+            balance: self.make_text_block(s.balance_label, 12.0, 600),
+            five_hour: self.make_text_block(s.five_hour, 14.0, 400),
+            weekly: self.make_text_block(s.weekly, 14.0, 400),
+            mcp: self.make_text_block(s.mcp_tools, 14.0, 400),
+            today: self.make_text_block(s.today_tokens, 10.0, 400),
+            week: self.make_text_block(s.week_tokens, 10.0, 400),
+            month: self.make_text_block(s.month_tokens, 10.0, 400),
+            peak_badge: self.make_text_block(s.peak_badge, 12.0, 600),
         }
     }
 
@@ -351,11 +210,10 @@ impl Renderer {
         if let Some(snap) = snap {
             let now = chrono::Utc::now();
             let (now_sec, now_ms) = (now.timestamp(), now.timestamp_millis());
-            if texts.as_ref().is_none_or(|t| {
-                t.key.0 != snap.queried_at
-                    || t.key.1 != model.lang
-                    || !buckets_match(&t.key.2, snap)
-            }) {
+            if texts
+                .as_ref()
+                .is_none_or(|t| t.key.0 != snap.queried_at || t.key.1 != model.lang)
+            {
                 texts = Some(self.build_main_texts(s, snap, model.lang, now_sec, now_ms));
             } else if let Some(t) = texts.as_mut() {
                 if t.resets_at != now_sec {
@@ -1081,7 +939,7 @@ impl Renderer {
     }
 
     /// Left-aligned direct drawing of a prebuilt layout
-    unsafe fn draw_block(
+    pub(super) unsafe fn draw_block(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         b: &super::TextBlock,
@@ -1095,7 +953,7 @@ impl Renderer {
 
     /// Right-aligned direct drawing of a prebuilt layout; x is the right
     /// edge
-    unsafe fn draw_block_r(
+    pub(super) unsafe fn draw_block_r(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         b: &super::TextBlock,
@@ -1108,7 +966,7 @@ impl Renderer {
     }
 
     /// Centered direct drawing of a prebuilt layout; x is the center
-    unsafe fn draw_block_c(
+    pub(super) unsafe fn draw_block_c(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         b: &super::TextBlock,
@@ -1123,7 +981,7 @@ impl Renderer {
     /// Left-aligned snap-disabled direct drawing of a prebuilt layout:
     /// used by chain-advanced badges, whose spacing would be skewed by
     /// snapping offsets
-    unsafe fn draw_block_nosnap(
+    pub(super) unsafe fn draw_block_nosnap(
         &mut self,
         target: &ID2D1HwndRenderTarget,
         b: &super::TextBlock,
@@ -1133,504 +991,6 @@ impl Renderer {
         alpha: f32,
     ) {
         self.draw_block_at(target, b, x, y, color, alpha, true);
-    }
-
-    /// Metric row: label + percentage + progress bar, with the countdown
-    /// on the left and the used detail on the right of the bottom line;
-    /// all text goes through MainTexts prebuilt layouts and only drawing
-    /// happens here. Returns the next row's y
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn metric_row(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        label: &super::TextBlock,
-        row: &RowTexts,
-        used_percent: f64,
-        y: f32,
-        w: f32,
-        alpha: f32,
-    ) -> f32 {
-        let pad = layout::CONTENT_PAD;
-        // Values and the progress bar turn danger-colored; the threshold
-        // shares the tray icon's red tier.
-        let critical = used_percent >= crate::ui::icon::CRITICAL_PCT;
-        let (c_label, c_value, c_caption, c_track) = (
-            self.theme.text_primary,
-            if critical {
-                self.theme.danger
-            } else {
-                self.theme.text_primary
-            },
-            self.theme.text_tertiary,
-            self.theme.track,
-        );
-
-        self.draw_block(target, label, pad, y + 2.0, c_label, alpha);
-        self.draw_block_r(target, &row.percent, w - pad, y + 1.0, c_value, alpha);
-
-        let bar_h = 5.0;
-        let bar_y = y + 22.0;
-        let track = D2D_RECT_F {
-            left: pad,
-            top: bar_y,
-            right: w - pad,
-            bottom: bar_y + bar_h,
-        };
-        let track_brush = self.brush(target, c_track, alpha);
-        target.FillRectangle(&track, &track_brush);
-        let frac = (used_percent / 100.0).clamp(0.0, 1.0) as f32;
-        // Fractions below 0.4% draw no fill; when drawn, the fill is at
-        // least 2px wide.
-        if frac > 0.004 {
-            let fg_w = ((w - pad * 2.0) * frac).max(2.0);
-            let fg = D2D_RECT_F {
-                left: pad,
-                top: bar_y,
-                right: pad + fg_w,
-                bottom: bar_y + bar_h,
-            };
-            let fill = self.brush(target, c_value, alpha);
-            target.FillRectangle(&fg, &fill);
-        }
-
-        // Bottom line split left/right: countdown takes the left 55%,
-        // the used detail is right-aligned.
-        if let Some(r) = row.reset.as_ref() {
-            self.draw_block(target, r, pad, bar_y + bar_h + 5.0, c_caption, alpha);
-        }
-        if let Some(d) = row.detail.as_ref() {
-            self.draw_block_r(target, d, w - pad, bar_y + bar_h + 5.0, c_caption, alpha);
-        }
-        y + layout::MAIN_METRIC_ROW_H
-    }
-
-    /// MCP tool composition section: inside a square-cornered frame, one
-    /// rounded-cell energy bar [full string = total tool consumption]
-    /// plus one row of three-part badges as the legend [swatch | name |
-    /// count]. Cell segments and badge swatches take a low-saturation
-    /// four-color palette ordered by descending usage, with the 5th+
-    /// tools merged into the fourth color; when the legend does not fit,
-    /// trailing whole badges are dropped for +N, and an over-width first
-    /// badge has its name truncated. Data only changes with polls;
-    /// segmentation, badges, and fitting results are cached by (snapshot
-    /// time, inner width) and not recomputed on animation frames.
-    /// Returns the next row's y
-    unsafe fn mcp_composition(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        m: &crate::api::McpUsage,
-        queried_at: chrono::DateTime<chrono::Local>,
-        y: f32,
-        w: f32,
-        alpha: f32,
-    ) -> f32 {
-        let pad = layout::CONTENT_PAD;
-        let top = y + layout::MAIN_MCP_COMP_TOP_GAP;
-        let frame_h = layout::MAIN_MCP_COMP_H - layout::MAIN_MCP_COMP_TOP_GAP;
-        let inner_x = pad + 1.0 + layout::MAIN_MCP_COMP_PAD_X;
-        let inner_w = w - 2.0 * pad - 2.0 - 2.0 * layout::MAIN_MCP_COMP_PAD_X;
-        let frame = D2D_RECT_F {
-            left: pad + 0.5,
-            top: top + 0.5,
-            right: w - pad - 0.5,
-            bottom: top + frame_h - 0.5,
-        };
-        let stroke = self.brush(target, self.theme.border, alpha);
-        target.DrawRectangle(&frame, &stroke, 1.0, None);
-
-        // Data-side artifacts are cached by (snapshot time, inner width):
-        // a hit skips sorting, segmentation, and all width measuring;
-        // width is part of the key because fitting results change with
-        // panel width (across-DPI monitors). take() moves ownership out
-        // so the draw section can freely call &mut self drawing methods;
-        // this function has a single exit, put back at function end.
-        let mut cache = self.mcp_cache.take();
-        if cache
-            .as_ref()
-            .is_none_or(|c| c.key != queried_at || c.inner_w != inner_w)
-        {
-            cache = Some(self.build_mcp_cache(m, queried_at, inner_w));
-        }
-        let c = cache.expect("mcp_cache 上方必已置");
-        let badges = &c.badges;
-        let shown = c.shown;
-
-        let cell_h = layout::MAIN_MCP_CELL_H;
-        let bar_y = top + 1.0 + layout::MAIN_MCP_COMP_PAD_Y;
-        let bar_w = MCP_CELLS as f32 * MCP_CELL_W + (MCP_CELLS - 1) as f32 * MCP_CELL_GAP;
-        let x0 = inner_x + (inner_w - bar_w) / 2.0;
-        // Pending-fill segments come pre-paired from the cache: the draw
-        // loop fills one rounded rect per cell with no per-frame range
-        // walk or color lookup.
-        for (rs, re, color) in &c.ranges {
-            let b = self.brush(target, *color, alpha);
-            for i in *rs..*re {
-                let left = x0 + i as f32 * (MCP_CELL_W + MCP_CELL_GAP);
-                let cell = D2D1_ROUNDED_RECT {
-                    rect: D2D_RECT_F {
-                        left,
-                        top: bar_y,
-                        right: left + MCP_CELL_W,
-                        bottom: bar_y + cell_h,
-                    },
-                    radiusX: MCP_CELL_R,
-                    radiusY: MCP_CELL_R,
-                };
-                target.FillRoundedRectangle(&cell, &b);
-            }
-        }
-
-        let leg_y = bar_y + cell_h + layout::MAIN_MCP_LEGEND_ADV;
-        let leg_h = layout::MAIN_MCP_LEGEND_H;
-        let sw_top = leg_y + 4.0;
-        let swatch = |x: f32| D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: x,
-                top: sw_top,
-                right: x + MCP_SWATCH,
-                bottom: sw_top + MCP_SWATCH,
-            },
-            radiusX: MCP_CELL_R,
-            radiusY: MCP_CELL_R,
-        };
-        let mut x = inner_x;
-        // Badge text is vertically centered (the former text_raw
-        // vcenter behavior); y is derived from the row height
-        let text_y = |h: f32| leg_y + (leg_h - h) / 2.0;
-        if shown == 0 && !badges.is_empty() {
-            // The first badge is already over-width: the prebuilt
-            // truncated fallback keeps the largest tool visible; drawing
-            // is block-only, no per-frame measuring.
-            let b = &badges[0];
-            let sw = self.brush(target, b.color, alpha);
-            target.FillRoundedRectangle(&swatch(x), &sw);
-            self.draw_block_nosnap(
-                target,
-                &c.fallback,
-                x + MCP_SWATCH + MCP_SWATCH_GAP,
-                text_y(c.fallback.h),
-                self.theme.text_secondary,
-                alpha,
-            );
-        } else {
-            for (i, b) in badges.iter().take(shown).enumerate() {
-                if i > 0 {
-                    x += MCP_BADGE_GAP;
-                }
-                let sw = self.brush(target, b.color, alpha);
-                target.FillRoundedRectangle(&swatch(x), &sw);
-                x += MCP_SWATCH + MCP_SWATCH_GAP;
-                self.draw_block_nosnap(
-                    target,
-                    &b.block,
-                    x,
-                    text_y(b.block.h),
-                    self.theme.text_secondary,
-                    alpha,
-                );
-                x += b.block.w;
-            }
-            if c.hidden > 0 {
-                x += MCP_BADGE_GAP;
-                self.draw_block_nosnap(
-                    target,
-                    &c.plus,
-                    x,
-                    text_y(c.plus.h),
-                    self.theme.text_tertiary,
-                    alpha,
-                );
-            }
-        }
-        self.mcp_cache = Some(c);
-        y + layout::MAIN_MCP_COMP_H
-    }
-
-    /// Rebuild the MCP composition cache: tool sorting, energy bar
-    /// segmentation, and badge width-measured fitting
-    unsafe fn build_mcp_cache(
-        &mut self,
-        m: &crate::api::McpUsage,
-        queried_at: chrono::DateTime<chrono::Local>,
-        inner_w: f32,
-    ) -> McpCompCache {
-        // Tools in descending order; segment boundaries are rounded
-        // cumulative shares, seamless and non-overlapping between
-        // segments, with the last segment filling the whole bar.
-        let mut items: Vec<&crate::api::McpDetail> = m.details.iter().collect();
-        items.sort_by(|a, b| {
-            b.usage
-                .partial_cmp(&a.usage)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        // Normalization denominator takes the parse-side whole-set
-        // total: the residency cap drops the lowest-usage tail, and
-        // normalizing against the kept top-N sum alone would overstate
-        // the last visible segment's share. A zero total falls back to
-        // the kept sum (zero as well) — no division either way.
-        let sum: f64 = if m.total_usage > 0.0 {
-            m.total_usage
-        } else {
-            items.iter().map(|d| d.usage).sum()
-        };
-        let mut segs: Vec<(usize, usize, [f32; 4])> = Vec::new();
-        if sum > 0.0 {
-            let mut cum = 0.0f64;
-            for (i, d) in items.iter().enumerate() {
-                cum += d.usage;
-                let end = if i + 1 == items.len() {
-                    MCP_CELLS
-                } else {
-                    (cum / sum * MCP_CELLS as f64)
-                        .round()
-                        .clamp(0.0, MCP_CELLS as f64) as usize
-                };
-                let start = segs.last().map_or(0, |s| s.1);
-                if end > start {
-                    segs.push((start, end, MCP_PALETTE[i.min(MCP_PALETTE.len() - 1)]));
-                }
-            }
-        }
-        // The legend is a run of badges [swatch | name · count]: swatch
-        // colors match the energy bar segments, and capitalizing the
-        // first letter of names only affects the display layer. Fitting
-        // is width-driven: after the current badge fits, continuing
-        // requires the remaining width to also hold the inter-badge gap
-        // + "+N"; the trailing summary count is the number of remaining
-        // tools, taken from the parse-side total_count so entries the
-        // residency cap already dropped count as hidden too.
-        // The raw strings live only for this build pass (the over-width
-        // fallback layout is built right after fitting); the cache holds
-        // blocks alone, so no frame path re-measures.
-        let hidden_after = |shown: usize| m.total_count.saturating_sub(shown);
-        let mut texts: Vec<String> = Vec::with_capacity(items.len());
-        let badges: Vec<McpBadge> = items
-            .iter()
-            .enumerate()
-            .map(|(i, d)| {
-                let mut cs = d.model_code.chars();
-                let name = match cs.next() {
-                    Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
-                    None => String::new(),
-                };
-                let text = format!("{name} {}", fmt::compact_number(d.usage));
-                let block =
-                    super::TextBlock::new(self.make_layout(&text, MCP_BADGE_SIZE, 400, true));
-                texts.push(text);
-                McpBadge {
-                    color: MCP_PALETTE[i.min(MCP_PALETTE.len() - 1)],
-                    block,
-                }
-            })
-            .collect();
-        let badge_w = |b: &McpBadge| MCP_SWATCH + MCP_SWATCH_GAP + b.block.w;
-        let mut shown = 0usize;
-        let mut cur = 0.0f32;
-        for (i, b) in badges.iter().enumerate() {
-            let add = if i == 0 { 0.0 } else { MCP_BADGE_GAP } + badge_w(b);
-            let tail = if hidden_after(i + 1) > 0 {
-                MCP_BADGE_GAP
-                    + self.measure(
-                        &format!("+{}", hidden_after(i + 1)),
-                        MCP_BADGE_SIZE,
-                        400,
-                        true,
-                    )
-            } else {
-                0.0
-            };
-            if cur + add + tail > inner_w {
-                break;
-            }
-            cur += add;
-            shown = i + 1;
-        }
-        let hidden = hidden_after(shown);
-        let plus = if hidden > 0 {
-            let t = format!("+{hidden}");
-            super::TextBlock::new(self.make_layout(&t, MCP_BADGE_SIZE, 400, true))
-        } else {
-            super::TextBlock::new(None)
-        };
-        let fallback = if shown == 0 && !texts.is_empty() {
-            let avail = inner_w - MCP_SWATCH - MCP_SWATCH_GAP;
-            let (t, _) = self.ellipsize(&texts[0], MCP_BADGE_SIZE, avail, 400, true);
-            super::TextBlock::new(self.make_layout(&t, MCP_BADGE_SIZE, 400, true))
-        } else {
-            super::TextBlock::new(None)
-        };
-        // Gap-fill the bar once at build: data segments keep their color,
-        // gaps take the track color — pairing here keeps the draw loop a
-        // straight iteration.
-        let track = self.theme.track;
-        let ranges = mcp_job_ranges(&segs)
-            .into_iter()
-            .map(|(s, e)| {
-                let color = segs
-                    .iter()
-                    .find(|(ps, pe, _)| (*ps, *pe) == (s, e))
-                    .map_or(track, |(_, _, c)| *c);
-                (s, e, color)
-            })
-            .collect();
-        McpCompCache {
-            key: queried_at,
-            inner_w,
-            ranges,
-            badges,
-            shown,
-            hidden,
-            fallback,
-            plus,
-        }
-    }
-
-    /// Rebuild the Token card cache: formatting, measuring, and
-    /// over-width truncation in one pass
-    unsafe fn build_token_cells(
-        &mut self,
-        ts: &crate::api::TokenStats,
-        queried_at: chrono::DateTime<chrono::Local>,
-    ) -> TokenCells {
-        let avail = layout::TOKEN_CARD_W - TOKEN_CARD_INSET;
-        let cells = ts.legs.map(|v| {
-            let (num, unit) = match v {
-                Some(v) => fmt::compact_number_split(v),
-                None => (fmt::MISSING.to_string(), ""),
-            };
-            // Consolas only has the 400/700 weight tiers; 700 explicitly
-            // means bold.
-            let nw = self.measure(&num, TOKEN_NUM_SIZE, TOKEN_NUM_WEIGHT, true);
-            let uw = if unit.is_empty() {
-                0.0
-            } else {
-                self.measure_static(unit, TOKEN_UNIT_SIZE, 400, false)
-            };
-            // Absurdly large values can exceed the card width: truncate
-            // into the width rather than crossing the stroke and
-            // crowding the neighboring card.
-            let num = if nw + uw + TOKEN_UNIT_GAP > avail {
-                self.ellipsize(
-                    &num,
-                    TOKEN_NUM_SIZE,
-                    avail - uw - TOKEN_UNIT_GAP,
-                    TOKEN_NUM_WEIGHT,
-                    true,
-                )
-                .0
-            } else {
-                num
-            };
-            TokenCell {
-                num: super::TextBlock::new(self.make_layout(
-                    &num,
-                    TOKEN_NUM_SIZE,
-                    TOKEN_NUM_WEIGHT,
-                    true,
-                )),
-                unit: super::TextBlock::new(self.make_layout(unit, TOKEN_UNIT_SIZE, 400, false)),
-            }
-        });
-        TokenCells {
-            key: queried_at,
-            cells,
-        }
-    }
-
-    /// Three Token cards section: the typography cache hits by snapshot;
-    /// rebuilds complete in one pass; single exit — the cache taken out
-    /// must be put back at function end. Returns the section's bottom y
-    unsafe fn token_section(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        labels: &MainLabels,
-        ts: &crate::api::TokenStats,
-        queried_at: chrono::DateTime<chrono::Local>,
-        y: f32,
-        alpha: f32,
-    ) -> f32 {
-        let pad = layout::CONTENT_PAD;
-        let cy = y + layout::MAIN_TOKEN_CARD_ADV;
-        let mut cells = self.token_cells.take();
-        if cells.as_ref().is_none_or(|c| c.key != queried_at) {
-            cells = Some(self.build_token_cells(ts, queried_at));
-        }
-        let cells = cells.expect("token_cells 上方必已置");
-        // Labels are dispatched exhaustively by tier: pairing stays
-        // cohesive, and adding/removing tiers is compiler-checked.
-        for (i, (leg, _, _)) in TOKEN_LEGS.iter().enumerate() {
-            let label = match leg {
-                TokenLeg::Today => &labels.today,
-                TokenLeg::Week => &labels.week,
-                TokenLeg::Month => &labels.month,
-            };
-            self.token_card(
-                target,
-                label,
-                &cells.cells[i],
-                pad + i as f32 * (layout::TOKEN_CARD_W + layout::TOKEN_CARD_GAP),
-                cy,
-                alpha,
-            );
-        }
-        self.token_cells = Some(cells);
-        cy + layout::TOKEN_CARD_H
-    }
-
-    /// Token card: transparent-fill thin-stroke container; number and
-    /// unit are laid out separately (prebuilt layouts), with the label
-    /// sitting at the bottom.
-    unsafe fn token_card(
-        &mut self,
-        target: &ID2D1HwndRenderTarget,
-        label: &super::TextBlock,
-        cell: &TokenCell,
-        x: f32,
-        y: f32,
-        alpha: f32,
-    ) {
-        let cw = layout::TOKEN_CARD_W;
-        let rect = D2D1_ROUNDED_RECT {
-            rect: D2D_RECT_F {
-                left: x,
-                top: y,
-                right: x + cw,
-                bottom: y + layout::TOKEN_CARD_H,
-            },
-            radiusX: CARD_RADIUS,
-            radiusY: CARD_RADIUS,
-        };
-        let edge = self.brush(target, self.theme.card_border, alpha);
-        target.DrawRoundedRectangle(&rect, &edge, 1.0, None);
-        // The number-unit combination is centered as a whole; the unit
-        // hangs at the number's top-right corner as a superscript.
-        let nx = x + (cw - cell.num.w - cell.unit.w - TOKEN_UNIT_GAP) / 2.0;
-        self.draw_block(
-            target,
-            &cell.num,
-            nx,
-            y + layout::TOKEN_CARD_NUM_Y,
-            self.theme.text_primary,
-            alpha,
-        );
-        if cell.unit.w > 0.0 {
-            self.draw_block(
-                target,
-                &cell.unit,
-                nx + cell.num.w + TOKEN_UNIT_GAP,
-                y + layout::TOKEN_CARD_NUM_Y,
-                self.theme.text_secondary,
-                alpha,
-            );
-        }
-        self.draw_block_c(
-            target,
-            label,
-            x + cw / 2.0,
-            y + layout::TOKEN_CARD_LABEL_Y,
-            self.theme.text_secondary,
-            alpha,
-        );
     }
 
     /// "Peak" badge: bolt + text on the right of the title row; the label
@@ -1726,175 +1086,6 @@ impl Renderer {
             alpha,
             Align::Left,
             false,
-        );
-    }
-
-    /// Error card body (cached): the key is a full-value pair of error
-    /// content and language, so marquee frames rebuild nothing; leaving
-    /// out the language would keep stale copy after a language switch.
-    /// An Rc refcount clone replaces a full deep copy of the string —
-    /// hit registration still needs &mut self mid-drawing, so it cannot
-    /// be borrowed out.
-    fn cached_error_body(
-        &mut self,
-        s: &Strings,
-        e: &FetchError,
-        lang: crate::ui::i18n::Lang,
-    ) -> std::rc::Rc<str> {
-        // Reference comparison on the hit path; the owned clone only on a
-        // rebuild — the marquee calls this every frame while scrolling.
-        if let Some((k, b)) = self.err_card.as_ref()
-            && k.0 == *e
-            && k.1 == lang
-        {
-            return std::rc::Rc::clone(b);
-        }
-        let key = (e.clone(), lang);
-        let b: std::rc::Rc<str> = error_card_body(s, e).into();
-        self.err_card = Some((key, std::rc::Rc::clone(&b)));
-        b
-    }
-}
-
-/// Category title copy
-fn category_label(s: &Strings, c: ErrorCategory) -> &'static str {
-    match c {
-        ErrorCategory::Unauthenticated => s.err_cat_auth,
-        ErrorCategory::Request => s.err_cat_bad_request,
-        ErrorCategory::Throttled => s.err_cat_rate_limited,
-        ErrorCategory::Server => s.err_cat_server,
-        ErrorCategory::Network => s.err_cat_network,
-        ErrorCategory::Empty => s.err_cat_no_data,
-    }
-}
-
-/// Footer cache key: a thin delegation to fmt::elapsed_minutes_since —
-/// the same clamped minute bucket the text tiers read, so key
-/// transitions land exactly at whole elapsed minutes (the zero clamp
-/// single-sources there; a wall-clock step back must not bucket to -1).
-/// Taking a whole-second timestamp would drop the snapshot's sub-second
-/// part; the key transition would lead the real one by up to a second,
-/// and crossing a tier would cache the stale copy under the new key,
-/// displaying it a full minute late
-fn footer_key(now_ms: i64, at_ms: i64) -> i64 {
-    crate::ui::fmt::elapsed_minutes_since(now_ms, at_ms)
-}
-
-/// Display material for FetchError: the official error info and the
-/// fallback copy for categories with no official hint; categories whose
-/// info is None emit the raw copy directly, with no fallback chain. The
-/// error card and the footer tail segment share this source; the two
-/// views' fallback pairing never diverges.
-fn error_parts<'a>(e: &'a FetchError, s: &'a Strings) -> (Option<&'a ErrorInfo>, &'a str) {
-    match e {
-        FetchError::Unauthenticated(info) => (Some(info), s.err_auth_hint),
-        FetchError::Empty => (None, ""),
-        FetchError::Failure(info) => (Some(info), ""),
-        FetchError::Network(d) => (None, d),
-        FetchError::Throttled { info, .. } => (Some(info), ""),
-    }
-}
-
-/// Error display material shared by the card body and the footer tail:
-/// a (code, message) pair each surface renders its own way, or plain
-/// text (code-only template, raw message, fallback copy). One ladder —
-/// the two views' material selection cannot diverge.
-enum ErrorMaterial<'a> {
-    CodeMsg(i64, std::borrow::Cow<'a, str>),
-    Text(std::borrow::Cow<'a, str>),
-}
-
-/// Material selection has the single source `ErrorInfo::detail`
-fn error_material<'a>(e: &'a FetchError, s: &'a Strings) -> ErrorMaterial<'a> {
-    match error_parts(e, s) {
-        (Some(info), fallback) => match info.detail() {
-            ErrorDetail::CodeAndMsg { code, msg } => {
-                ErrorMaterial::CodeMsg(code, std::borrow::Cow::Borrowed(msg))
-            }
-            ErrorDetail::CodeOnly { code } => ErrorMaterial::Text(code_only_body(s, code).into()),
-            ErrorDetail::Msg(msg) => ErrorMaterial::Text(msg),
-            ErrorDetail::Fallback => ErrorMaterial::Text(fallback.into()),
-        },
-        (None, raw) => ErrorMaterial::Text(raw.into()),
-    }
-}
-
-/// Error card body: only the card template assembly happens here.
-fn error_card_body(s: &Strings, e: &FetchError) -> String {
-    // The empty state is onboarding body text and does not go through
-    // the fallback chain.
-    if matches!(e, FetchError::Empty) {
-        return s.err_empty_hint.to_string();
-    }
-    match error_material(e, s) {
-        ErrorMaterial::CodeMsg(code, msg) => s
-            .err_code_msg
-            .replace("{code}", &code.to_string())
-            .replace("{msg}", &msg),
-        ErrorMaterial::Text(t) => t.into_owned(),
-    }
-}
-
-/// Suffix segment of the footer summary; an empty string means no tail
-/// segment.
-fn footer_error_tail(s: &Strings, e: &FetchError) -> String {
-    match error_material(e, s) {
-        ErrorMaterial::CodeMsg(_, msg) => msg.into_owned(),
-        ErrorMaterial::Text(t) => t.into_owned(),
-    }
-}
-
-/// Code-only error body: shared by the error card and the footer tail — the
-/// two views are mutually exclusive states of the same error and must not
-/// render it differently.
-fn code_only_body(s: &Strings, code: i64) -> String {
-    s.err_code_only.replace("{code}", &code.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const C: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
-
-    /// Footer key and copy tiers share the same boundary: transitions
-    /// land exactly at whole elapsed minutes; the snapshot's sub-second
-    /// part never makes the key early or late
-    #[test]
-    fn footer_key_matches_text_tiers() {
-        let at = 1_000_000i64 * 60_000 + 700;
-        assert_eq!(footer_key(at + 59_999, at), 0);
-        assert_eq!(footer_key(at + 60_000, at), 1);
-        assert_eq!(footer_key(at + 119_999, at), 1);
-        assert_eq!(footer_key(at + 120_000, at), 2);
-        // Wall clock stepped back (NTP correction): delta clamps to zero,
-        // never bucketing to -1 — same clamp as fmt::updated_text
-        assert_eq!(footer_key(at - 30_000, at), 0);
-    }
-
-    /// Pinned pairing of tiers with fallback day counts and log labels
-    #[test]
-    fn token_legs_pinned() {
-        assert_eq!(TOKEN_LEGS[0], (TokenLeg::Today, 0, "today"));
-        assert_eq!(TOKEN_LEGS[1], (TokenLeg::Week, 6, "week"));
-        assert_eq!(TOKEN_LEGS[2], (TokenLeg::Month, 29, "month"));
-    }
-
-    /// Energy bar pending-fill ranges: data segments are kept as-is,
-    /// uncovered cell positions get track segments, the head and tail
-    /// are padded as needed, and segment order is the draw order
-    #[test]
-    fn mcp_ranges_cover_track_gaps() {
-        // No data: the whole bar is track
-        assert_eq!(mcp_job_ranges(&[]), vec![(0, MCP_CELLS)]);
-        // A single segment fills everything: no track
-        assert_eq!(mcp_job_ranges(&[(0, 20, C)]), vec![(0, 20)]);
-        // Head gap
-        assert_eq!(mcp_job_ranges(&[(5, 20, C)]), vec![(0, 5), (5, 20)]);
-        // Mid gap; data segments join contiguously
-        assert_eq!(
-            mcp_job_ranges(&[(2, 6, C), (6, 10, C), (14, 20, C)]),
-            vec![(0, 2), (2, 6), (6, 10), (10, 14), (14, 20)]
         );
     }
 }
